@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RoboSpeed – Progress Bar Mockup</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #1C1C1E;
+    font-family: "Segoe UI", system-ui, sans-serif;
+    color: #E5E5EA;
+    padding: 40px 48px;
+  }
+  h1 { font-size: 13px; font-weight: 700; color: #0A84FF; letter-spacing: 1px;
+       text-transform: uppercase; margin-bottom: 32px; }
+  .panel {
+    background: #1E1E21;
+    border-radius: 8px;
+    padding: 24px 28px;
+    margin-bottom: 32px;
+    border: 1px solid #3A3A3D;
+  }
+  .panel-title {
+    font-size: 11px; font-weight: 700; color: #E5E5EA;
+    margin-bottom: 18px;
+  }
+  .context-row {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 6px;
+  }
+  .ctx-left  { font-size: 9px; color: #8E8E93; }
+  .ctx-right { font-size: 9px; color: #8E8E93; }
+  /* ── progress bar track ── */
+  .bar-track {
+    width: 100%; height: 10px;
+    background: #232326;
+    border-radius: 5px;
+    overflow: hidden;
+    margin-bottom: 4px;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 5px;
+    transition: width 0.3s ease;
+  }
+  /* Gradient: blue → green (matching GradBar in code) */
+  .bar-fill.running {
+    background: linear-gradient(to right, #0A84FF, #30D158);
+  }
+  /* Amber for paused */
+  .bar-fill.paused {
+    background: linear-gradient(to right, #C27A1A, #FF9F0A);
+  }
+  /* Grey for stopped/idle */
+  .bar-fill.idle {
+    background: #3A3A3D;
+  }
+  /* Red for error / out-of-range */
+  .bar-fill.error {
+    background: linear-gradient(to right, #B4232C, #FF453A);
+  }
+  .pct-label {
+    font-size: 8px; color: #8E8E93; text-align: right; margin-top: 2px;
+  }
+  .status-tag {
+    display: inline-block;
+    font-size: 8px; font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 3px;
+    letter-spacing: 0.5px;
+    margin-bottom: 14px;
+  }
+  .tag-run    { background: #1F8F4E33; color: #30D158; border: 1px solid #1F8F4E; }
+  .tag-pause  { background: #C27A1A33; color: #FF9F0A; border: 1px solid #C27A1A; }
+  .tag-stop   { background: #3A3A3D;   color: #8E8E93; border: 1px solid #48484A; }
+  .tag-error  { background: #B4232C33; color: #FF453A; border: 1px solid #B4232C; }
+  /* animated demo bar */
+  @keyframes pulse-fill {
+    0%   { width: 0% }
+    100% { width: 72% }
+  }
+  .bar-fill.animated {
+    animation: pulse-fill 2.2s cubic-bezier(.4,0,.2,1) forwards;
+  }
+  hr.div { border: none; border-top: 1px solid #3A3A3D; margin: 28px 0; }
+  .note {
+    font-size: 9px; color: #48484A; margin-top: 24px; line-height: 1.6;
+  }
+  /* ── inline demo with animation ── */
+  .demo-label {
+    font-size: 9px; font-weight: 700; color: #C0C0C5;
+    text-transform: uppercase; letter-spacing: 0.6px;
+    margin-bottom: 8px;
+  }
+  /* hover highlight */
+  .panel:hover { border-color: #4A4A4D; }
+</style>
+</head>
+<body>
+
+<h1>RoboSpeed — Cycle Progress Bar · All States Mockup</h1>
+
+<!-- ═══ STATE 1: RUNNING ════════════════════════════════════════════ -->
+<div class="panel">
+  <div class="panel-title">Live Force Monitor</div>
+  <span class="status-tag tag-run">● RUNNING</span>
+  <div class="demo-label">Cycle progress · 72 / 100</div>
+  <div class="context-row">
+    <span class="ctx-left">Detecting Anomalies</span>
+    <span class="ctx-right">72 %</span>
+  </div>
+  <div class="bar-track">
+    <div class="bar-fill running" style="width:72%"></div>
+  </div>
+  <p class="pct-label">72 / 100 cycles · Blue → Green gradient</p>
+</div>
+
+<!-- ═══ STATE 2: PAUSED ═════════════════════════════════════════════ -->
+<div class="panel">
+  <div class="panel-title">Live Force Monitor</div>
+  <span class="status-tag tag-pause">⏸ PAUSED</span>
+  <div class="demo-label">Cycle progress · 45 / 100</div>
+  <div class="context-row">
+    <span class="ctx-left">Learning Baseline 30/30</span>
+    <span class="ctx-right">45 %</span>
+  </div>
+  <div class="bar-track">
+    <div class="bar-fill paused" style="width:45%"></div>
+  </div>
+  <p class="pct-label">45 / 100 cycles · Amber gradient while paused</p>
+</div>
+
+<!-- ═══ STATE 3: STOPPED / IDLE ════════════════════════════════════ -->
+<div class="panel">
+  <div class="panel-title">Live Force Monitor</div>
+  <span class="status-tag tag-stop">■ STOPPED</span>
+  <div class="demo-label">Cycle progress · 0 / 100</div>
+  <div class="context-row">
+    <span class="ctx-left">Learning Baseline 0/30</span>
+    <span class="ctx-right">0 %</span>
+  </div>
+  <div class="bar-track">
+    <div class="bar-fill idle" style="width:0%"></div>
+  </div>
+  <p class="pct-label">No cycles run · Track shows as dark grey</p>
+</div>
+
+<!-- ═══ STATE 4: COMPLETED ══════════════════════════════════════════ -->
+<div class="panel">
+  <div class="panel-title">Live Force Monitor</div>
+  <span class="status-tag tag-run">✓ COMPLETED</span>
+  <div class="demo-label">Cycle progress · 100 / 100</div>
+  <div class="context-row">
+    <span class="ctx-left">Detecting Anomalies</span>
+    <span class="ctx-right">100 %</span>
+  </div>
+  <div class="bar-track">
+    <div class="bar-fill running" style="width:100%"></div>
+  </div>
+  <p class="pct-label">100 / 100 cycles · Full blue→green fill</p>
+</div>
+
+<!-- ═══ STATE 5: ERROR ═══════════════════════════════════════════════ -->
+<div class="panel">
+  <div class="panel-title">Live Force Monitor</div>
+  <span class="status-tag tag-error">⚠ FORCE OUT OF RANGE</span>
+  <div class="demo-label">Cycle progress · 38 / 100 · Error detected</div>
+  <div class="context-row">
+    <span class="ctx-left">Detecting Anomalies</span>
+    <span class="ctx-right">38 %</span>
+  </div>
+  <div class="bar-track">
+    <div class="bar-fill error" style="width:38%"></div>
+  </div>
+  <p class="pct-label">38 / 100 cycles · Red gradient on force error</p>
+</div>
+
+<hr class="div">
+
+<!-- ═══ ANIMATED LIVE DEMO ══════════════════════════════════════════ -->
+<div class="panel">
+  <div class="panel-title">⚡ Animated — Live fill preview (plays on page load)</div>
+  <span class="status-tag tag-run">● RUNNING</span>
+  <div class="demo-label">Cycle progress · animating to 72%…</div>
+  <div class="context-row">
+    <span class="ctx-left">Detecting Anomalies</span>
+    <span class="ctx-right" id="pct-txt">0 %</span>
+  </div>
+  <div class="bar-track">
+    <div class="bar-fill running animated" id="anim-bar" style="width:0%"></div>
+  </div>
+  <p class="pct-label">Blue → Green gradient, 10px height, 5px rounded ends</p>
+</div>
+
+<!-- ═══ COLOUR REFERENCE ═══════════════════════════════════════════ -->
+<div class="panel">
+  <div class="panel-title">Colour reference</div>
+  <table style="font-size:9px;border-collapse:collapse;width:100%;">
+    <tr style="color:#8E8E93;">
+      <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #3A3A3D">State</th>
+      <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #3A3A3D">Start colour</th>
+      <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #3A3A3D">End colour</th>
+      <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #3A3A3D">Track bg</th>
+    </tr>
+    <tr>
+      <td style="padding:5px 8px;color:#30D158">Running / Completed</td>
+      <td style="padding:5px 8px;font-family:monospace">#0A84FF (Blue)</td>
+      <td style="padding:5px 8px;font-family:monospace">#30D158 (Green)</td>
+      <td style="padding:5px 8px;font-family:monospace">#232326</td>
+    </tr>
+    <tr style="background:#1A1A1C">
+      <td style="padding:5px 8px;color:#FF9F0A">Paused</td>
+      <td style="padding:5px 8px;font-family:monospace">#C27A1A (Amber)</td>
+      <td style="padding:5px 8px;font-family:monospace">#FF9F0A (Light Amber)</td>
+      <td style="padding:5px 8px;font-family:monospace">#232326</td>
+    </tr>
+    <tr>
+      <td style="padding:5px 8px;color:#8E8E93">Stopped / Idle</td>
+      <td colspan="2" style="padding:5px 8px;font-family:monospace">#3A3A3D (Grey)</td>
+      <td style="padding:5px 8px;font-family:monospace">#232326</td>
+    </tr>
+    <tr style="background:#1A1A1C">
+      <td style="padding:5px 8px;color:#FF453A">Error</td>
+      <td style="padding:5px 8px;font-family:monospace">#B4232C (Deep Red)</td>
+      <td style="padding:5px 8px;font-family:monospace">#FF453A (Bright Red)</td>
+      <td style="padding:5px 8px;font-family:monospace">#232326</td>
+    </tr>
+  </table>
+</div>
+
+<p class="note">
+  The bar is 10px tall with 5px rounded ends (pill shape). It updates every 100 ms via QTimer in the
+  main window's _refresh_ui() method. The fill width = (cycle_count / target_cycles) × bar_width px.
+  The percentage label to the right ("72 %") is a QLabel updated at the same interval.
+</p>
+
+<script>
+  // Animate the counter in sync with the CSS animation
+  const bar = document.getElementById('anim-bar');
+  const txt = document.getElementById('pct-txt');
+  let start = null;
+  const TARGET = 72, DURATION = 2200;
+  function step(ts) {
+    if (!start) start = ts;
+    const prog = Math.min((ts - start) / DURATION, 1);
+    const ease = prog < 0.5 ? 2*prog*prog : -1+(4-2*prog)*prog;
+    const val  = Math.round(ease * TARGET);
+    txt.textContent = val + ' %';
+    if (prog < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+</script>
+</body>
+</html>

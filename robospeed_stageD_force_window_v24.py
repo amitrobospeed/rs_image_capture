@@ -1,0 +1,884 @@
+import time
+import threading
+from dataclasses import dataclass, field
+from collections import deque
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+from matplotlib.patches import Circle, Rectangle
+from matplotlib.widgets import Button, TextBox
+from matplotlib.backends.backend_pdf import PdfPages
+import tkinter as tk
+from tkinter import filedialog
+import os
+
+from Phidget22.Devices.VoltageRatioInput import VoltageRatioInput
+from dorna2 import Dorna
+
+
+# ================================
+# FORCE SETTINGS
+# ================================
+calibration_factor = 68000
+window_seconds = 10
+update_interval = 0.2
+data_interval_ms = 8
+
+peak_start_threshold = 0.5
+
+force_min_valid = 0.5
+force_max_valid = 1.8
+
+baseline_cycles = 30
+deviation_threshold = 0.50
+
+ALERT_FLASH_S = 1.0
+
+# ================================
+# UI SETTINGS
+# ================================
+LOGO_CANDIDATE_PATHS = [
+    "assets/robospeed_logo.png",
+    "robospeed_logo.png",
+]
+
+COLOR_BG = "#0f172a"
+COLOR_PANEL = "#111827"
+COLOR_PANEL_BORDER = "#334155"
+COLOR_TEXT = "#e5e7eb"
+
+
+# ================================
+# DORNA SETTINGS
+# ================================
+DORNA_HOST = "192.168.1.24"
+DORNA_PORT = 443
+
+# ✅ Updated ranges per your request
+VEL_MIN, VEL_MAX = 0, 1000
+ACC_MIN, ACC_MAX = 0, 2000
+JERK_MIN, JERK_MAX = 0, 10000
+
+SAFE_START_VEL = 100
+SAFE_START_ACC = 200
+SAFE_START_JERK = 2000
+
+
+# ================================
+# HOME POSITION
+# ================================
+HOME_POSE = {
+    "x": 318.06,
+    "y": -38.16,
+    "z": 200.0,
+    "a": -173.0,
+    "b": 41.62,
+    "c": -3.53
+}
+
+
+# ================================
+# BUTTON POSES (hardcoded)
+# ================================
+BUTTON_POSES = {
+    "A": {
+        "above":   {"x": 318.06, "y": -38.16, "z": 127.44, "a": -173.0,  "b": 41.62, "c": -3.53},
+        "press":   {"x": 318.06, "y": -38.16, "z": 120.40, "a": -173.0,  "b": 41.62, "c": -3.53},
+        "retract": {"x": 318.06, "y": -38.16, "z": 127.44, "a": -173.0,  "b": 41.62, "c": -3.53},
+    },
+    "B": {
+        "above":   {"x": 327.02, "y": -21.69, "z": 127.44, "a": -173.8,  "b": 32.25, "c": -4.81},
+        "press":   {"x": 327.02, "y": -21.69, "z": 118.70, "a": -173.8,  "b": 32.25, "c": -4.81},
+        "retract": {"x": 327.02, "y": -21.69, "z": 127.44, "a": -173.8,  "b": 32.25, "c": -4.81},
+    },
+    "C": {
+        "above":   {"x": 342.30, "y": -29.64, "z": 127.44, "a": -174.83, "b": 34.08, "c": -6.71},
+        "press":   {"x": 342.30, "y": -29.64, "z": 120.38, "a": -174.83, "b": 34.08, "c": -6.71},
+        "retract": {"x": 342.30, "y": -29.64, "z": 127.44, "a": -174.83, "b": 34.08, "c": -6.71},
+    },
+    "D": {
+        "above":   {"x": 335.08, "y": -43.88, "z": 125.13, "a": -173.84, "b": 43.25, "c": -4.86},
+        "press":   {"x": 335.08, "y": -43.88, "z": 121.70, "a": -173.84, "b": 43.25, "c": -4.86},
+        "retract": {"x": 335.08, "y": -43.88, "z": 127.44, "a": -173.84, "b": 43.25, "c": -4.86},
+    },
+}
+
+PHASES = ["above", "press", "retract"]
+BUTTON_ORDER = ["A", "B", "C", "D"]
+
+TRAJECTORY = []
+INDEX_TO_META = []
+for btn in BUTTON_ORDER:
+    for ph in PHASES:
+        TRAJECTORY.append(BUTTON_POSES[btn][ph])
+        INDEX_TO_META.append((btn, ph))
+
+
+# ================================
+# STAT PARSER (your firmware: idle == -1)
+# ================================
+def _extract_stat(resp):
+    if isinstance(resp, dict):
+        if "stat" in resp:
+            return int(resp["stat"])
+        if "union" in resp and isinstance(resp["union"], dict) and "stat" in resp["union"]:
+            return int(resp["union"]["stat"])
+        if "msgs" in resp and isinstance(resp["msgs"], list) and len(resp["msgs"]) > 0:
+            m0 = resp["msgs"][0]
+            if isinstance(m0, dict) and "stat" in m0:
+                return int(m0["stat"])
+    return None
+
+
+def is_idle(robot):
+    try:
+        resp = robot.play(-1, {"cmd": "stat"})
+        s = _extract_stat(resp)
+        return (s == -1)
+    except Exception:
+        return False
+
+
+# ================================
+# STATE
+# ================================
+@dataclass
+class SystemState:
+    running: bool = False
+    paused: bool = False
+    stopped: bool = True
+
+    vel: int = 300
+    acc: int = 300
+    jerk: int = 1000  # ✅ added
+    target_cycles: int = 100
+    baseline_cycles: int = baseline_cycles
+    force_min: float = force_min_valid
+    force_max: float = force_max_valid
+
+    traj_index: int = 0
+    cycle_count: int = 0
+    aligned_to_A: bool = False
+
+    force_out_of_range: dict = field(default_factory=lambda: {"A": 0, "B": 0, "C": 0, "D": 0})
+    button_did_not_retract: dict = field(default_factory=lambda: {"A": 0, "B": 0, "C": 0, "D": 0})
+
+    baseline_peaks: dict = field(default_factory=lambda: {"A": [], "B": [], "C": [], "D": []})
+    baseline_mean: dict = field(default_factory=dict)
+    baseline_ready: bool = False
+
+    window_active: bool = False
+    window_button: str | None = None
+    window_peak_force: float | None = None
+    window_peak_time: float | None = None
+
+    alert_until_wall: float = 0.0
+    alert_color: str = "gray"
+    alert_msg: str = ""
+    test_name: str = "test_report"
+    exit_requested: bool = False
+
+
+def main():
+    # --- Connect robot (keep alive) ---
+    robot = Dorna()
+    print("Connecting to Dorna...")
+    robot.connect(host=DORNA_HOST, port=DORNA_PORT)
+    print("Robot Connected!")
+
+    # --- Force sensor ---
+    bridge = VoltageRatioInput()
+    bridge.setDeviceSerialNumber(781028)
+    bridge.setChannel(0)
+    bridge.openWaitForAttachment(5000)
+    bridge.setDataInterval(data_interval_ms)
+
+    print("Taring...")
+    time.sleep(1)
+    zero_offset = float(np.mean([bridge.getVoltageRatio() for _ in range(200)]))
+
+    state = SystemState()
+    state_lock = threading.RLock()
+
+    # --- GUI layout (same as Stage D force window v5) ---
+    fig = plt.figure(figsize=(14, 8), facecolor=COLOR_BG)
+
+    # Determine app logo once and reuse it in GUI + PDF report
+    app_logo_path = None
+    for logo_path in LOGO_CANDIDATE_PATHS:
+        if os.path.exists(logo_path):
+            app_logo_path = logo_path
+            break
+
+    # left panel background sections (professional grouping)
+    fig.patches.append(Rectangle((0.02, 0.0628), 0.2076, 0.9098, transform=fig.transFigure,
+                                 facecolor=COLOR_PANEL, edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-1))
+
+    # Plot on right
+    ax = fig.add_axes([0.30, 0.25, 0.67, 0.65])
+    ax.set_ylim(-0.2, 2.0)
+    ax.set_ylabel("Force (lbs)", fontsize=22, color="white")
+    ax.set_xlabel("Time (s)", fontsize=16, color="white")
+    ax.set_title("Live Force (Last 10s)", fontsize=26, color=COLOR_TEXT)
+    ax.set_facecolor("#f8fafc")
+    ax.tick_params(axis='x', colors='white')
+    ax.tick_params(axis='y', colors='white')
+    ax.yaxis.grid(True, alpha=0.35)
+    force_band = ax.axhspan(state.force_min, state.force_max, alpha=0.18, color="#93c5fd")
+
+    (line,) = ax.plot([], [], linewidth=2.5, color="#0ea5e9")
+
+    # Messages (no bbox), keep two-line spacing at ~1.5 lines
+    status_line_y = 0.095
+    line_spacing_y = ((1.5 * 13.0) / 72.0) / 8.0  # 1.5 lines at 13pt on 8in figure
+    fail_line_y = status_line_y - line_spacing_y
+    msg_text_x = 0.31
+    status_line = fig.text(msg_text_x, status_line_y, "", fontsize=13, color=COLOR_TEXT)
+    param_line  = fig.text(msg_text_x, fail_line_y, "", fontsize=13, color=COLOR_TEXT)
+    fail_line_1 = fig.text(msg_text_x, fail_line_y, "", fontsize=11, color="#fbbf24")
+    fail_line_2 = fig.text(msg_text_x, fail_line_y, "", fontsize=11, color="#fca5a5")
+
+    # status indicator: dedicated square axes keeps a true circle and aligns with status text line
+    status_diameter = 0.03  # 1.5x previous 0.02 diameter
+    status_ax = fig.add_axes([0.282, status_line_y - 0.0063, status_diameter, status_diameter])
+    status_ax.set_aspect('equal')
+    status_ax.axis('off')
+    status_dot = Circle((0.5, 0.5), 0.45, transform=status_ax.transAxes, facecolor="gray", edgecolor="black")
+    status_ax.add_patch(status_dot)
+
+    # Bottom-right logo (same anchor style as gui_test), enlarged 1.5x and nudged left/up
+    if app_logo_path:
+        try:
+            force_ax_x, force_ax_y, force_ax_w, _force_ax_h = 0.30, 0.25, 0.67, 0.65
+            logo_w, logo_h = 0.297, 0.0432  # 1.5x current size while preserving aspect ratio
+            logo_x = (force_ax_x + force_ax_w) - logo_w + (1.0 / 14.0) - ((3.0 / 25.4) / 14.0)
+            logo_y = 0.01 + ((1.0 / 25.4) / 8.0)
+            ax_logo = fig.add_axes([logo_x, logo_y, logo_w, logo_h])
+            ax_logo.imshow(mpimg.imread(app_logo_path))
+            ax_logo.axis("off")
+        except Exception:
+            pass
+    else:
+        fig.text(0.035, 0.95, "ROBOSPEED", fontsize=16, color=COLOR_TEXT, weight="bold")
+
+    # ---- LEFT PANEL ----
+    y_top = 0.875
+    dy = 0.062
+
+    fig.text(0.0594, y_top + 0.063, "Run Controls", color="#e2e8f0", fontsize=12, weight="bold", zorder=5)
+    fig.text(0.0594, y_top - 7.09*dy + 0.02, "Settings", color="#e2e8f0", fontsize=12, weight="bold", zorder=5)
+
+    btn_start = Button(fig.add_axes([0.0594, y_top, 0.14, 0.05]), "Start", color="#22c55e", hovercolor="#16a34a")
+    btn_pause = Button(fig.add_axes([0.0594, y_top - dy, 0.14, 0.05]), "Pause", color="#f59e0b", hovercolor="#d97706")
+    btn_stop = Button(fig.add_axes([0.0594, y_top - 2*dy, 0.14, 0.05]), "Stop", color="#ef4444", hovercolor="#dc2626")
+    btn_home = Button(fig.add_axes([0.0594, y_top - 3*dy, 0.14, 0.05]), "Home", color="#64748b", hovercolor="#475569")
+    btn_reset = Button(fig.add_axes([0.0594, y_top - 4*dy, 0.14, 0.05]), "Reset", color="#94a3b8", hovercolor="#64748b")
+    btn_report = Button(fig.add_axes([0.0594, y_top - 5*dy, 0.14, 0.05]), "Download Report", color="#3b82f6", hovercolor="#2563eb")
+    btn_exit = Button(fig.add_axes([0.0594, y_top - 6*dy, 0.14, 0.05]), "Exit", color="#b91c1c", hovercolor="#991b1b")
+
+    tb_w = 0.06174
+    tb_x = (0.0594 + 0.14) - tb_w
+    tb_y_shift = 0.005
+    tb_vel = TextBox(fig.add_axes([tb_x, y_top - 7.98*dy - tb_y_shift + 0.02, tb_w, 0.05]), "Vel (0-1000)", initial=str(state.vel))
+    tb_acc = TextBox(fig.add_axes([tb_x, y_top - 8.98*dy - tb_y_shift + 0.02, tb_w, 0.05]), "Acc(0-2000)", initial=str(state.acc))
+    tb_jerk = TextBox(fig.add_axes([tb_x, y_top - 9.98*dy - tb_y_shift + 0.02, tb_w, 0.05]), "Jerk(0-10,000)", initial=str(state.jerk))
+    tb_cyc = TextBox(fig.add_axes([tb_x, y_top - 10.97*dy - tb_y_shift + 0.02, tb_w, 0.05]), "Cycles", initial=str(state.target_cycles))
+    tb_base = TextBox(fig.add_axes([tb_x, y_top - 11.97*dy - tb_y_shift + 0.02, tb_w, 0.05]), "Baseline", initial=str(state.baseline_cycles))
+    force_row_y = y_top - 12.97*dy - tb_y_shift + 0.02
+    force_box_gap = 0.006
+    force_box_w = (tb_w - force_box_gap) / 2
+    fmin_x = tb_x
+    fmax_x = tb_x + force_box_w + force_box_gap
+    tb_fmin = TextBox(fig.add_axes([fmin_x, force_row_y, force_box_w, 0.05]), "Force", initial=str(state.force_min))
+    tb_fmax = TextBox(fig.add_axes([fmax_x, force_row_y, force_box_w, 0.05]), "", initial=str(state.force_max))
+
+    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report]:
+        _btn.label.set_color("white")
+        _btn.label.set_fontsize(12)
+
+    for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
+        _tb.label.set_color("white")
+        _tb.label.set_horizontalalignment("left")
+        _tb.label.set_position((-1.27, 0.5))
+    for _tb in [tb_fmin, tb_fmax]:
+        _tb.label.set_color("white")
+    tb_fmin.label.set_horizontalalignment("left")
+    force_label_x = -1.27 * (tb_w / force_box_w)
+    tb_fmin.label.set_position((force_label_x, 0.5))
+
+    def clamp(v, lo, hi):
+        return max(lo, min(hi, v))
+
+    def set_alert(color, msg):
+        with state_lock:
+            state.alert_color = color
+            state.alert_msg = msg
+            state.alert_until_wall = time.time() + ALERT_FLASH_S
+
+    def go_home():
+        print("[Robot] Going Home")
+        robot.play(-1, {
+            "cmd": "jmove", "rel": 0,
+            "vel": SAFE_START_VEL,
+            "acc": SAFE_START_ACC,
+            "jerk": SAFE_START_JERK,
+            **HOME_POSE
+        })
+
+    # ✅ KEY FIX: apply current TextBox values on Start (even if on_submit didn't fire)
+    def apply_textbox_values():
+        def _parse_int(text, fallback):
+            try:
+                return int(float(text))
+            except Exception:
+                return fallback
+
+        def _parse_float(text, fallback):
+            try:
+                return float(text)
+            except Exception:
+                return fallback
+
+        with state_lock:
+            v = _parse_int(tb_vel.text, state.vel)
+            a = _parse_int(tb_acc.text, state.acc)
+            j = _parse_int(tb_jerk.text, state.jerk)
+            c = _parse_int(tb_cyc.text, state.target_cycles)
+            b = _parse_int(tb_base.text, state.baseline_cycles)
+            fmin = _parse_float(tb_fmin.text, state.force_min)
+            fmax = _parse_float(tb_fmax.text, state.force_max)
+
+            state.vel = clamp(v, VEL_MIN, VEL_MAX)
+            state.acc = clamp(a, ACC_MIN, ACC_MAX)
+            state.jerk = clamp(j, JERK_MIN, JERK_MAX)
+            if c > 0:
+                state.target_cycles = c
+            new_base = clamp(b, 1, 500)
+            if new_base != state.baseline_cycles:
+                state.baseline_cycles = new_base
+                state.baseline_peaks = {"A": [], "B": [], "C": [], "D": []}
+                state.baseline_mean = {}
+                state.baseline_ready = False
+            else:
+                state.baseline_cycles = new_base
+
+            if fmax > fmin:
+                state.force_min = fmin
+                state.force_max = fmax
+
+
+    def on_start(_evt):
+        apply_textbox_values()
+        with state_lock:
+            resume_from_pause = state.paused and not state.stopped
+            state.running = True
+            state.paused = False
+            state.stopped = False
+
+            if resume_from_pause:
+                resume_cycle = state.cycle_count
+                resume_step = state.traj_index
+            else:
+                state.traj_index = 0
+                state.cycle_count = 0
+                state.aligned_to_A = False
+                state.window_active = False
+                state.window_button = None
+                state.window_peak_force = None
+                state.window_peak_time = None
+                resume_cycle = 0
+                resume_step = 0
+        if resume_from_pause:
+            print(f"[GUI] Start pressed -> Resuming from cycle {resume_cycle}, step {resume_step}")
+        else:
+            print("[GUI] Start pressed -> New run")
+
+    def on_pause(_evt):
+        with state_lock:
+            state.running = False
+            state.paused = True
+        print("[GUI] Pause pressed")
+
+    def on_stop(_evt):
+        with state_lock:
+            state.running = False
+            state.paused = False
+            state.stopped = True
+            state.traj_index = 0
+            state.cycle_count = 0
+            state.aligned_to_A = False
+            state.window_active = False
+            state.window_button = None
+            state.window_peak_force = None
+            state.window_peak_time = None
+        print("[GUI] Stop pressed -> Going Home")
+        go_home()
+
+    def on_home(_evt):
+        go_home()
+
+    def on_reset(_evt):
+        with state_lock:
+            state.force_out_of_range = {"A": 0, "B": 0, "C": 0, "D": 0}
+            state.button_did_not_retract = {"A": 0, "B": 0, "C": 0, "D": 0}
+            state.baseline_peaks = {"A": [], "B": [], "C": [], "D": []}
+            state.baseline_mean = {}
+            state.baseline_ready = False
+        print("[GUI] Reset pressed -> counters + baseline cleared")
+
+    def build_report_pdf(path):
+        target_dir = os.path.dirname(path) or "."
+        if not os.access(target_dir, os.W_OK):
+            raise PermissionError(f"No write permission to directory: {target_dir}")
+
+        with state_lock:
+            report_name = state.test_name.strip() or "test_report"
+            peak_copy = {b: list(report_peak_cycles[b]) for b in BUTTON_ORDER}
+            force_copy = {b: list(report_peak_forces[b]) for b in BUTTON_ORDER}
+            miss_copy = {b: list(report_missed_cycles[b]) for b in BUTTON_ORDER}
+            oor_copy = {b: list(report_oor_cycles[b]) for b in BUTTON_ORDER}
+            state_cycles = state.cycle_count
+            baseline_used = state.baseline_cycles
+            force_min_used = state.force_min
+            force_max_used = state.force_max
+            settings_used = {
+                "Velocity": state.vel,
+                "Acceleration": state.acc,
+                "Jerk": state.jerk,
+                "Target cycles": state.target_cycles,
+                "Baseline cycles": state.baseline_cycles,
+                "Force min": state.force_min,
+                "Force max": state.force_max,
+            }
+
+        observed_cycles = []
+        for b in BUTTON_ORDER:
+            observed_cycles.extend(peak_copy[b])
+            observed_cycles.extend(miss_copy[b])
+            observed_cycles.extend(oor_copy[b])
+        total_cycles = max(observed_cycles) if observed_cycles else state_cycles
+
+        pdf = PdfPages(path)
+        try:
+            summary_fig = plt.figure(figsize=(11, 8.5), facecolor="white")
+            summary_fig.suptitle(f"Test Report: {report_name}", fontsize=20, weight="bold", y=0.96)
+
+            if app_logo_path:
+                try:
+                    ax_logo_rep = summary_fig.add_axes([0.66, 0.03, 0.30, 0.08])
+                    ax_logo_rep.imshow(mpimg.imread(app_logo_path))
+                    ax_logo_rep.axis("off")
+                except Exception:
+                    pass
+
+            txt = (
+                f"Total cycles completed: {total_cycles}\n"
+                f"Baseline cycles setting: {baseline_used}\n"
+                f"Force valid range: {force_min_used} to {force_max_used} lbs"
+            )
+            summary_fig.text(0.08, 0.78, txt, fontsize=12, va='top')
+            settings_txt = "\n".join([f"{k}: {v}" for k, v in settings_used.items()])
+            summary_fig.text(0.08, 0.53, "Settings used for this test:", fontsize=12, weight="bold", va='top')
+            summary_fig.text(0.08, 0.49, settings_txt, fontsize=11, va='top')
+            summary_fig.text(0.08, 0.60, "Buttons tracked: A, B, C, D", fontsize=11, color="#334155")
+            pdf.savefig(summary_fig)
+            plt.close(summary_fig)
+
+            for b in BUTTON_ORDER:
+                fig_btn, ax_btn = plt.subplots(figsize=(11, 4.5))
+                ax_btn.set_title(f"Button {b}: Force vs Cycle")
+                ax_btn.set_xlabel("Cycle Count")
+                ax_btn.set_ylabel("Peak Force (lbs)")
+                ax_btn.grid(True, axis='y', alpha=0.3)
+
+                if peak_copy[b]:
+                    ax_btn.plot(peak_copy[b], force_copy[b], marker='o', linewidth=1.5, color='black', label='Peak force')
+
+                for i, cyc in enumerate(miss_copy[b]):
+                    ax_btn.axvline(cyc, color='red', linestyle='--', linewidth=1.5,
+                                   label='Did not retract' if i == 0 else None)
+
+                for i, cyc in enumerate(oor_copy[b]):
+                    ax_btn.axvline(cyc, color='orange', linestyle='--', linewidth=1.5,
+                                   label='Force out of range' if i == 0 else None)
+
+                handles, labels = ax_btn.get_legend_handles_labels()
+                if labels:
+                    ax_btn.legend(loc='best')
+
+                oor_n = len(oor_copy[b])
+                miss_n = len(miss_copy[b])
+                ax_btn.text(
+                    0.01, -0.22,
+                    f"Total force out of range failures: {oor_n}    Total button did not retract failures: {miss_n}",
+                    transform=ax_btn.transAxes,
+                    fontsize=10,
+                    color='black',
+                    va='top'
+                )
+
+                fig_btn.tight_layout(rect=[0, 0.08, 1, 1])
+                pdf.savefig(fig_btn)
+                plt.close(fig_btn)
+        finally:
+            pdf.close()
+
+    def on_download_report(_evt):
+        apply_textbox_values()
+        with state_lock:
+            default_name = "test_report.pdf"
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            path = filedialog.asksaveasfilename(
+                title="Save test report",
+                defaultextension=".pdf",
+                initialfile=default_name,
+                initialdir=os.path.expanduser("~"),
+                filetypes=[("PDF files", "*.pdf")],
+            )
+        finally:
+            root.destroy()
+
+        if path:
+            try:
+                with state_lock:
+                    state.test_name = os.path.splitext(os.path.basename(path))[0] or "test_report"
+                build_report_pdf(path)
+                set_alert("green", f"Report saved: {path}")
+                print(f"[Report] Saved: {path}")
+            except PermissionError as exc:
+                set_alert("red", f"Report save failed: {exc}")
+                print(f"[Report] Permission error: {exc}")
+            except Exception as exc:
+                set_alert("red", f"Report save failed: {exc}")
+                print(f"[Report] Save failed: {exc}")
+
+    def on_exit(_evt):
+        with state_lock:
+            state.exit_requested = True
+            state.running = False
+            state.paused = False
+            state.stopped = True
+        plt.close(fig)
+
+    btn_start.on_clicked(on_start)
+    btn_pause.on_clicked(on_pause)
+    btn_stop.on_clicked(on_stop)
+    btn_home.on_clicked(on_home)
+    btn_reset.on_clicked(on_reset)
+    btn_report.on_clicked(on_download_report)
+    btn_exit.on_clicked(on_exit)
+
+    # TextBox callbacks (kept, but now also locked)
+    def on_vel_submit(text):
+        try:
+            v = int(float(text))
+            with state_lock:
+                state.vel = clamp(v, VEL_MIN, VEL_MAX)
+        except Exception:
+            pass
+
+    def on_acc_submit(text):
+        try:
+            a = int(float(text))
+            with state_lock:
+                state.acc = clamp(a, ACC_MIN, ACC_MAX)
+        except Exception:
+            pass
+
+    def on_jerk_submit(text):
+        try:
+            j = int(float(text))
+            with state_lock:
+                state.jerk = clamp(j, JERK_MIN, JERK_MAX)
+        except Exception:
+            pass
+
+    def on_cyc_submit(text):
+        try:
+            c = int(float(text))
+            if c > 0:
+                with state_lock:
+                    state.target_cycles = c
+        except Exception:
+            pass
+
+    def on_base_submit(text):
+        try:
+            b = int(float(text))
+            with state_lock:
+                new_base = clamp(b, 1, 500)
+                if new_base != state.baseline_cycles:
+                    state.baseline_cycles = new_base
+                    state.baseline_peaks = {"A": [], "B": [], "C": [], "D": []}
+                    state.baseline_mean = {}
+                    state.baseline_ready = False
+                else:
+                    state.baseline_cycles = new_base
+        except Exception:
+            pass
+
+    def on_fmin_submit(text):
+        try:
+            fmin = float(text)
+            with state_lock:
+                if state.force_max > fmin:
+                    state.force_min = fmin
+        except Exception:
+            pass
+
+    def on_fmax_submit(text):
+        try:
+            fmax = float(text)
+            with state_lock:
+                if fmax > state.force_min:
+                    state.force_max = fmax
+        except Exception:
+            pass
+
+    tb_vel.on_submit(on_vel_submit)
+    tb_acc.on_submit(on_acc_submit)
+    tb_jerk.on_submit(on_jerk_submit)
+    tb_cyc.on_submit(on_cyc_submit)
+    tb_base.on_submit(on_base_submit)
+    tb_fmin.on_submit(on_fmin_submit)
+    tb_fmax.on_submit(on_fmax_submit)
+
+    # ---- Force buffers ----
+    times = deque()
+    forces = deque()
+    start_time = time.time()
+
+    peak_events = deque()
+    peak_scatter = None
+    peak_texts = []
+
+    report_peak_cycles = {b: [] for b in BUTTON_ORDER}
+    report_peak_forces = {b: [] for b in BUTTON_ORDER}
+    report_missed_cycles = {b: [] for b in BUTTON_ORDER}
+    report_oor_cycles = {b: [] for b in BUTTON_ORDER}
+
+    print("Streaming + GUI running (Stage D force window v5).")
+
+    try:
+        while True:
+            with state_lock:
+                if state.exit_requested:
+                    break
+            # FORCE sample
+            raw = bridge.getVoltageRatio()
+            t_now = time.time() - start_time
+            force = (raw - zero_offset) * calibration_factor
+
+            times.append(t_now)
+            forces.append(force)
+
+            while times and (t_now - times[0] > window_seconds):
+                times.popleft()
+                forces.popleft()
+
+            # Track peak during active window
+            with state_lock:
+                if state.window_active:
+                    if state.window_peak_force is None or force > state.window_peak_force:
+                        state.window_peak_force = force
+                        state.window_peak_time = t_now
+
+            # Plot update
+            if len(times) > 1:
+                line.set_data(times, forces)
+                ax.set_xlim(times[0], times[-1])
+
+            # ROBOT stepping
+            with state_lock:
+                running = state.running
+
+            if running and is_idle(robot):
+                with state_lock:
+                    if state.cycle_count >= state.target_cycles:
+                        state.running = False
+                        state.paused = False
+                        state.stopped = True
+                        state.traj_index = 0
+                        state.aligned_to_A = False
+                        print("[Robot] Target cycles reached. Stopping.")
+                    else:
+                        if not state.aligned_to_A:
+                            print("[Robot] Safe Align A-above")
+                            robot.play(-1, {
+                                "cmd": "jmove", "rel": 0,
+                                "vel": SAFE_START_VEL,
+                                "acc": SAFE_START_ACC,
+                                "jerk": SAFE_START_JERK,
+                                **BUTTON_POSES["A"]["above"]
+                            })
+                            state.aligned_to_A = True
+                            state.traj_index = 1
+                        else:
+                            idx = state.traj_index
+                            pos = TRAJECTORY[idx]
+                            btn, ph = INDEX_TO_META[idx]
+
+                            # CLOSE window before sending retract
+                            if ph == "retract" and state.window_active and state.window_button == btn:
+                                peak = state.window_peak_force
+
+                                cycle_num = state.cycle_count + 1
+
+                                if peak is None or peak < peak_start_threshold:
+                                    state.button_did_not_retract[btn] += 1
+                                    report_missed_cycles[btn].append(cycle_num)
+                                    peak_events.append({"t": t_now, "y": peak_start_threshold, "btn": btn, "missed": True})
+                                    set_alert("red", f"Missed peak on {btn}")
+                                    print(f"[ForceWindow] MISS {btn}")
+                                else:
+                                    peak_t = state.window_peak_time if state.window_peak_time is not None else t_now
+                                    report_peak_cycles[btn].append(cycle_num)
+                                    report_peak_forces[btn].append(float(peak))
+                                    peak_events.append({"t": peak_t, "y": float(peak), "btn": btn, "missed": False})
+
+                                    # baseline collect
+                                    if state.cycle_count < state.baseline_cycles:
+                                        state.baseline_peaks[btn].append(float(peak))
+                                        ready = all(len(state.baseline_peaks[b]) >= state.baseline_cycles for b in BUTTON_ORDER)
+                                        if ready and (not state.baseline_ready):
+                                            state.baseline_mean = {b: float(np.mean(state.baseline_peaks[b])) for b in BUTTON_ORDER}
+                                            state.baseline_ready = True
+                                            set_alert("green", "Baseline ready")
+                                            print("[Baseline] READY:", state.baseline_mean)
+
+                                    out_of_range = False
+                                    baseline_deviation = False
+
+                                    # out of range
+                                    if not (state.force_min <= peak <= state.force_max):
+                                        out_of_range = True
+                                        set_alert("orange", f"Force out of range {btn}: {peak:.2f}")
+                                        print(f"[ForceWindow] OOR {btn} peak={peak:.2f}")
+
+                                    # baseline deviation
+                                    if state.baseline_ready and btn in state.baseline_mean and state.baseline_mean[btn] > 0:
+                                        base = state.baseline_mean[btn]
+                                        if abs(peak - base) > base * deviation_threshold:
+                                            baseline_deviation = True
+                                            set_alert("orange", f"Baseline dev {btn}: {peak:.2f} vs {base:.2f}")
+                                            print(f"[ForceWindow] DEV {btn} peak={peak:.2f} base={base:.2f}")
+
+                                    # Increment once per press even if both checks fail.
+                                    if out_of_range or baseline_deviation:
+                                        state.force_out_of_range[btn] += 1
+                                        report_oor_cycles[btn].append(cycle_num)
+
+                                # close window
+                                state.window_active = False
+                                state.window_button = None
+                                state.window_peak_force = None
+                                state.window_peak_time = None
+
+                            # OPEN window before press
+                            if ph == "press":
+                                state.window_active = True
+                                state.window_button = btn
+                                state.window_peak_force = None
+                                state.window_peak_time = None
+                                print(f"[ForceWindow] OPEN {btn}")
+
+                            vel = clamp(int(state.vel), VEL_MIN, VEL_MAX)
+                            acc = clamp(int(state.acc), ACC_MIN, ACC_MAX)
+                            jerk = clamp(int(state.jerk), JERK_MIN, JERK_MAX)
+
+                            print(f"[Robot] Move idx={idx} {btn}-{ph} vel={vel} acc={acc} jerk={jerk}")
+                            robot.play(-1, {
+                                "cmd": "jmove", "rel": 0,
+                                "vel": vel,
+                                "acc": acc,
+                                "jerk": jerk,
+                                **pos
+                            })
+
+                            state.traj_index += 1
+                            if state.traj_index >= len(TRAJECTORY):
+                                state.traj_index = 0
+                                state.cycle_count += 1
+                                print(f"[Robot] Cycle complete -> {state.cycle_count}")
+
+            # UI text / alerts
+            with state_lock:
+                mode = "RUNNING" if state.running else ("PAUSED" if state.paused else "STOPPED")
+                base_color = "green" if state.running else ("orange" if state.paused else "gray")
+
+                now_wall = time.time()
+                if now_wall <= state.alert_until_wall:
+                    status_dot.set_facecolor(state.alert_color)
+                    alert_msg = state.alert_msg
+                else:
+                    status_dot.set_facecolor(base_color)
+                    alert_msg = ""
+
+                idx = state.traj_index % len(TRAJECTORY)
+                btn, ph = INDEX_TO_META[idx]
+
+                if state.baseline_ready:
+                    baseline_txt = "Baseline: READY"
+                else:
+                    min_n = min(len(state.baseline_peaks[b]) for b in BUTTON_ORDER)
+                    baseline_txt = f"Baseline: {min_n}/{state.baseline_cycles} per button"
+
+                status_line.set_text(
+                    f"State: {mode} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
+                )
+                param_line.set_text("")
+                fail_line_1.set_text(
+                    f"Force out of range  A:{state.force_out_of_range['A']}  B:{state.force_out_of_range['B']}  C:{state.force_out_of_range['C']}  D:{state.force_out_of_range['D']} | "
+                    f"Button did not retract  A:{state.button_did_not_retract['A']}  B:{state.button_did_not_retract['B']}  C:{state.button_did_not_retract['C']}  D:{state.button_did_not_retract['D']}"
+                )
+                fail_line_2.set_text("")
+
+                force_band.remove()
+                force_band = ax.axhspan(state.force_min, state.force_max, alpha=0.18, color="#93c5fd")
+
+                while peak_events and (t_now - peak_events[0]["t"] > window_seconds):
+                    peak_events.popleft()
+
+                if peak_scatter is not None:
+                    peak_scatter.remove()
+                    peak_scatter = None
+
+                for txt in peak_texts:
+                    txt.remove()
+                peak_texts = []
+
+                if peak_events:
+                    x_evt = [e["t"] for e in peak_events]
+                    y_evt = [e["y"] for e in peak_events]
+                    c_evt = ["red" if e["missed"] else "black" for e in peak_events]
+                    peak_scatter = ax.scatter(x_evt, y_evt, c=c_evt, s=36, zorder=3)
+
+                    for e in peak_events:
+                        y_off = 0.08 if e["missed"] else 0.04
+                        label = f"{e['btn']} (MISS)" if e["missed"] else e["btn"]
+                        txt = ax.text(e["t"], e["y"] + y_off, label, fontsize=10, color=("red" if e["missed"] else "black"),
+                                      ha="center", va="bottom", zorder=4)
+                        peak_texts.append(txt)
+
+            plt.pause(update_interval)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            bridge.close()
+        except Exception:
+            pass
+        try:
+            robot.close()
+        except Exception:
+            pass
+        print("Exited cleanly.")
+
+
+if __name__ == "__main__":
+    main()
