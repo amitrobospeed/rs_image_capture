@@ -93,6 +93,8 @@ class InspectionCapture:
 @dataclass
 class ControllerConfig:
     motion_port     : str  = "COM3"     # serial port for robot motion controller
+    motion_host     : str  = "192.168.1.24"  # ethernet host for Dorna motion controller
+    motion_tcp_port : int  = 443         # ethernet port for Dorna motion controller
     daq_port        : str  = "COM4"     # serial port for force DAQ
     camera_c1_id    : int  = 0          # OpenCV camera index
     camera_c2_id    : int  = 1
@@ -110,45 +112,212 @@ class MotionDriver:
     def __init__(self, config: ControllerConfig):
         self._cfg = config
         self._connected = False
+        self._transport = "sim"
+        self._robot = None
+        self._ser = None
+        self._last_params = MotionParams()
+
+    @staticmethod
+    def _extract_stat(resp) -> Optional[int]:
+        """Extract Dorna 'stat' from possible response envelope shapes."""
+        if isinstance(resp, dict):
+            if "stat" in resp:
+                return int(resp["stat"])
+            union = resp.get("union")
+            if isinstance(union, dict) and "stat" in union:
+                return int(union["stat"])
+            msgs = resp.get("msgs")
+            if isinstance(msgs, list) and msgs:
+                m0 = msgs[0]
+                if isinstance(m0, dict) and "stat" in m0:
+                    return int(m0["stat"])
+        return None
+
+    def _wait_dorna_idle(self, timeout_s: float = 10.0) -> bool:
+        if not self._robot:
+            return False
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            try:
+                s = self._extract_stat(self._robot.play(-1, {"cmd": "stat"}))
+                if s == -1:  # idle in your firmware
+                    return True
+            except Exception as e:
+                log.debug(f"MotionDriver: stat poll failed: {e}")
+            time.sleep(0.05)
+        return False
 
     def connect(self) -> bool:
         if self._cfg.sim_mode:
-            log.info("MotionDriver: simulation mode — no serial connection")
+            log.info("MotionDriver: simulation mode — no motion connection")
             self._connected = True
+            self._transport = "sim"
             return True
+
+        # Preferred path: Dorna over Ethernet
+        try:
+            from dorna2 import Dorna
+            self._robot = Dorna()
+            self._robot.connect(host=self._cfg.motion_host,
+                                port=self._cfg.motion_tcp_port)
+            self._connected = True
+            self._transport = "dorna_ethernet"
+            log.info(
+                f"MotionDriver: connected to Dorna @ "
+                f"{self._cfg.motion_host}:{self._cfg.motion_tcp_port}"
+            )
+            return True
+        except Exception as e:
+            log.warning(f"MotionDriver: Dorna ethernet connect failed: {e}")
+
+        # Fallback: generic serial motion controller
         try:
             import serial
             self._ser = serial.Serial(self._cfg.motion_port, 115200, timeout=1)
             self._connected = True
-            log.info(f"MotionDriver: connected on {self._cfg.motion_port}")
+            self._transport = "serial"
+            log.info(f"MotionDriver: connected on serial {self._cfg.motion_port}")
             return True
         except Exception as e:
             log.error(f"MotionDriver.connect failed: {e}")
             return False
 
     def disconnect(self):
-        if not self._cfg.sim_mode and hasattr(self, "_ser"):
+        if self._transport == "serial" and self._ser is not None:
             self._ser.close()
+        if self._transport == "dorna_ethernet" and self._robot is not None:
+            try:
+                self._robot.close()
+            except Exception:
+                pass
         self._connected = False
 
     def home(self) -> bool:
         log.info("MotionDriver: HOME command")
-        return True   # TODO: send HOME command, wait for completion
+        if self._cfg.sim_mode:
+            return True
+        if self._transport == "dorna_ethernet" and self._robot is not None:
+            try:
+                self._robot.play(0, {
+                    "cmd": "jmove",
+                    "rel": 0,
+                    "vel": self._last_params.velocity,
+                    "accel": self._last_params.acceleration,
+                    "jerk": self._last_params.jerk,
+                    "x": 318.06,
+                    "y": -38.16,
+                    "z": 200.0,
+                    "a": -173.0,
+                    "b": 41.62,
+                    "c": -3.53,
+                })
+                return self._wait_dorna_idle(timeout_s=15.0)
+            except Exception as e:
+                log.error(f"MotionDriver.home failed (ethernet): {e}")
+                return False
+
+        if self._transport == "serial" and self._ser is not None:
+            try:
+                self._ser.write(b"HOME\r\n")
+                return self._ser.readline().strip() == b"OK"
+            except Exception as e:
+                log.error(f"MotionDriver.home failed (serial): {e}")
+                return False
+        return False
 
     def set_params(self, params: MotionParams):
         log.info(f"MotionDriver: set_params vel={params.velocity} "
                  f"acc={params.acceleration} jerk={params.jerk}")
-        # TODO: write velocity/accel/jerk to controller
+        self._last_params = params
+        if self._cfg.sim_mode:
+            return
+        if self._transport == "serial" and self._ser is not None:
+            try:
+                cmd = (
+                    f"SET VEL {params.velocity};ACC {params.acceleration};"
+                    f"JERK {params.jerk}\r\n"
+                )
+                self._ser.write(cmd.encode("ascii"))
+                self._ser.readline()
+            except Exception as e:
+                log.warning(f"MotionDriver.set_params serial write failed: {e}")
 
     def run_cycle(self) -> bool:
         """Execute one press-release cycle. Returns True when complete."""
-        # TODO: send CYCLE command; poll until done
-        time.sleep(0.05)   # sim: fake 50 ms cycle time
-        return True
+        if self._cfg.sim_mode:
+            time.sleep(0.05)   # sim: fake 50 ms cycle time
+            return True
+
+        if self._transport == "dorna_ethernet" and self._robot is not None:
+            try:
+                self._robot.play(0, {
+                    "cmd": "jmove",
+                    "rel": 0,
+                    "vel": self._last_params.velocity,
+                    "accel": self._last_params.acceleration,
+                    "jerk": self._last_params.jerk,
+                    "x": 318.06,
+                    "y": -38.16,
+                    "z": 127.44,
+                    "a": -173.0,
+                    "b": 41.62,
+                    "c": -3.53,
+                })
+                self._robot.play(0, {
+                    "cmd": "jmove",
+                    "rel": 0,
+                    "vel": self._last_params.velocity,
+                    "accel": self._last_params.acceleration,
+                    "jerk": self._last_params.jerk,
+                    "x": 318.06,
+                    "y": -38.16,
+                    "z": 120.40,
+                    "a": -173.0,
+                    "b": 41.62,
+                    "c": -3.53,
+                })
+                self._robot.play(0, {
+                    "cmd": "jmove",
+                    "rel": 0,
+                    "vel": self._last_params.velocity,
+                    "accel": self._last_params.acceleration,
+                    "jerk": self._last_params.jerk,
+                    "x": 318.06,
+                    "y": -38.16,
+                    "z": 127.44,
+                    "a": -173.0,
+                    "b": 41.62,
+                    "c": -3.53,
+                })
+                return self._wait_dorna_idle(timeout_s=10.0)
+            except Exception as e:
+                log.error(f"MotionDriver.run_cycle failed (ethernet): {e}")
+                return False
+
+        if self._transport == "serial" and self._ser is not None:
+            try:
+                self._ser.write(b"CYCLE\r\n")
+                return self._ser.readline().strip() == b"OK"
+            except Exception as e:
+                log.error(f"MotionDriver.run_cycle failed (serial): {e}")
+                return False
+        return False
 
     def stop(self):
         log.info("MotionDriver: STOP command")
-        # TODO: immediate stop
+        if self._cfg.sim_mode:
+            return
+        if self._transport == "dorna_ethernet" and self._robot is not None:
+            try:
+                self._robot.play(0, {"cmd": "halt"})
+            except Exception as e:
+                log.error(f"MotionDriver.stop failed (ethernet): {e}")
+            return
+        if self._transport == "serial" and self._ser is not None:
+            try:
+                self._ser.write(b"STOP\r\n")
+            except Exception as e:
+                log.error(f"MotionDriver.stop failed (serial): {e}")
 
     def record_trajectory(self):
         log.info("MotionDriver: RECORD TRAJECTORY command")
@@ -564,6 +733,10 @@ def _parse_args():
                    help="Connect to real hardware")
     p.add_argument("--motion-port",  default="COM3",
                    help="Serial port for motion controller (default COM3)")
+    p.add_argument("--motion-host",  default="192.168.1.24",
+                   help="Ethernet host for Dorna motion controller")
+    p.add_argument("--motion-tcp-port",  type=int, default=443,
+                   help="Ethernet TCP port for Dorna motion controller")
     p.add_argument("--daq-port",     default="COM4",
                    help="Serial port for force DAQ (default COM4)")
     p.add_argument("--cam-c1",       type=int, default=0,
@@ -577,6 +750,8 @@ def main():
     args  = _parse_args()
     cfg   = ControllerConfig(
         motion_port  = args.motion_port,
+        motion_host  = args.motion_host,
+        motion_tcp_port = args.motion_tcp_port,
         daq_port     = args.daq_port,
         camera_c1_id = args.cam_c1,
         camera_c2_id = args.cam_c2,
