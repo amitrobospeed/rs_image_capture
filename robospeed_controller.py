@@ -171,23 +171,6 @@ class MotionDriver:
                 f"{self._cfg.motion_host}:{self._cfg.motion_tcp_port}"
             )
             return True
-            self._connected = True
-            self._transport = "sim"
-            return True
-
-        # Preferred path: Dorna over Ethernet
-        try:
-            from dorna2 import Dorna
-            self._robot = Dorna()
-            self._robot.connect(host=self._cfg.motion_host,
-                                port=self._cfg.motion_tcp_port)
-            self._connected = True
-            self._transport = "dorna_ethernet"
-            log.info(
-                f"MotionDriver: connected to Dorna @ "
-                f"{self._cfg.motion_host}:{self._cfg.motion_tcp_port}"
-            )
-            return True
         except Exception as e:
             log.warning(f"MotionDriver: Dorna ethernet connect failed: {e}")
 
@@ -407,29 +390,10 @@ class ForceDAQ:
             self._bridge.setDataInterval(self._cfg.force_data_interval_ms)
 
             # Tare / zero-offset at connect time
-            samples = [self._bridge.getVoltageRatio() for _ in range(200)]
-            self._zero_offset = sum(samples) / len(samples)
-
-            self._connected = True
-            self._transport = "phidget"
-            log.info(
-                f"ForceDAQ: connected via Phidget serial={self._cfg.phidget_serial} "
-                f"channel={self._cfg.phidget_channel}, zero={self._zero_offset:.8f}"
-            )
-            return True
-            return True
-
-        # Preferred path: Phidget22 bridge (matches Stage D v24)
-        try:
-            from Phidget22.Devices.VoltageRatioInput import VoltageRatioInput
-            self._bridge = VoltageRatioInput()
-            self._bridge.setDeviceSerialNumber(self._cfg.phidget_serial)
-            self._bridge.setChannel(self._cfg.phidget_channel)
-            self._bridge.openWaitForAttachment(5000)
-            self._bridge.setDataInterval(self._cfg.force_data_interval_ms)
-
-            # Tare / zero-offset at connect time
-            samples = [self._bridge.getVoltageRatio() for _ in range(200)]
+            samples = []
+            for _ in range(200):
+                samples.append(self._bridge.getVoltageRatio())
+                time.sleep(0.001)
             self._zero_offset = sum(samples) / len(samples)
 
             self._connected = True
