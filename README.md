@@ -475,6 +475,43 @@ In sim mode the graph always updates. In hardware mode the `ForceDAQ.read_lbs()`
 
 ---
 
+### GitHub PR shows **"Update branch"** and merge conflicts
+
+This happens when your PR branch is behind the target branch (usually `work`) and both branches changed the same lines.
+
+To avoid manual conflict resolution in GitHub UI, update your local PR branch first, then push:
+
+```bash
+git fetch origin
+git checkout work
+git pull --rebase origin work
+git push origin work
+```
+
+If a conflict already happened and you see options like **"Current / Incoming / Both"**:
+
+- **Current change** = code already on your branch.
+- **Incoming change** = code coming from the branch you are merging/rebasing onto.
+- **Both changes** = keep both blocks, then manually clean duplicates.
+
+For this project, prefer resolving conflicts locally (not in browser UI) so you can run a syntax check before pushing:
+
+```bash
+python3 -m py_compile robospeed_controller.py
+```
+
+If you get `SyntaxError: expected 'except' or 'finally' block`, that usually means a bad merge edit around `try:` (or unresolved conflict markers like `<<<<<<<`, `=======`, `>>>>>>>`).
+
+Quick check:
+
+```bash
+rg -n "^(<<<<<<<|=======|>>>>>>>)" robospeed_controller.py
+```
+
+If matches are found, remove markers and keep only the final intended code, then run `py_compile` again.
+
+---
+
 ### High CPU usage
 
 PyQtGraph is set to 50 Hz sampling. If CPU is high, reduce the sampling rate in `MockDataThread.run()` (sim) or in the `TestLoopThread` force sampling loop:
