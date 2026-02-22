@@ -417,6 +417,28 @@ class ForceDAQ:
                 f"channel={self._cfg.phidget_channel}, zero={self._zero_offset:.8f}"
             )
             return True
+            return True
+
+        # Preferred path: Phidget22 bridge (matches Stage D v24)
+        try:
+            from Phidget22.Devices.VoltageRatioInput import VoltageRatioInput
+            self._bridge = VoltageRatioInput()
+            self._bridge.setDeviceSerialNumber(self._cfg.phidget_serial)
+            self._bridge.setChannel(self._cfg.phidget_channel)
+            self._bridge.openWaitForAttachment(5000)
+            self._bridge.setDataInterval(self._cfg.force_data_interval_ms)
+
+            # Tare / zero-offset at connect time
+            samples = [self._bridge.getVoltageRatio() for _ in range(200)]
+            self._zero_offset = sum(samples) / len(samples)
+
+            self._connected = True
+            self._transport = "phidget"
+            log.info(
+                f"ForceDAQ: connected via Phidget serial={self._cfg.phidget_serial} "
+                f"channel={self._cfg.phidget_channel}, zero={self._zero_offset:.8f}"
+            )
+            return True
         except Exception as e:
             log.warning(f"ForceDAQ: Phidget connect failed: {e}")
 
