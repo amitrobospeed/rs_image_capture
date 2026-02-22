@@ -447,6 +447,7 @@ class ForceGraph(QWidget):
         self.setPalette(pal)
         pg.setConfigOptions(antialias=True)
         self._mode = "time"
+        self._time_window_s = 10.0
         self._tbuf = deque(maxlen=3000)
         self._fbuf = deque(maxlen=3000)
         self._cbuf = deque(maxlen=3000)
@@ -526,6 +527,13 @@ class ForceGraph(QWidget):
 
     def push(self, t, force, cycle=0):
         self._tbuf.append(t); self._fbuf.append(force); self._cbuf.append(cycle)
+
+        # Match Stage D behavior: show a rolling 10-second window.
+        while self._tbuf and (t - self._tbuf[0] > self._time_window_s):
+            self._tbuf.popleft()
+            self._fbuf.popleft()
+            self._cbuf.popleft()
+
         self._redraw()
         if self._fbuf: self._peak_lbl.setText(f"Peak: {max(self._fbuf):.3f} lbs")
 

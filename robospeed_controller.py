@@ -284,8 +284,10 @@ class MotionDriver:
                         "jerk": self._last_params.jerk,
                         **pose,
                     })
+                    if not self._wait_dorna_idle(timeout_s=5.0):
+                        return False
 
-                return self._wait_dorna_idle(timeout_s=30.0)
+                return True
             except Exception as e:
                 log.error(f"MotionDriver.run_cycle failed (ethernet): {e}")
                 return False
@@ -537,6 +539,9 @@ class TestLoopThread(QThread):
         self._stop_req  = False
         self._lock      = threading.Lock()
         self._t0        = time.time()
+        self._sample_cycle = 0
+        self._sample_collecting = False
+        self._sample_peak = 0.0
 
     # ── control ──────────────────────────────────────────────────
     def request_stop(self):
@@ -556,37 +561,52 @@ class TestLoopThread(QThread):
 
         self._motion.set_params(self._params)
         cycle = 0
-        peaks_this_cycle: list[float] = []
         force_sample_interval = 0.02   # 50 Hz
+
+        # Stream force continuously (Stage D-style live scrolling graph).
+        def _sample_loop():
+            while self._running:
+                f = self._daq.read_lbs()
+                t = time.time() - self._t0
+                with self._lock:
+                    c = self._sample_cycle
+                    collecting = self._sample_collecting
+                    if collecting and f > self._sample_peak:
+                        self._sample_peak = f
+                self.sig_force_live.emit(t, f, c)
+                time.sleep(force_sample_interval)
+
+        sampler = threading.Thread(target=_sample_loop, daemon=True)
+        sampler.start()
 
         for cycle in range(1, self._params.target_cycles + 1):
             with self._lock:
-                if self._stop_req: break
+                if self._stop_req:
+                    break
 
             # Wait while paused
             while True:
                 with self._lock:
-                    if not self._paused or self._stop_req: break
+                    if not self._paused or self._stop_req:
+                        break
                 time.sleep(0.05)
 
-            # ── Execute one cycle ──────────────────────────────────
-            peaks_this_cycle.clear()
-            t_cycle_start = time.time()
+            # Execute one full cycle (A/B/C/D). Count increments only after completion.
+            with self._lock:
+                self._sample_cycle = cycle
+                self._sample_peak = 0.0
+                self._sample_collecting = True
 
             ok = self._motion.run_cycle()
+
+            with self._lock:
+                peak = self._sample_peak
+                self._sample_collecting = False
+
             if not ok:
                 self.sig_error.emit(f"Motion error at cycle {cycle}")
                 break
 
-            # ── Sample force during cycle ──────────────────────────
-            while time.time() - t_cycle_start < 0.3:   # 300 ms window
-                f = self._daq.read_lbs()
-                t = time.time() - self._t0
-                self.sig_force_live.emit(t, f, cycle)
-                peaks_this_cycle.append(f)
-                time.sleep(force_sample_interval)
-
-            peak = max(peaks_this_cycle) if peaks_this_cycle else 0.0
             force_ok   = self._params.force_min_lbs <= peak <= self._params.force_max_lbs
             retract_ok = True   # TODO: read retract sensor
 
@@ -613,6 +633,7 @@ class TestLoopThread(QThread):
                         InspectionCapture(cycle, cam, ftype, data))
 
         self._running = False
+        sampler.join(timeout=0.2)
         self.sig_finished.emit()
         log.info(f"TestLoopThread: finished after {cycle} cycles")
 
