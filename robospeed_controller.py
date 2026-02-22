@@ -286,46 +286,6 @@ class MotionDriver:
                     })
 
                 return self._wait_dorna_idle(timeout_s=30.0)
-                self._robot.play(0, {
-                    "cmd": "jmove",
-                    "rel": 0,
-                    "vel": self._last_params.velocity,
-                    "accel": self._last_params.acceleration,
-                    "jerk": self._last_params.jerk,
-                    "x": 318.06,
-                    "y": -38.16,
-                    "z": 127.44,
-                    "a": -173.0,
-                    "b": 41.62,
-                    "c": -3.53,
-                })
-                self._robot.play(0, {
-                    "cmd": "jmove",
-                    "rel": 0,
-                    "vel": self._last_params.velocity,
-                    "accel": self._last_params.acceleration,
-                    "jerk": self._last_params.jerk,
-                    "x": 318.06,
-                    "y": -38.16,
-                    "z": 120.40,
-                    "a": -173.0,
-                    "b": 41.62,
-                    "c": -3.53,
-                })
-                self._robot.play(0, {
-                    "cmd": "jmove",
-                    "rel": 0,
-                    "vel": self._last_params.velocity,
-                    "accel": self._last_params.acceleration,
-                    "jerk": self._last_params.jerk,
-                    "x": 318.06,
-                    "y": -38.16,
-                    "z": 127.44,
-                    "a": -173.0,
-                    "b": 41.62,
-                    "c": -3.53,
-                })
-                return self._wait_dorna_idle(timeout_s=10.0)
             except Exception as e:
                 log.error(f"MotionDriver.run_cycle failed (ethernet): {e}")
                 return False
@@ -389,11 +349,10 @@ class ForceDAQ:
             self._bridge.openWaitForAttachment(5000)
             self._bridge.setDataInterval(self._cfg.force_data_interval_ms)
 
-            # Tare / zero-offset at connect time
-            samples = []
-            for _ in range(200):
-                samples.append(self._bridge.getVoltageRatio())
-                time.sleep(0.001)
+            # Stage D v24 behavior: wait, then tare from 200 samples.
+            log.info("ForceDAQ: taring force sensor...")
+            time.sleep(1.0)
+            samples = [self._bridge.getVoltageRatio() for _ in range(200)]
             self._zero_offset = sum(samples) / len(samples)
 
             self._connected = True
@@ -439,7 +398,7 @@ class ForceDAQ:
             try:
                 raw = self._bridge.getVoltageRatio()
                 force = (raw - self._zero_offset) * self._cfg.force_calibration_factor
-                return float(max(0.0, force))
+                return float(force)
             except Exception as e:
                 log.debug(f"ForceDAQ.read_lbs phidget read failed: {e}")
                 return 0.0
