@@ -96,6 +96,10 @@ class ControllerConfig:
     motion_host     : str  = "192.168.1.24"  # ethernet host for Dorna motion controller
     motion_tcp_port : int  = 443         # ethernet port for Dorna motion controller
     daq_port        : str  = "COM4"     # serial port for force DAQ
+    phidget_serial  : int  = 781028     # Phidget bridge serial for force sensor
+    phidget_channel : int  = 0          # Phidget channel index
+    force_calibration_factor: float = 68000.0  # voltage ratio -> lbs
+    force_data_interval_ms : int   = 8          # Phidget sampling interval
     camera_c1_id    : int  = 0          # OpenCV camera index
     camera_c2_id    : int  = 1
     sim_mode        : bool = True       # True = no real hardware
@@ -150,6 +154,23 @@ class MotionDriver:
     def connect(self) -> bool:
         if self._cfg.sim_mode:
             log.info("MotionDriver: simulation mode — no motion connection")
+            self._connected = True
+            self._transport = "sim"
+            return True
+
+        # Preferred path: Dorna over Ethernet
+        try:
+            from dorna2 import Dorna
+            self._robot = Dorna()
+            self._robot.connect(host=self._cfg.motion_host,
+                                port=self._cfg.motion_tcp_port)
+            self._connected = True
+            self._transport = "dorna_ethernet"
+            log.info(
+                f"MotionDriver: connected to Dorna @ "
+                f"{self._cfg.motion_host}:{self._cfg.motion_tcp_port}"
+            )
+            return True
             self._connected = True
             self._transport = "sim"
             return True
@@ -358,29 +379,66 @@ class MotionDriver:
 
 class ForceDAQ:
     """
-    Reads force sensor via serial / USB DAQ.
+    Reads force sensor via Phidget bridge or serial DAQ.
     In sim_mode generates synthetic force data.
     """
     def __init__(self, config: ControllerConfig):
         self._cfg = config
         self._connected = False
         self._t0 = time.time()
+        self._zero_offset = 0.0
+        self._transport = "sim"
+        self._bridge = None
+        self._ser = None
 
     def connect(self) -> bool:
         if self._cfg.sim_mode:
             self._connected = True
+            self._transport = "sim"
             return True
+
+        # Preferred path: Phidget22 bridge (matches Stage D v24)
+        try:
+            from Phidget22.Devices.VoltageRatioInput import VoltageRatioInput
+            self._bridge = VoltageRatioInput()
+            self._bridge.setDeviceSerialNumber(self._cfg.phidget_serial)
+            self._bridge.setChannel(self._cfg.phidget_channel)
+            self._bridge.openWaitForAttachment(5000)
+            self._bridge.setDataInterval(self._cfg.force_data_interval_ms)
+
+            # Tare / zero-offset at connect time
+            samples = [self._bridge.getVoltageRatio() for _ in range(200)]
+            self._zero_offset = sum(samples) / len(samples)
+
+            self._connected = True
+            self._transport = "phidget"
+            log.info(
+                f"ForceDAQ: connected via Phidget serial={self._cfg.phidget_serial} "
+                f"channel={self._cfg.phidget_channel}, zero={self._zero_offset:.8f}"
+            )
+            return True
+        except Exception as e:
+            log.warning(f"ForceDAQ: Phidget connect failed: {e}")
+
+        # Fallback path: generic serial DAQ
         try:
             import serial
             self._ser = serial.Serial(self._cfg.daq_port, 115200, timeout=0.1)
             self._connected = True
+            self._transport = "serial"
+            log.info(f"ForceDAQ: connected on serial {self._cfg.daq_port}")
             return True
         except Exception as e:
             log.error(f"ForceDAQ.connect failed: {e}")
             return False
 
     def disconnect(self):
-        if not self._cfg.sim_mode and hasattr(self, "_ser"):
+        if self._transport == "phidget" and self._bridge is not None:
+            try:
+                self._bridge.close()
+            except Exception:
+                pass
+        if self._transport == "serial" and self._ser is not None:
             self._ser.close()
 
     def read_lbs(self) -> float:
@@ -390,7 +448,25 @@ class ForceDAQ:
             t = time.time() - self._t0
             return max(0.0, 1.1 * math.sin(2 * math.pi * 0.2 * t)
                        + random.gauss(0, 0.015))
-        # TODO: read from serial DAQ
+
+        if self._transport == "phidget" and self._bridge is not None:
+            try:
+                raw = self._bridge.getVoltageRatio()
+                force = (raw - self._zero_offset) * self._cfg.force_calibration_factor
+                return float(max(0.0, force))
+            except Exception as e:
+                log.debug(f"ForceDAQ.read_lbs phidget read failed: {e}")
+                return 0.0
+
+        if self._transport == "serial" and self._ser is not None:
+            try:
+                self._ser.write(b"READ\r\n")
+                raw = self._ser.readline().strip()
+                return float(raw)
+            except Exception as e:
+                log.debug(f"ForceDAQ.read_lbs serial read failed: {e}")
+                return 0.0
+
         return 0.0
 
 
@@ -771,6 +847,14 @@ def _parse_args():
                    help="Ethernet TCP port for Dorna motion controller")
     p.add_argument("--daq-port",     default="COM4",
                    help="Serial port for force DAQ (default COM4)")
+    p.add_argument("--phidget-serial", type=int, default=781028,
+                   help="Phidget bridge serial for force sensor")
+    p.add_argument("--phidget-channel", type=int, default=0,
+                   help="Phidget channel index for force sensor")
+    p.add_argument("--force-calibration-factor", type=float, default=68000.0,
+                   help="Force conversion factor from voltage ratio to lbs")
+    p.add_argument("--force-data-interval-ms", type=int, default=8,
+                   help="Phidget data interval in milliseconds")
     p.add_argument("--cam-c1",       type=int, default=0,
                    help="OpenCV index for camera C1")
     p.add_argument("--cam-c2",       type=int, default=1,
@@ -785,6 +869,10 @@ def main():
         motion_host  = args.motion_host,
         motion_tcp_port = args.motion_tcp_port,
         daq_port     = args.daq_port,
+        phidget_serial = args.phidget_serial,
+        phidget_channel = args.phidget_channel,
+        force_calibration_factor = args.force_calibration_factor,
+        force_data_interval_ms = args.force_data_interval_ms,
         camera_c1_id = args.cam_c1,
         camera_c2_id = args.cam_c2,
         sim_mode     = args.sim,
