@@ -250,6 +250,38 @@ class MotionDriver:
 
         if self._transport == "dorna_ethernet" and self._robot is not None:
             try:
+                # One cycle = visit A/B/C/D, each with above -> press -> retract.
+                # Matches Stage D trajectory semantics.
+                cycle_poses = [
+                    # A
+                    {"x": 318.06, "y": -38.16, "z": 127.44, "a": -173.0,  "b": 41.62, "c": -3.53},
+                    {"x": 318.06, "y": -38.16, "z": 120.40, "a": -173.0,  "b": 41.62, "c": -3.53},
+                    {"x": 318.06, "y": -38.16, "z": 127.44, "a": -173.0,  "b": 41.62, "c": -3.53},
+                    # B
+                    {"x": 327.02, "y": -21.69, "z": 127.44, "a": -173.8,  "b": 32.25, "c": -4.81},
+                    {"x": 327.02, "y": -21.69, "z": 118.70, "a": -173.8,  "b": 32.25, "c": -4.81},
+                    {"x": 327.02, "y": -21.69, "z": 127.44, "a": -173.8,  "b": 32.25, "c": -4.81},
+                    # C
+                    {"x": 342.30, "y": -29.64, "z": 127.44, "a": -174.83, "b": 34.08, "c": -6.71},
+                    {"x": 342.30, "y": -29.64, "z": 120.38, "a": -174.83, "b": 34.08, "c": -6.71},
+                    {"x": 342.30, "y": -29.64, "z": 127.44, "a": -174.83, "b": 34.08, "c": -6.71},
+                    # D
+                    {"x": 335.08, "y": -43.88, "z": 125.13, "a": -173.84, "b": 43.25, "c": -4.86},
+                    {"x": 335.08, "y": -43.88, "z": 121.70, "a": -173.84, "b": 43.25, "c": -4.86},
+                    {"x": 335.08, "y": -43.88, "z": 127.44, "a": -173.84, "b": 43.25, "c": -4.86},
+                ]
+
+                for pose in cycle_poses:
+                    self._robot.play(0, {
+                        "cmd": "jmove",
+                        "rel": 0,
+                        "vel": self._last_params.velocity,
+                        "accel": self._last_params.acceleration,
+                        "jerk": self._last_params.jerk,
+                        **pose,
+                    })
+
+                return self._wait_dorna_idle(timeout_s=30.0)
                 self._robot.play(0, {
                     "cmd": "jmove",
                     "rel": 0,
