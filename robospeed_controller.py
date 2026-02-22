@@ -171,6 +171,23 @@ class MotionDriver:
                 f"{self._cfg.motion_host}:{self._cfg.motion_tcp_port}"
             )
             return True
+            self._connected = True
+            self._transport = "sim"
+            return True
+
+        # Preferred path: Dorna over Ethernet
+        try:
+            from dorna2 import Dorna
+            self._robot = Dorna()
+            self._robot.connect(host=self._cfg.motion_host,
+                                port=self._cfg.motion_tcp_port)
+            self._connected = True
+            self._transport = "dorna_ethernet"
+            log.info(
+                f"MotionDriver: connected to Dorna @ "
+                f"{self._cfg.motion_host}:{self._cfg.motion_tcp_port}"
+            )
+            return True
         except Exception as e:
             log.warning(f"MotionDriver: Dorna ethernet connect failed: {e}")
 
@@ -286,6 +303,46 @@ class MotionDriver:
                     })
 
                 return self._wait_dorna_idle(timeout_s=30.0)
+                self._robot.play(0, {
+                    "cmd": "jmove",
+                    "rel": 0,
+                    "vel": self._last_params.velocity,
+                    "accel": self._last_params.acceleration,
+                    "jerk": self._last_params.jerk,
+                    "x": 318.06,
+                    "y": -38.16,
+                    "z": 127.44,
+                    "a": -173.0,
+                    "b": 41.62,
+                    "c": -3.53,
+                })
+                self._robot.play(0, {
+                    "cmd": "jmove",
+                    "rel": 0,
+                    "vel": self._last_params.velocity,
+                    "accel": self._last_params.acceleration,
+                    "jerk": self._last_params.jerk,
+                    "x": 318.06,
+                    "y": -38.16,
+                    "z": 120.40,
+                    "a": -173.0,
+                    "b": 41.62,
+                    "c": -3.53,
+                })
+                self._robot.play(0, {
+                    "cmd": "jmove",
+                    "rel": 0,
+                    "vel": self._last_params.velocity,
+                    "accel": self._last_params.acceleration,
+                    "jerk": self._last_params.jerk,
+                    "x": 318.06,
+                    "y": -38.16,
+                    "z": 127.44,
+                    "a": -173.0,
+                    "b": 41.62,
+                    "c": -3.53,
+                })
+                return self._wait_dorna_idle(timeout_s=10.0)
             except Exception as e:
                 log.error(f"MotionDriver.run_cycle failed (ethernet): {e}")
                 return False
