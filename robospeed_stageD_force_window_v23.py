@@ -519,8 +519,10 @@ def main():
 
     # Two-row manual/camera controls, 4 mm above camera pane
     camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.25, 0.32, 0.65
-    row2_y = camera_ax_y + camera_ax_h + (4.0 * mm_to_fig_y)
-    row1_y = row2_y + manual_btn_h + manual_btn_gap
+    # Align Row 1 top edge with force graph top edge
+    force_ax_top = 0.25 + 0.65
+    row1_y = force_ax_top - manual_btn_h
+    row2_y = row1_y - (manual_btn_h + manual_btn_gap)
     manual_btn_w = (camera_ax_w - (4 * manual_btn_gap)) / 5
 
     fig.text(camera_ax_x, row1_y + manual_btn_h + 0.006, "Manual IC / Camera", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
