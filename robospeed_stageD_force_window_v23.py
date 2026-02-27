@@ -517,28 +517,31 @@ def main():
     manual_btn_h = 0.033
     manual_btn_gap = 0.004
 
-    # Single horizontal row, 4 mm above camera pane
+    # Two-row manual/camera controls, 4 mm above camera pane
     camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.25, 0.32, 0.65
-    manual_row_y = camera_ax_y + camera_ax_h + (4.0 * mm_to_fig_y)
-    manual_btn_w = (camera_ax_w - (6 * manual_btn_gap)) / 7
+    row2_y = camera_ax_y + camera_ax_h + (4.0 * mm_to_fig_y)
+    row1_y = row2_y + manual_btn_h + manual_btn_gap
+    manual_btn_w = (camera_ax_w - (4 * manual_btn_gap)) / 5
 
-    fig.text(camera_ax_x, manual_row_y + manual_btn_h + 0.006, "Manual IC / Camera", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
+    fig.text(camera_ax_x, row1_y + manual_btn_h + 0.006, "Manual IC / Camera", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
 
     x0 = camera_ax_x
-    btn_ic_home = Button(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "IC Home", color="#0ea5e9", hovercolor="#0284c7")
-    btn_return_test = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Return to Test", color="#0891b2", hovercolor="#0e7490")
-    btn_camera_tune = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Camera Tune", color="#16a34a", hovercolor="#15803d")
-    btn_golden_capture = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Golden Capture", color="#d97706", hovercolor="#b45309")
-    btn_image_capture = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
-    btn_run_inspection = Button(fig.add_axes([x0 + 5 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Run Inspection", color="#7c3aed", hovercolor="#6d28d9")
-    btn_re_tare = Button(fig.add_axes([x0 + 6 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Re-tare", color="#475569", hovercolor="#334155")
+    # Row 1: IC Home, Camera Tune, Golden Capture, Image Capture, Run Inspection
+    btn_ic_home = Button(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), row1_y, manual_btn_w, manual_btn_h]), "IC Home", color="#0ea5e9", hovercolor="#0284c7")
+    btn_camera_tune = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row1_y, manual_btn_w, manual_btn_h]), "Camera Tune", color="#16a34a", hovercolor="#15803d")
+    btn_golden_capture = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row1_y, manual_btn_w, manual_btn_h]), "Golden Capture", color="#d97706", hovercolor="#b45309")
+    btn_image_capture = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row1_y, manual_btn_w, manual_btn_h]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
+    btn_run_inspection = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), row1_y, manual_btn_w, manual_btn_h]), "Run Inspection", color="#7c3aed", hovercolor="#6d28d9")
 
-    btn_tare_on_start = Button(fig.add_axes([0.0594, y_top - 7*dy, 0.14, 0.05]), "Tare@Start: ON", color="#0f766e", hovercolor="#115e59")
+    # Row 2: Return to Test, Re-tare, Tare@Start ON/OFF
+    btn_return_test = Button(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Return to Test", color="#0891b2", hovercolor="#0e7490")
+    btn_re_tare = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Re-tare", color="#475569", hovercolor="#334155")
+    btn_tare_on_start = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Tare@Start: ON", color="#0f766e", hovercolor="#115e59")
 
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start,
                  btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare] else 12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_tare_on_start] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
