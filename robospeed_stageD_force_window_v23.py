@@ -247,9 +247,6 @@ def main():
                 _set_camera_status("camera:open_failed")
                 return
 
-            cv2.namedWindow(CAMERA_WINDOW_NAME, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(CAMERA_WINDOW_NAME, 960, 540)
-            cv2.moveWindow(CAMERA_WINDOW_NAME, 980, 120)
             _set_camera_status("camera:live")
 
             # warmup frames
@@ -277,21 +274,13 @@ def main():
                     with camera_lock:
                         camera_latest_frame = frame.copy()
 
-                    overlay = frame.copy()
-                    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    cv2.putText(overlay, f"{CAMERA_WINDOW_NAME}  {stamp}", (20, 36),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                    cv2.imshow(CAMERA_WINDOW_NAME, overlay)
-                    cv2.waitKey(1)
+                    # Frame is rendered inside the matplotlib window (same app window).
             finally:
                 try:
                     pipeline.stop()
                 except Exception:
                     pass
-                try:
-                    cv2.destroyWindow(CAMERA_WINDOW_NAME)
-                except Exception:
-                    pass
+                pass
 
         camera_thread = threading.Thread(target=_camera_worker, daemon=True)
         camera_thread.start()
@@ -323,8 +312,8 @@ def main():
     fig.patches.append(Rectangle((0.02, 0.0628), 0.2076, 0.9098, transform=fig.transFigure,
                                  facecolor=COLOR_PANEL, edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-1))
 
-    # Plot on right
-    ax = fig.add_axes([0.30, 0.25, 0.67, 0.65])
+    # Plot area (force + camera in same matplotlib window)
+    ax = fig.add_axes([0.30, 0.25, 0.32, 0.65])
     ax.set_ylim(-0.2, 2.0)
     ax.set_ylabel("Force (lbs)", fontsize=22, color="white")
     ax.set_xlabel("Time (s)", fontsize=16, color="white")
@@ -336,6 +325,15 @@ def main():
     force_band = ax.axhspan(state.force_min, state.force_max, alpha=0.18, color="#93c5fd")
 
     (line,) = ax.plot([], [], linewidth=2.5, color="#0ea5e9")
+
+    # Camera pane (same window as force graph)
+    ax_cam = fig.add_axes([0.65, 0.25, 0.32, 0.65])
+    ax_cam.set_title("IC Camera", fontsize=20, color=COLOR_TEXT)
+    ax_cam.set_xticks([])
+    ax_cam.set_yticks([])
+    ax_cam.set_facecolor("#0b1220")
+    cam_placeholder = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+    camera_im = ax_cam.imshow(cam_placeholder)
 
     # Messages (no bbox), keep two-line spacing at ~1.5 lines
     status_line_y = 0.095
@@ -1102,6 +1100,11 @@ def main():
                     min_n = min(len(state.baseline_peaks[b]) for b in BUTTON_ORDER)
                     baseline_txt = f"Baseline: {min_n}/{state.baseline_cycles} per button"
 
+                frame = get_latest_camera_frame()
+                if frame is not None:
+                    camera_im.set_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                ax_cam.set_title(f"IC Camera ({camera_txt})", fontsize=20, color=COLOR_TEXT)
+
                 status_line.set_text(
                     f"State: {mode} | {manual_state} | Camera: {camera_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
                 )
@@ -1146,10 +1149,6 @@ def main():
     finally:
         try:
             stop_camera_preview()
-        except Exception:
-            pass
-        try:
-            cv2.destroyAllWindows()
         except Exception:
             pass
         try:
