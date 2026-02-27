@@ -93,7 +93,13 @@ class InspectionCapture:
 @dataclass
 class ControllerConfig:
     motion_port     : str  = "COM3"     # serial port for robot motion controller
+    motion_host     : str  = "192.168.1.24"  # ethernet host for Dorna motion controller
+    motion_tcp_port : int  = 443         # ethernet port for Dorna motion controller
     daq_port        : str  = "COM4"     # serial port for force DAQ
+    phidget_serial  : int  = 781028     # Phidget bridge serial for force sensor
+    phidget_channel : int  = 0          # Phidget channel index
+    force_calibration_factor: float = 68000.0  # voltage ratio -> lbs
+    force_data_interval_ms : int   = 8          # Phidget sampling interval
     camera_c1_id    : int  = 0          # OpenCV camera index
     camera_c2_id    : int  = 1
     sim_mode        : bool = True       # True = no real hardware
@@ -110,45 +116,206 @@ class MotionDriver:
     def __init__(self, config: ControllerConfig):
         self._cfg = config
         self._connected = False
+        self._transport = "sim"
+        self._robot = None
+        self._ser = None
+        self._last_params = MotionParams()
+
+    @staticmethod
+    def _extract_stat(resp) -> Optional[int]:
+        """Extract Dorna 'stat' from possible response envelope shapes."""
+        if isinstance(resp, dict):
+            if "stat" in resp:
+                return int(resp["stat"])
+            union = resp.get("union")
+            if isinstance(union, dict) and "stat" in union:
+                return int(union["stat"])
+            msgs = resp.get("msgs")
+            if isinstance(msgs, list) and msgs:
+                m0 = msgs[0]
+                if isinstance(m0, dict) and "stat" in m0:
+                    return int(m0["stat"])
+        return None
+
+    def _wait_dorna_idle(self, timeout_s: float = 10.0) -> bool:
+        if not self._robot:
+            return False
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            try:
+                s = self._extract_stat(self._robot.play(-1, {"cmd": "stat"}))
+                if s == -1:  # idle in your firmware
+                    return True
+            except Exception as e:
+                log.debug(f"MotionDriver: stat poll failed: {e}")
+            time.sleep(0.05)
+        return False
 
     def connect(self) -> bool:
         if self._cfg.sim_mode:
-            log.info("MotionDriver: simulation mode — no serial connection")
+            log.info("MotionDriver: simulation mode — no motion connection")
             self._connected = True
+            self._transport = "sim"
             return True
+
+        # Preferred path: Dorna over Ethernet
+        try:
+            from dorna2 import Dorna
+            self._robot = Dorna()
+            self._robot.connect(host=self._cfg.motion_host,
+                                port=self._cfg.motion_tcp_port)
+            self._connected = True
+            self._transport = "dorna_ethernet"
+            log.info(
+                f"MotionDriver: connected to Dorna @ "
+                f"{self._cfg.motion_host}:{self._cfg.motion_tcp_port}"
+            )
+            return True
+        except Exception as e:
+            log.warning(f"MotionDriver: Dorna ethernet connect failed: {e}")
+
+        # Fallback: generic serial motion controller
         try:
             import serial
             self._ser = serial.Serial(self._cfg.motion_port, 115200, timeout=1)
             self._connected = True
-            log.info(f"MotionDriver: connected on {self._cfg.motion_port}")
+            self._transport = "serial"
+            log.info(f"MotionDriver: connected on serial {self._cfg.motion_port}")
             return True
         except Exception as e:
             log.error(f"MotionDriver.connect failed: {e}")
             return False
 
     def disconnect(self):
-        if not self._cfg.sim_mode and hasattr(self, "_ser"):
+        if self._transport == "serial" and self._ser is not None:
             self._ser.close()
+        if self._transport == "dorna_ethernet" and self._robot is not None:
+            try:
+                self._robot.close()
+            except Exception:
+                pass
         self._connected = False
 
     def home(self) -> bool:
         log.info("MotionDriver: HOME command")
-        return True   # TODO: send HOME command, wait for completion
+        if self._cfg.sim_mode:
+            return True
+        if self._transport == "dorna_ethernet" and self._robot is not None:
+            try:
+                self._robot.play(0, {
+                    "cmd": "jmove",
+                    "rel": 0,
+                    "vel": self._last_params.velocity,
+                    "accel": self._last_params.acceleration,
+                    "jerk": self._last_params.jerk,
+                    "x": 318.06,
+                    "y": -38.16,
+                    "z": 200.0,
+                    "a": -173.0,
+                    "b": 41.62,
+                    "c": -3.53,
+                })
+                return self._wait_dorna_idle(timeout_s=15.0)
+            except Exception as e:
+                log.error(f"MotionDriver.home failed (ethernet): {e}")
+                return False
+
+        if self._transport == "serial" and self._ser is not None:
+            try:
+                self._ser.write(b"HOME\r\n")
+                return self._ser.readline().strip() == b"OK"
+            except Exception as e:
+                log.error(f"MotionDriver.home failed (serial): {e}")
+                return False
+        return False
 
     def set_params(self, params: MotionParams):
         log.info(f"MotionDriver: set_params vel={params.velocity} "
                  f"acc={params.acceleration} jerk={params.jerk}")
-        # TODO: write velocity/accel/jerk to controller
+        self._last_params = params
+        if self._cfg.sim_mode:
+            return
+        if self._transport == "serial" and self._ser is not None:
+            try:
+                cmd = (
+                    f"SET VEL {params.velocity};ACC {params.acceleration};"
+                    f"JERK {params.jerk}\r\n"
+                )
+                self._ser.write(cmd.encode("ascii"))
+                self._ser.readline()
+            except Exception as e:
+                log.warning(f"MotionDriver.set_params serial write failed: {e}")
 
     def run_cycle(self) -> bool:
         """Execute one press-release cycle. Returns True when complete."""
-        # TODO: send CYCLE command; poll until done
-        time.sleep(0.05)   # sim: fake 50 ms cycle time
-        return True
+        if self._cfg.sim_mode:
+            time.sleep(0.05)   # sim: fake 50 ms cycle time
+            return True
+
+        if self._transport == "dorna_ethernet" and self._robot is not None:
+            try:
+                # One cycle = visit A/B/C/D, each with above -> press -> retract.
+                # Matches Stage D trajectory semantics.
+                cycle_poses = [
+                    # A
+                    {"x": 318.06, "y": -38.16, "z": 127.44, "a": -173.0,  "b": 41.62, "c": -3.53},
+                    {"x": 318.06, "y": -38.16, "z": 120.40, "a": -173.0,  "b": 41.62, "c": -3.53},
+                    {"x": 318.06, "y": -38.16, "z": 127.44, "a": -173.0,  "b": 41.62, "c": -3.53},
+                    # B
+                    {"x": 327.02, "y": -21.69, "z": 127.44, "a": -173.8,  "b": 32.25, "c": -4.81},
+                    {"x": 327.02, "y": -21.69, "z": 118.70, "a": -173.8,  "b": 32.25, "c": -4.81},
+                    {"x": 327.02, "y": -21.69, "z": 127.44, "a": -173.8,  "b": 32.25, "c": -4.81},
+                    # C
+                    {"x": 342.30, "y": -29.64, "z": 127.44, "a": -174.83, "b": 34.08, "c": -6.71},
+                    {"x": 342.30, "y": -29.64, "z": 120.38, "a": -174.83, "b": 34.08, "c": -6.71},
+                    {"x": 342.30, "y": -29.64, "z": 127.44, "a": -174.83, "b": 34.08, "c": -6.71},
+                    # D
+                    {"x": 335.08, "y": -43.88, "z": 125.13, "a": -173.84, "b": 43.25, "c": -4.86},
+                    {"x": 335.08, "y": -43.88, "z": 121.70, "a": -173.84, "b": 43.25, "c": -4.86},
+                    {"x": 335.08, "y": -43.88, "z": 127.44, "a": -173.84, "b": 43.25, "c": -4.86},
+                ]
+
+                for pose in cycle_poses:
+                    self._robot.play(0, {
+                        "cmd": "jmove",
+                        "rel": 0,
+                        "vel": self._last_params.velocity,
+                        "accel": self._last_params.acceleration,
+                        "jerk": self._last_params.jerk,
+                        **pose,
+                    })
+                    if not self._wait_dorna_idle(timeout_s=5.0):
+                        return False
+
+                return True
+            except Exception as e:
+                log.error(f"MotionDriver.run_cycle failed (ethernet): {e}")
+                return False
+
+        if self._transport == "serial" and self._ser is not None:
+            try:
+                self._ser.write(b"CYCLE\r\n")
+                return self._ser.readline().strip() == b"OK"
+            except Exception as e:
+                log.error(f"MotionDriver.run_cycle failed (serial): {e}")
+                return False
+        return False
 
     def stop(self):
         log.info("MotionDriver: STOP command")
-        # TODO: immediate stop
+        if self._cfg.sim_mode:
+            return
+        if self._transport == "dorna_ethernet" and self._robot is not None:
+            try:
+                self._robot.play(0, {"cmd": "halt"})
+            except Exception as e:
+                log.error(f"MotionDriver.stop failed (ethernet): {e}")
+            return
+        if self._transport == "serial" and self._ser is not None:
+            try:
+                self._ser.write(b"STOP\r\n")
+            except Exception as e:
+                log.error(f"MotionDriver.stop failed (serial): {e}")
 
     def record_trajectory(self):
         log.info("MotionDriver: RECORD TRAJECTORY command")
@@ -157,29 +324,68 @@ class MotionDriver:
 
 class ForceDAQ:
     """
-    Reads force sensor via serial / USB DAQ.
+    Reads force sensor via Phidget bridge or serial DAQ.
     In sim_mode generates synthetic force data.
     """
     def __init__(self, config: ControllerConfig):
         self._cfg = config
         self._connected = False
         self._t0 = time.time()
+        self._zero_offset = 0.0
+        self._transport = "sim"
+        self._bridge = None
+        self._ser = None
 
     def connect(self) -> bool:
         if self._cfg.sim_mode:
             self._connected = True
+            self._transport = "sim"
             return True
+
+        # Preferred path: Phidget22 bridge (matches Stage D v24)
+        try:
+            from Phidget22.Devices.VoltageRatioInput import VoltageRatioInput
+            self._bridge = VoltageRatioInput()
+            self._bridge.setDeviceSerialNumber(self._cfg.phidget_serial)
+            self._bridge.setChannel(self._cfg.phidget_channel)
+            self._bridge.openWaitForAttachment(5000)
+            self._bridge.setDataInterval(self._cfg.force_data_interval_ms)
+
+            # Stage D v24 behavior: wait, then tare from 200 samples.
+            log.info("ForceDAQ: taring force sensor...")
+            time.sleep(1.0)
+            samples = [self._bridge.getVoltageRatio() for _ in range(200)]
+            self._zero_offset = sum(samples) / len(samples)
+
+            self._connected = True
+            self._transport = "phidget"
+            log.info(
+                f"ForceDAQ: connected via Phidget serial={self._cfg.phidget_serial} "
+                f"channel={self._cfg.phidget_channel}, zero={self._zero_offset:.8f}"
+            )
+            return True
+        except Exception as e:
+            log.warning(f"ForceDAQ: Phidget connect failed: {e}")
+
+        # Fallback path: generic serial DAQ
         try:
             import serial
             self._ser = serial.Serial(self._cfg.daq_port, 115200, timeout=0.1)
             self._connected = True
+            self._transport = "serial"
+            log.info(f"ForceDAQ: connected on serial {self._cfg.daq_port}")
             return True
         except Exception as e:
             log.error(f"ForceDAQ.connect failed: {e}")
             return False
 
     def disconnect(self):
-        if not self._cfg.sim_mode and hasattr(self, "_ser"):
+        if self._transport == "phidget" and self._bridge is not None:
+            try:
+                self._bridge.close()
+            except Exception:
+                pass
+        if self._transport == "serial" and self._ser is not None:
             self._ser.close()
 
     def read_lbs(self) -> float:
@@ -189,7 +395,25 @@ class ForceDAQ:
             t = time.time() - self._t0
             return max(0.0, 1.1 * math.sin(2 * math.pi * 0.2 * t)
                        + random.gauss(0, 0.015))
-        # TODO: read from serial DAQ
+
+        if self._transport == "phidget" and self._bridge is not None:
+            try:
+                raw = self._bridge.getVoltageRatio()
+                force = (raw - self._zero_offset) * self._cfg.force_calibration_factor
+                return float(force)
+            except Exception as e:
+                log.debug(f"ForceDAQ.read_lbs phidget read failed: {e}")
+                return 0.0
+
+        if self._transport == "serial" and self._ser is not None:
+            try:
+                self._ser.write(b"READ\r\n")
+                raw = self._ser.readline().strip()
+                return float(raw)
+            except Exception as e:
+                log.debug(f"ForceDAQ.read_lbs serial read failed: {e}")
+                return 0.0
+
         return 0.0
 
 
@@ -315,6 +539,9 @@ class TestLoopThread(QThread):
         self._stop_req  = False
         self._lock      = threading.Lock()
         self._t0        = time.time()
+        self._sample_cycle = 0
+        self._sample_collecting = False
+        self._sample_peak = 0.0
 
     # ── control ──────────────────────────────────────────────────
     def request_stop(self):
@@ -334,37 +561,52 @@ class TestLoopThread(QThread):
 
         self._motion.set_params(self._params)
         cycle = 0
-        peaks_this_cycle: list[float] = []
         force_sample_interval = 0.02   # 50 Hz
+
+        # Stream force continuously (Stage D-style live scrolling graph).
+        def _sample_loop():
+            while self._running:
+                f = self._daq.read_lbs()
+                t = time.time() - self._t0
+                with self._lock:
+                    c = self._sample_cycle
+                    collecting = self._sample_collecting
+                    if collecting and f > self._sample_peak:
+                        self._sample_peak = f
+                self.sig_force_live.emit(t, f, c)
+                time.sleep(force_sample_interval)
+
+        sampler = threading.Thread(target=_sample_loop, daemon=True)
+        sampler.start()
 
         for cycle in range(1, self._params.target_cycles + 1):
             with self._lock:
-                if self._stop_req: break
+                if self._stop_req:
+                    break
 
             # Wait while paused
             while True:
                 with self._lock:
-                    if not self._paused or self._stop_req: break
+                    if not self._paused or self._stop_req:
+                        break
                 time.sleep(0.05)
 
-            # ── Execute one cycle ──────────────────────────────────
-            peaks_this_cycle.clear()
-            t_cycle_start = time.time()
+            # Execute one full cycle (A/B/C/D). Count increments only after completion.
+            with self._lock:
+                self._sample_cycle = cycle
+                self._sample_peak = 0.0
+                self._sample_collecting = True
 
             ok = self._motion.run_cycle()
+
+            with self._lock:
+                peak = self._sample_peak
+                self._sample_collecting = False
+
             if not ok:
                 self.sig_error.emit(f"Motion error at cycle {cycle}")
                 break
 
-            # ── Sample force during cycle ──────────────────────────
-            while time.time() - t_cycle_start < 0.3:   # 300 ms window
-                f = self._daq.read_lbs()
-                t = time.time() - self._t0
-                self.sig_force_live.emit(t, f, cycle)
-                peaks_this_cycle.append(f)
-                time.sleep(force_sample_interval)
-
-            peak = max(peaks_this_cycle) if peaks_this_cycle else 0.0
             force_ok   = self._params.force_min_lbs <= peak <= self._params.force_max_lbs
             retract_ok = True   # TODO: read retract sensor
 
@@ -391,6 +633,7 @@ class TestLoopThread(QThread):
                         InspectionCapture(cycle, cam, ftype, data))
 
         self._running = False
+        sampler.join(timeout=0.2)
         self.sig_finished.emit()
         log.info(f"TestLoopThread: finished after {cycle} cycles")
 
@@ -564,8 +807,20 @@ def _parse_args():
                    help="Connect to real hardware")
     p.add_argument("--motion-port",  default="COM3",
                    help="Serial port for motion controller (default COM3)")
+    p.add_argument("--motion-host",  default="192.168.1.24",
+                   help="Ethernet host for Dorna motion controller")
+    p.add_argument("--motion-tcp-port",  type=int, default=443,
+                   help="Ethernet TCP port for Dorna motion controller")
     p.add_argument("--daq-port",     default="COM4",
                    help="Serial port for force DAQ (default COM4)")
+    p.add_argument("--phidget-serial", type=int, default=781028,
+                   help="Phidget bridge serial for force sensor")
+    p.add_argument("--phidget-channel", type=int, default=0,
+                   help="Phidget channel index for force sensor")
+    p.add_argument("--force-calibration-factor", type=float, default=68000.0,
+                   help="Force conversion factor from voltage ratio to lbs")
+    p.add_argument("--force-data-interval-ms", type=int, default=8,
+                   help="Phidget data interval in milliseconds")
     p.add_argument("--cam-c1",       type=int, default=0,
                    help="OpenCV index for camera C1")
     p.add_argument("--cam-c2",       type=int, default=1,
@@ -577,7 +832,13 @@ def main():
     args  = _parse_args()
     cfg   = ControllerConfig(
         motion_port  = args.motion_port,
+        motion_host  = args.motion_host,
+        motion_tcp_port = args.motion_tcp_port,
         daq_port     = args.daq_port,
+        phidget_serial = args.phidget_serial,
+        phidget_channel = args.phidget_channel,
+        force_calibration_factor = args.force_calibration_factor,
+        force_data_interval_ms = args.force_data_interval_ms,
         camera_c1_id = args.cam_c1,
         camera_c2_id = args.cam_c2,
         sim_mode     = args.sim,
