@@ -12,6 +12,9 @@ from matplotlib.backends.backend_pdf import PdfPages
 import tkinter as tk
 from tkinter import filedialog
 import os
+from datetime import datetime
+
+import cv2
 
 from Phidget22.Devices.VoltageRatioInput import VoltageRatioInput
 from dorna2 import Dorna
@@ -47,6 +50,9 @@ COLOR_BG = "#0f172a"
 COLOR_PANEL = "#111827"
 COLOR_PANEL_BORDER = "#334155"
 COLOR_TEXT = "#e5e7eb"
+
+CAMERA_WINDOW_NAME = "IC Camera"
+CAMERA_OUTPUT_DIR = "inspection_output"
 
 
 # ================================
@@ -204,6 +210,77 @@ def main():
 
     state = SystemState()
     state_lock = threading.RLock()
+
+    # --- Camera preview (Phase 2A) ---
+    os.makedirs(CAMERA_OUTPUT_DIR, exist_ok=True)
+    camera_lock = threading.RLock()
+    camera_latest_frame = None
+    camera_status = "camera:not_started"
+    camera_stop_evt = threading.Event()
+    camera_thread = None
+
+    def _set_camera_status(msg):
+        nonlocal camera_status
+        with camera_lock:
+            camera_status = msg
+
+    def start_camera_preview():
+        nonlocal camera_thread, camera_latest_frame
+        if camera_thread is not None and camera_thread.is_alive():
+            return
+
+        camera_stop_evt.clear()
+
+        def _camera_worker():
+            nonlocal camera_latest_frame
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                _set_camera_status("camera:open_failed")
+                return
+
+            cv2.namedWindow(CAMERA_WINDOW_NAME, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(CAMERA_WINDOW_NAME, 960, 540)
+            cv2.moveWindow(CAMERA_WINDOW_NAME, 980, 120)
+            _set_camera_status("camera:live")
+
+            while not camera_stop_evt.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    _set_camera_status("camera:frame_failed")
+                    time.sleep(0.05)
+                    continue
+
+                with camera_lock:
+                    camera_latest_frame = frame.copy()
+
+                overlay = frame.copy()
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cv2.putText(overlay, f"{CAMERA_WINDOW_NAME}  {stamp}", (20, 36),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                cv2.imshow(CAMERA_WINDOW_NAME, overlay)
+                cv2.waitKey(1)
+
+            cap.release()
+            try:
+                cv2.destroyWindow(CAMERA_WINDOW_NAME)
+            except Exception:
+                pass
+
+        camera_thread = threading.Thread(target=_camera_worker, daemon=True)
+        camera_thread.start()
+
+    def stop_camera_preview():
+        camera_stop_evt.set()
+        if camera_thread is not None:
+            camera_thread.join(timeout=1.5)
+
+    def get_latest_camera_frame():
+        with camera_lock:
+            if camera_latest_frame is None:
+                return None
+            return camera_latest_frame.copy()
+
+    start_camera_preview()
 
     # --- GUI layout (same as Stage D force window v5) ---
     fig = plt.figure(figsize=(14, 8), facecolor=COLOR_BG)
@@ -513,8 +590,24 @@ def main():
                 return
             state.image_capture_count += 1
             capture_num = state.image_capture_count
-        set_alert("#2563eb", f"Image Capture requested (#{capture_num})")
-        print(f"[GUI] Image Capture requested #{capture_num}")
+
+        frame = get_latest_camera_frame()
+        if frame is None:
+            set_alert("red", "Image Capture failed: no camera frame")
+            print("[GUI] Image Capture failed: latest camera frame unavailable")
+            return
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        out_name = f"ic_capture_{capture_num:03d}_{ts}.png"
+        out_path = os.path.join(CAMERA_OUTPUT_DIR, out_name)
+        ok = cv2.imwrite(out_path, frame)
+        if not ok:
+            set_alert("red", "Image Capture failed: save error")
+            print(f"[GUI] Image Capture failed: could not save {out_path}")
+            return
+
+        set_alert("#2563eb", f"Image Capture saved: {out_name}")
+        print(f"[GUI] Image Capture saved -> {out_path}")
 
     def on_return_to_test(_evt):
         with state_lock:
@@ -970,6 +1063,8 @@ def main():
                 manual_state = "Manual: REQUESTED" if state.manual_intervention_requested else (
                     "Manual: ACTIVE" if state.manual_mode_active else "Manual: OFF"
                 )
+                with camera_lock:
+                    camera_txt = camera_status
 
                 idx = state.traj_index % len(TRAJECTORY)
                 btn, ph = INDEX_TO_META[idx]
@@ -981,7 +1076,7 @@ def main():
                     baseline_txt = f"Baseline: {min_n}/{state.baseline_cycles} per button"
 
                 status_line.set_text(
-                    f"State: {mode} | {manual_state} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
+                    f"State: {mode} | {manual_state} | Camera: {camera_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
                 )
                 param_line.set_text("")
                 fail_line_1.set_text(
@@ -1022,6 +1117,14 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            stop_camera_preview()
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         try:
             bridge.close()
         except Exception:
