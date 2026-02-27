@@ -513,9 +513,9 @@ def main():
     manual_btn_h = 0.033
     manual_btn_gap = 0.004
 
-    # Single horizontal row, 8 mm above camera pane
+    # Single horizontal row, 4 mm above camera pane
     camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.25, 0.32, 0.65
-    manual_row_y = camera_ax_y + camera_ax_h + (8.0 * mm_to_fig_y)
+    manual_row_y = camera_ax_y + camera_ax_h + (4.0 * mm_to_fig_y)
     manual_btn_w = (camera_ax_w - (5 * manual_btn_gap)) / 6
 
     fig.text(camera_ax_x, manual_row_y + manual_btn_h + 0.006, "Manual IC / Camera", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
