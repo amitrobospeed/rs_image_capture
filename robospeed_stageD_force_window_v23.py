@@ -12,6 +12,10 @@ from matplotlib.backends.backend_pdf import PdfPages
 import tkinter as tk
 from tkinter import filedialog
 import os
+from datetime import datetime
+
+import cv2
+import pyrealsense2 as rs
 
 from Phidget22.Devices.VoltageRatioInput import VoltageRatioInput
 from dorna2 import Dorna
@@ -34,6 +38,8 @@ baseline_cycles = 30
 deviation_threshold = 0.50
 
 ALERT_FLASH_S = 1.0
+TARE_WARMUP_S = 3.0
+TARE_SAMPLES = 200
 
 # ================================
 # UI SETTINGS
@@ -47,6 +53,19 @@ COLOR_BG = "#0f172a"
 COLOR_PANEL = "#111827"
 COLOR_PANEL_BORDER = "#334155"
 COLOR_TEXT = "#e5e7eb"
+
+CAMERA_WINDOW_NAME = "IC Camera"
+CAMERA_OUTPUT_DIR = "inspection_output"
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+CAMERA_FPS = 15
+TARGET_LUMA_MEAN = 95
+MAX_SAT_PCT = 3.0
+TUNE_MAX_ITERS = 10
+EXPOSURE_MIN = 2000
+EXPOSURE_MAX = 15000
+GAIN_MIN = 0
+GAIN_MAX = 32
 
 
 # ================================
@@ -63,6 +82,7 @@ JERK_MIN, JERK_MAX = 0, 10000
 SAFE_START_VEL = 100
 SAFE_START_ACC = 200
 SAFE_START_JERK = 2000
+IC_CLEAR_J0_REL = -50
 
 
 # ================================
@@ -176,6 +196,11 @@ class SystemState:
     alert_until_wall: float = 0.0
     alert_color: str = "gray"
     alert_msg: str = ""
+    manual_intervention_requested: bool = False
+    manual_mode_active: bool = False
+    image_capture_count: int = 0
+    tare_on_start: bool = True
+    tare_in_progress: bool = False
     test_name: str = "test_report"
     exit_requested: bool = False
 
@@ -195,11 +220,197 @@ def main():
     bridge.setDataInterval(data_interval_ms)
 
     print("Taring...")
-    time.sleep(1)
-    zero_offset = float(np.mean([bridge.getVoltageRatio() for _ in range(200)]))
+    time.sleep(TARE_WARMUP_S)
+    zero_offset = float(np.mean([bridge.getVoltageRatio() for _ in range(TARE_SAMPLES)]))
 
     state = SystemState()
     state_lock = threading.RLock()
+
+    # --- Camera preview (Phase 2A / Phase 3A controls) ---
+    os.makedirs(CAMERA_OUTPUT_DIR, exist_ok=True)
+    camera_lock = threading.RLock()
+    camera_hw_lock = threading.RLock()
+    camera_latest_frame = None
+    camera_status = "camera:not_started"
+    camera_stop_evt = threading.Event()
+    camera_thread = None
+    camera_sensor = None
+
+    # session-level camera settings lock
+    camera_exposure = 4500
+    camera_gain = 8
+    camera_settings_locked = False
+    camera_tuned_once = False
+
+    # capture/inspection session artifacts
+    golden_frame = None
+    golden_path = None
+    last_capture_frame = None
+    last_capture_path = None
+
+    def _set_camera_status(msg):
+        nonlocal camera_status
+        with camera_lock:
+            camera_status = msg
+
+    def compute_luma_stats(bgr):
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        mean_luma = float(np.mean(gray))
+        sat_pct = float(np.mean(gray >= 250) * 100.0)
+        return mean_luma, sat_pct
+
+    def start_camera_preview():
+        nonlocal camera_thread, camera_latest_frame, camera_sensor
+        if camera_thread is not None and camera_thread.is_alive():
+            return
+
+        camera_stop_evt.clear()
+
+        def _camera_worker():
+            nonlocal camera_latest_frame, camera_sensor
+            pipeline = rs.pipeline()
+            config = rs.config()
+            config.enable_stream(rs.stream.color, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.bgr8, CAMERA_FPS)
+
+            try:
+                profile = pipeline.start(config)
+            except Exception:
+                _set_camera_status("camera:open_failed")
+                return
+
+            try:
+                sensor = profile.get_device().first_color_sensor()
+                sensor.set_option(rs.option.enable_auto_exposure, 0)
+                sensor.set_option(rs.option.exposure, int(camera_exposure))
+                sensor.set_option(rs.option.gain, int(camera_gain))
+                with camera_hw_lock:
+                    camera_sensor = sensor
+            except Exception:
+                _set_camera_status("camera:sensor_setup_failed")
+
+            _set_camera_status("camera:live")
+
+            # warmup frames
+            for _ in range(8):
+                try:
+                    pipeline.wait_for_frames(1000)
+                except Exception:
+                    break
+
+            try:
+                while not camera_stop_evt.is_set():
+                    try:
+                        frames = pipeline.wait_for_frames(1000)
+                    except Exception:
+                        _set_camera_status("camera:frame_timeout")
+                        time.sleep(0.05)
+                        continue
+
+                    color = frames.get_color_frame()
+                    if not color:
+                        _set_camera_status("camera:no_color_frame")
+                        continue
+
+                    frame = np.asanyarray(color.get_data())
+                    with camera_lock:
+                        camera_latest_frame = frame.copy()
+
+                    # Frame is rendered inside the matplotlib window (same app window).
+            finally:
+                with camera_hw_lock:
+                    camera_sensor = None
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+
+        camera_thread = threading.Thread(target=_camera_worker, daemon=True)
+        camera_thread.start()
+
+    def stop_camera_preview():
+        camera_stop_evt.set()
+        if camera_thread is not None:
+            camera_thread.join(timeout=1.5)
+
+    def get_latest_camera_frame():
+        with camera_lock:
+            if camera_latest_frame is None:
+                return None
+            return camera_latest_frame.copy()
+
+    def run_camera_auto_tune():
+        nonlocal camera_exposure, camera_gain, camera_settings_locked, camera_tuned_once
+        with camera_hw_lock:
+            sensor = camera_sensor
+        if sensor is None:
+            set_alert("red", "Camera tune failed: sensor not ready")
+            return False
+
+        frame = get_latest_camera_frame()
+        if frame is None:
+            set_alert("red", "Camera tune failed: no camera frame")
+            return False
+
+        exp = int(camera_exposure)
+        gain = int(camera_gain)
+
+        for _ in range(TUNE_MAX_ITERS):
+            mean_l, sat = compute_luma_stats(frame)
+
+            if sat > MAX_SAT_PCT:
+                exp = int(exp * 0.85)
+                gain = int(gain * 0.9)
+            else:
+                if mean_l > TARGET_LUMA_MEAN + 5:
+                    exp = int(exp * 0.9)
+                elif mean_l < TARGET_LUMA_MEAN - 5:
+                    exp = int(exp * 1.05)
+                else:
+                    break
+
+            exp = int(np.clip(exp, EXPOSURE_MIN, EXPOSURE_MAX))
+            gain = int(np.clip(gain, GAIN_MIN, GAIN_MAX))
+
+            try:
+                sensor.set_option(rs.option.exposure, exp)
+                sensor.set_option(rs.option.gain, gain)
+            except Exception:
+                set_alert("red", "Camera tune failed: cannot apply settings")
+                return False
+
+            time.sleep(0.15)
+            newer = get_latest_camera_frame()
+            if newer is not None:
+                frame = newer
+
+        camera_exposure = exp
+        camera_gain = gain
+        camera_settings_locked = True
+        camera_tuned_once = True
+        set_alert("green", f"Camera tuned+locked exp={exp} gain={gain}")
+        return True
+
+    def save_capture_frame(frame, prefix, idx):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        out_name = f"{prefix}_{idx:03d}_{ts}.png"
+        out_path = os.path.join(CAMERA_OUTPUT_DIR, out_name)
+        ok = cv2.imwrite(out_path, frame)
+        return ok, out_name, out_path
+
+    def run_basic_inspection(golden, cyc):
+        g = cv2.cvtColor(golden, cv2.COLOR_BGR2GRAY)
+        c = cv2.cvtColor(cyc, cv2.COLOR_BGR2GRAY)
+        diff = cv2.absdiff(g, c)
+        score = float(np.mean(diff))
+        _, mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+        pass_fail = "PASS" if score < 8.0 else "FAIL"
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        mask_path = os.path.join(CAMERA_OUTPUT_DIR, f"inspection_mask_{ts}.png")
+        cv2.imwrite(mask_path, mask)
+        return pass_fail, score, mask_path
+
+    start_camera_preview()
 
     # --- GUI layout (same as Stage D force window v5) ---
     fig = plt.figure(figsize=(14, 8), facecolor=COLOR_BG)
@@ -215,8 +426,8 @@ def main():
     fig.patches.append(Rectangle((0.02, 0.0628), 0.2076, 0.9098, transform=fig.transFigure,
                                  facecolor=COLOR_PANEL, edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-1))
 
-    # Plot on right
-    ax = fig.add_axes([0.30, 0.25, 0.67, 0.65])
+    # Plot area (force + camera in same matplotlib window)
+    ax = fig.add_axes([0.30, 0.25, 0.32, 0.65])
     ax.set_ylim(-0.2, 2.0)
     ax.set_ylabel("Force (lbs)", fontsize=22, color="white")
     ax.set_xlabel("Time (s)", fontsize=16, color="white")
@@ -228,6 +439,15 @@ def main():
     force_band = ax.axhspan(state.force_min, state.force_max, alpha=0.18, color="#93c5fd")
 
     (line,) = ax.plot([], [], linewidth=2.5, color="#0ea5e9")
+
+    # Camera pane (same window as force graph)
+    ax_cam = fig.add_axes([0.65, 0.25, 0.32, 0.65])
+    ax_cam.set_title("IC Camera", fontsize=20, color=COLOR_TEXT)
+    ax_cam.set_xticks([])
+    ax_cam.set_yticks([])
+    ax_cam.set_facecolor("#0b1220")
+    cam_placeholder = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+    camera_im = ax_cam.imshow(cam_placeholder)
 
     # Messages (no bbox), keep two-line spacing at ~1.5 lines
     status_line_y = 0.095
@@ -293,9 +513,37 @@ def main():
     tb_fmin = TextBox(fig.add_axes([fmin_x, force_row_y, force_box_w, 0.05]), "Force", initial=str(state.force_min))
     tb_fmax = TextBox(fig.add_axes([fmax_x, force_row_y, force_box_w, 0.05]), "", initial=str(state.force_max))
 
-    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report]:
+    mm_to_fig_y = (1.0 / 25.4) / 8.0
+    manual_btn_h = 0.033
+    manual_btn_gap = 0.004
+
+    # Two-row manual/camera controls, 4 mm above camera pane
+    camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.25, 0.32, 0.65
+    # Align Row 1 top edge with force graph top edge
+    force_ax_top = 0.25 + 0.65
+    row1_y = force_ax_top - manual_btn_h
+    row2_y = row1_y - (manual_btn_h + manual_btn_gap)
+    manual_btn_w = (camera_ax_w - (4 * manual_btn_gap)) / 5
+
+    fig.text(camera_ax_x, row1_y + manual_btn_h + 0.006, "Manual IC / Camera", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
+
+    x0 = camera_ax_x
+    # Row 1: IC Home, Camera Tune, Golden Capture, Image Capture, Run Inspection
+    btn_ic_home = Button(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), row1_y, manual_btn_w, manual_btn_h]), "IC Home", color="#0ea5e9", hovercolor="#0284c7")
+    btn_camera_tune = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row1_y, manual_btn_w, manual_btn_h]), "Camera Tune", color="#16a34a", hovercolor="#15803d")
+    btn_golden_capture = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row1_y, manual_btn_w, manual_btn_h]), "Golden Capture", color="#d97706", hovercolor="#b45309")
+    btn_image_capture = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row1_y, manual_btn_w, manual_btn_h]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
+    btn_run_inspection = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), row1_y, manual_btn_w, manual_btn_h]), "Run Inspection", color="#7c3aed", hovercolor="#6d28d9")
+
+    # Row 2: Return to Test, Re-tare, Tare@Start ON/OFF
+    btn_return_test = Button(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Return to Test", color="#0891b2", hovercolor="#0e7490")
+    btn_re_tare = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Re-tare", color="#475569", hovercolor="#334155")
+    btn_tare_on_start = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Tare@Start: ON", color="#0f766e", hovercolor="#115e59")
+
+    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start,
+                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_tare_on_start] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
@@ -316,6 +564,49 @@ def main():
             state.alert_msg = msg
             state.alert_until_wall = time.time() + ALERT_FLASH_S
 
+    def update_tare_toggle_button():
+        with state_lock:
+            enabled = state.tare_on_start
+        if enabled:
+            btn_tare_on_start.label.set_text("Tare@Start: ON")
+            btn_tare_on_start.ax.set_facecolor("#0f766e")
+        else:
+            btn_tare_on_start.label.set_text("Tare@Start: OFF")
+            btn_tare_on_start.ax.set_facecolor("#7f1d1d")
+
+    def go_a_above():
+        print("[Robot] Going to A-above for tare")
+        robot.play(-1, {
+            "cmd": "jmove", "rel": 0,
+            "vel": SAFE_START_VEL,
+            "acc": SAFE_START_ACC,
+            "jerk": SAFE_START_JERK,
+            **BUTTON_POSES["A"]["above"]
+        })
+
+    def perform_tare(reason):
+        nonlocal zero_offset
+        with state_lock:
+            if state.tare_in_progress:
+                set_alert("#475569", "Tare already in progress")
+                return False
+            state.tare_in_progress = True
+        try:
+            set_alert("#475569", f"Tare warm-up ({TARE_WARMUP_S:.0f}s): {reason}")
+            time.sleep(TARE_WARMUP_S)
+            samples = [bridge.getVoltageRatio() for _ in range(TARE_SAMPLES)]
+            zero_offset = float(np.mean(samples))
+            set_alert("green", f"Tare complete ({reason})")
+            print(f"[Force] Tare complete ({reason}) zero_offset={zero_offset:.8f}")
+            return True
+        except Exception as exc:
+            set_alert("red", f"Tare failed: {exc}")
+            print(f"[Force] Tare failed: {exc}")
+            return False
+        finally:
+            with state_lock:
+                state.tare_in_progress = False
+
     def go_home():
         print("[Robot] Going Home")
         robot.play(-1, {
@@ -325,6 +616,33 @@ def main():
             "jerk": SAFE_START_JERK,
             **HOME_POSE
         })
+
+    def wait_until_idle(timeout_s=20.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            if is_idle(robot):
+                return True
+            time.sleep(0.02)
+        return False
+
+    def go_ic_home_checkpoint():
+        go_home()
+        if not wait_until_idle():
+            print("[Robot] Timeout waiting to reach Home before IC clear")
+            return False
+
+        print(f"[Robot] IC clear move: rel j0={IC_CLEAR_J0_REL}")
+        robot.play(-1, {
+            "cmd": "jmove", "rel": 1,
+            "vel": SAFE_START_VEL,
+            "acc": SAFE_START_ACC,
+            "jerk": SAFE_START_JERK,
+            "j0": IC_CLEAR_J0_REL
+        })
+        if not wait_until_idle():
+            print("[Robot] Timeout waiting at IC checkpoint")
+            return False
+        return True
 
     # ✅ KEY FIX: apply current TextBox values on Start (even if on_submit didn't fire)
     def apply_textbox_values():
@@ -360,6 +678,7 @@ def main():
                 state.baseline_peaks = {"A": [], "B": [], "C": [], "D": []}
                 state.baseline_mean = {}
                 state.baseline_ready = False
+                state.image_capture_count = 0
             else:
                 state.baseline_cycles = new_base
 
@@ -371,8 +690,8 @@ def main():
     def on_start(_evt):
         apply_textbox_values()
         with state_lock:
-            state.running = True
-            state.paused = False
+            state.running = False
+            state.paused = True
             state.stopped = False
             state.traj_index = 0
             state.cycle_count = 0
@@ -381,7 +700,50 @@ def main():
             state.window_button = None
             state.window_peak_force = None
             state.window_peak_time = None
-        print("[GUI] Start pressed")
+            state.manual_intervention_requested = False
+            state.manual_mode_active = False
+            state.image_capture_count = 0
+
+        nonlocal last_capture_frame, last_capture_path
+        last_capture_frame = None
+        last_capture_path = None
+
+        print("[GUI] Start pressed -> Going Home before cycle start")
+        go_home()
+        if not wait_until_idle():
+            with state_lock:
+                state.running = False
+                state.paused = False
+                state.stopped = True
+            set_alert("red", "Start failed: robot did not reach Home")
+            print("[GUI] Start aborted: timeout waiting at Home")
+            return
+
+        with state_lock:
+            tare_on_start = state.tare_on_start
+        if tare_on_start:
+            go_a_above()
+            if not wait_until_idle():
+                with state_lock:
+                    state.running = False
+                    state.paused = False
+                    state.stopped = True
+                set_alert("red", "Start failed: robot did not reach A-above for tare")
+                print("[GUI] Start aborted: timeout waiting at A-above for tare")
+                return
+            if not perform_tare("start"):
+                with state_lock:
+                    state.running = False
+                    state.paused = False
+                    state.stopped = True
+                print("[GUI] Start aborted: tare failed")
+                return
+
+        with state_lock:
+            state.running = True
+            state.paused = False
+            state.stopped = False
+        set_alert("green", "At Home. Starting cycle test")
 
     def on_pause(_evt):
         with state_lock:
@@ -401,19 +763,190 @@ def main():
             state.window_button = None
             state.window_peak_force = None
             state.window_peak_time = None
+            state.manual_intervention_requested = False
+            state.manual_mode_active = False
+            state.image_capture_count = 0
         print("[GUI] Stop pressed -> Going Home")
         go_home()
 
     def on_home(_evt):
         go_home()
 
+    def on_re_tare(_evt):
+        with state_lock:
+            if state.running:
+                set_alert("#475569", "Re-tare blocked while running")
+                print("[GUI] Re-tare blocked: running")
+                return
+        if not wait_until_idle(timeout_s=5.0):
+            set_alert("#475569", "Re-tare blocked: robot not idle")
+            print("[GUI] Re-tare blocked: robot not idle")
+            return
+        perform_tare("manual")
+
+    def on_toggle_tare_on_start(_evt):
+        with state_lock:
+            state.tare_on_start = not state.tare_on_start
+            enabled = state.tare_on_start
+        update_tare_toggle_button()
+        set_alert("#0f766e" if enabled else "#7f1d1d", f"Tare-on-start {'enabled' if enabled else 'disabled'}")
+
+    def on_ic_home(_evt):
+        with state_lock:
+            if state.manual_mode_active:
+                set_alert("#0ea5e9", "Already at IC checkpoint")
+                print("[GUI] IC Home ignored: already in manual checkpoint mode")
+                return
+
+            if state.running:
+                state.manual_intervention_requested = True
+                set_alert("#0ea5e9", "IC Home requested (soft interrupt at cycle boundary)")
+                print("[GUI] IC Home pressed")
+                return
+
+            state.manual_intervention_requested = False
+            state.manual_mode_active = True
+            state.running = False
+            state.paused = True
+            state.stopped = False
+
+        print("[GUI] IC Home pressed -> no active cycle, moving to IC checkpoint now")
+        ok = go_ic_home_checkpoint()
+        if ok:
+            set_alert("#0ea5e9", "At IC checkpoint. Press Return to Test to resume")
+        else:
+            with state_lock:
+                state.manual_mode_active = False
+            set_alert("red", "IC checkpoint move failed. Check robot state")
+
+    def on_image_capture(_evt):
+        nonlocal last_capture_frame, last_capture_path
+        with state_lock:
+            if not state.manual_mode_active:
+                set_alert("#2563eb", "Image Capture ignored (not at IC checkpoint)")
+                print("[GUI] Image Capture ignored: enter IC Home first")
+                return
+            if not camera_settings_locked:
+                set_alert("#2563eb", "Image Capture blocked: run Camera Tune first")
+                print("[GUI] Image Capture blocked: camera not tuned/locked")
+                return
+            state.image_capture_count += 1
+            capture_num = state.image_capture_count
+
+        frame = get_latest_camera_frame()
+        if frame is None:
+            set_alert("red", "Image Capture failed: no camera frame")
+            print("[GUI] Image Capture failed: latest camera frame unavailable")
+            return
+
+        ok, out_name, out_path = save_capture_frame(frame, "ic_capture", capture_num)
+        if not ok:
+            set_alert("red", "Image Capture failed: save error")
+            print(f"[GUI] Image Capture failed: could not save {out_path}")
+            return
+
+        last_capture_frame = frame.copy()
+        last_capture_path = out_path
+        set_alert("#2563eb", f"Image Capture saved: {out_name}")
+        print(f"[GUI] Image Capture saved -> {out_path}")
+
+    def on_camera_tune(_evt):
+        ok = run_camera_auto_tune()
+        if ok:
+            print(f"[GUI] Camera tuned and locked exp={camera_exposure} gain={camera_gain}")
+
+    def on_golden_capture(_evt):
+        nonlocal golden_frame, golden_path
+        with state_lock:
+            if not state.manual_mode_active:
+                set_alert("#d97706", "Golden Capture ignored (not at IC checkpoint)")
+                print("[GUI] Golden Capture ignored: enter IC Home first")
+                return
+
+        if not camera_settings_locked:
+            set_alert("#d97706", "Golden Capture blocked: run Camera Tune first")
+            print("[GUI] Golden Capture blocked: camera not tuned/locked")
+            return
+
+        frame = get_latest_camera_frame()
+        if frame is None:
+            set_alert("red", "Golden Capture failed: no camera frame")
+            print("[GUI] Golden Capture failed: latest camera frame unavailable")
+            return
+
+        ok, out_name, out_path = save_capture_frame(frame, "golden", 1)
+        if not ok:
+            set_alert("red", "Golden Capture failed: save error")
+            print(f"[GUI] Golden Capture failed: could not save {out_path}")
+            return
+
+        golden_frame = frame.copy()
+        golden_path = out_path
+        set_alert("#d97706", f"Golden saved: {out_name}")
+        print(f"[GUI] Golden saved -> {out_path}")
+
+    def on_run_inspection(_evt):
+        nonlocal last_capture_frame
+        if golden_frame is None:
+            set_alert("#7c3aed", "Run Inspection blocked: capture Golden first")
+            print("[GUI] Run Inspection blocked: golden missing")
+            return
+        if last_capture_frame is None:
+            set_alert("#7c3aed", "Run Inspection blocked: capture Image first")
+            print("[GUI] Run Inspection blocked: latest capture missing")
+            return
+
+        verdict, score, mask_path = run_basic_inspection(golden_frame, last_capture_frame)
+        set_alert("green" if verdict == "PASS" else "orange", f"Inspection {verdict} score={score:.2f}")
+        print(f"[GUI] Run Inspection -> {verdict} score={score:.2f} mask={mask_path}")
+
+    def on_return_to_test(_evt):
+        with state_lock:
+            state.manual_intervention_requested = False
+            was_manual = state.manual_mode_active
+            if not was_manual:
+                set_alert("#0891b2", "Return to Test ignored (not in manual mode)")
+                print("[GUI] Return to Test ignored: robot was not in manual checkpoint mode")
+                return
+
+            state.manual_mode_active = False
+            state.running = False
+            state.paused = True
+            state.stopped = False
+            state.aligned_to_A = False
+            state.traj_index = 0
+
+        print("[GUI] Return to Test pressed -> Going Home before restart")
+        go_home()
+        if not wait_until_idle():
+            with state_lock:
+                state.running = False
+                state.paused = False
+                state.stopped = True
+            set_alert("red", "Return to Test failed: robot did not reach Home")
+            print("[GUI] Return to Test aborted: timeout waiting at Home")
+            return
+
+        with state_lock:
+            state.running = True
+            state.paused = False
+            state.stopped = False
+        set_alert("#0891b2", "At Home. Restarting cycle test")
+        print("[GUI] Return to Test: automatic cycle resumed")
+
     def on_reset(_evt):
+        nonlocal golden_frame, golden_path, last_capture_frame, last_capture_path
         with state_lock:
             state.force_out_of_range = {"A": 0, "B": 0, "C": 0, "D": 0}
             state.button_did_not_retract = {"A": 0, "B": 0, "C": 0, "D": 0}
             state.baseline_peaks = {"A": [], "B": [], "C": [], "D": []}
             state.baseline_mean = {}
             state.baseline_ready = False
+            state.image_capture_count = 0
+        golden_frame = None
+        golden_path = None
+        last_capture_frame = None
+        last_capture_path = None
         print("[GUI] Reset pressed -> counters + baseline cleared")
 
     def build_report_pdf(path):
@@ -557,9 +1090,19 @@ def main():
     btn_pause.on_clicked(on_pause)
     btn_stop.on_clicked(on_stop)
     btn_home.on_clicked(on_home)
+    btn_re_tare.on_clicked(on_re_tare)
+    btn_tare_on_start.on_clicked(on_toggle_tare_on_start)
+    btn_ic_home.on_clicked(on_ic_home)
+    btn_return_test.on_clicked(on_return_to_test)
+    btn_camera_tune.on_clicked(on_camera_tune)
+    btn_golden_capture.on_clicked(on_golden_capture)
+    btn_image_capture.on_clicked(on_image_capture)
+    btn_run_inspection.on_clicked(on_run_inspection)
     btn_reset.on_clicked(on_reset)
     btn_report.on_clicked(on_download_report)
     btn_exit.on_clicked(on_exit)
+
+    update_tare_toggle_button()
 
     # TextBox callbacks (kept, but now also locked)
     def on_vel_submit(text):
@@ -794,6 +1337,19 @@ def main():
                                 state.cycle_count += 1
                                 print(f"[Robot] Cycle complete -> {state.cycle_count}")
 
+                                if state.manual_intervention_requested:
+                                    state.running = False
+                                    state.paused = True
+                                    state.manual_mode_active = True
+                                    state.manual_intervention_requested = False
+                                    state.aligned_to_A = False
+                                    print("[Robot] Soft interrupt reached at cycle boundary -> moving to IC checkpoint")
+                                    ok = go_ic_home_checkpoint()
+                                    if ok:
+                                        set_alert("#0ea5e9", "At IC checkpoint. Press Return to Test to resume")
+                                    else:
+                                        set_alert("red", "IC checkpoint move failed. Check robot state")
+
             # UI text / alerts
             with state_lock:
                 mode = "RUNNING" if state.running else ("PAUSED" if state.paused else "STOPPED")
@@ -807,6 +1363,12 @@ def main():
                     status_dot.set_facecolor(base_color)
                     alert_msg = ""
 
+                manual_state = "Manual: REQUESTED" if state.manual_intervention_requested else (
+                    "Manual: ACTIVE" if state.manual_mode_active else "Manual: OFF"
+                )
+                with camera_lock:
+                    camera_txt = camera_status
+
                 idx = state.traj_index % len(TRAJECTORY)
                 btn, ph = INDEX_TO_META[idx]
 
@@ -816,8 +1378,15 @@ def main():
                     min_n = min(len(state.baseline_peaks[b]) for b in BUTTON_ORDER)
                     baseline_txt = f"Baseline: {min_n}/{state.baseline_cycles} per button"
 
+                frame = get_latest_camera_frame()
+                if frame is not None:
+                    camera_im.set_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                ax_cam.set_title(f"IC Camera ({camera_txt})", fontsize=20, color=COLOR_TEXT)
+
+                cam_lock_txt = "LOCKED" if camera_settings_locked else "UNLOCKED"
+                tare_txt = "Tare@Start:ON" if state.tare_on_start else "Tare@Start:OFF"
                 status_line.set_text(
-                    f"State: {mode} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
+                    f"State: {mode} | {manual_state} | {tare_txt} | Camera: {camera_txt}/{cam_lock_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
                 )
                 param_line.set_text("")
                 fail_line_1.set_text(
@@ -858,6 +1427,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            stop_camera_preview()
+        except Exception:
+            pass
         try:
             bridge.close()
         except Exception:
