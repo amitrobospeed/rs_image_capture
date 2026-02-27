@@ -63,6 +63,7 @@ JERK_MIN, JERK_MAX = 0, 10000
 SAFE_START_VEL = 100
 SAFE_START_ACC = 200
 SAFE_START_JERK = 2000
+IC_CLEAR_J0_REL = -50
 
 
 # ================================
@@ -176,6 +177,9 @@ class SystemState:
     alert_until_wall: float = 0.0
     alert_color: str = "gray"
     alert_msg: str = ""
+    manual_intervention_requested: bool = False
+    manual_mode_active: bool = False
+    image_capture_count: int = 0
     test_name: str = "test_report"
     exit_requested: bool = False
 
@@ -293,9 +297,25 @@ def main():
     tb_fmin = TextBox(fig.add_axes([fmin_x, force_row_y, force_box_w, 0.05]), "Force", initial=str(state.force_min))
     tb_fmax = TextBox(fig.add_axes([fmax_x, force_row_y, force_box_w, 0.05]), "", initial=str(state.force_max))
 
-    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report]:
+    border_inset_x = (3.0 / 25.4) / 14.0  # 3 mm on a 14-inch wide figure
+    border_inset_y = (3.0 / 25.4) / 8.0   # 3 mm on an 8-inch tall figure
+    manual_btn_w = 0.08
+    manual_btn_h = 0.035
+    manual_btn_gap = 0.01
+    manual_y = border_inset_y
+    right_btn_x = 1.0 - border_inset_x - manual_btn_w
+    mid_btn_x = right_btn_x - manual_btn_gap - manual_btn_w
+    left_btn_x = mid_btn_x - manual_btn_gap - manual_btn_w
+
+    fig.text(left_btn_x, manual_y + manual_btn_h + 0.008, "Manual IC", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
+    btn_ic_home = Button(fig.add_axes([left_btn_x, manual_y, manual_btn_w, manual_btn_h]), "IC Home", color="#0ea5e9", hovercolor="#0284c7")
+    btn_image_capture = Button(fig.add_axes([mid_btn_x, manual_y, manual_btn_w, manual_btn_h]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
+    btn_return_test = Button(fig.add_axes([right_btn_x, manual_y, manual_btn_w, manual_btn_h]), "Return to Test", color="#0891b2", hovercolor="#0e7490")
+
+    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report,
+                 btn_ic_home, btn_image_capture, btn_return_test]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(12)
+        _btn.label.set_fontsize(9 if _btn in [btn_ic_home, btn_image_capture, btn_return_test] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
@@ -325,6 +345,33 @@ def main():
             "jerk": SAFE_START_JERK,
             **HOME_POSE
         })
+
+    def wait_until_idle(timeout_s=20.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            if is_idle(robot):
+                return True
+            time.sleep(0.02)
+        return False
+
+    def go_ic_home_checkpoint():
+        go_home()
+        if not wait_until_idle():
+            print("[Robot] Timeout waiting to reach Home before IC clear")
+            return False
+
+        print(f"[Robot] IC clear move: rel j0={IC_CLEAR_J0_REL}")
+        robot.play(-1, {
+            "cmd": "jmove", "rel": 1,
+            "vel": SAFE_START_VEL,
+            "acc": SAFE_START_ACC,
+            "jerk": SAFE_START_JERK,
+            "j0": IC_CLEAR_J0_REL
+        })
+        if not wait_until_idle():
+            print("[Robot] Timeout waiting at IC checkpoint")
+            return False
+        return True
 
     # ✅ KEY FIX: apply current TextBox values on Start (even if on_submit didn't fire)
     def apply_textbox_values():
@@ -360,6 +407,7 @@ def main():
                 state.baseline_peaks = {"A": [], "B": [], "C": [], "D": []}
                 state.baseline_mean = {}
                 state.baseline_ready = False
+                state.image_capture_count = 0
             else:
                 state.baseline_cycles = new_base
 
@@ -371,8 +419,8 @@ def main():
     def on_start(_evt):
         apply_textbox_values()
         with state_lock:
-            state.running = True
-            state.paused = False
+            state.running = False
+            state.paused = True
             state.stopped = False
             state.traj_index = 0
             state.cycle_count = 0
@@ -381,7 +429,26 @@ def main():
             state.window_button = None
             state.window_peak_force = None
             state.window_peak_time = None
-        print("[GUI] Start pressed")
+            state.manual_intervention_requested = False
+            state.manual_mode_active = False
+            state.image_capture_count = 0
+
+        print("[GUI] Start pressed -> Going Home before cycle start")
+        go_home()
+        if not wait_until_idle():
+            with state_lock:
+                state.running = False
+                state.paused = False
+                state.stopped = True
+            set_alert("red", "Start failed: robot did not reach Home")
+            print("[GUI] Start aborted: timeout waiting at Home")
+            return
+
+        with state_lock:
+            state.running = True
+            state.paused = False
+            state.stopped = False
+        set_alert("green", "At Home. Starting cycle test")
 
     def on_pause(_evt):
         with state_lock:
@@ -401,11 +468,87 @@ def main():
             state.window_button = None
             state.window_peak_force = None
             state.window_peak_time = None
+            state.manual_intervention_requested = False
+            state.manual_mode_active = False
+            state.image_capture_count = 0
         print("[GUI] Stop pressed -> Going Home")
         go_home()
 
     def on_home(_evt):
         go_home()
+
+    def on_ic_home(_evt):
+        with state_lock:
+            if state.manual_mode_active:
+                set_alert("#0ea5e9", "Already at IC checkpoint")
+                print("[GUI] IC Home ignored: already in manual checkpoint mode")
+                return
+
+            if state.running:
+                state.manual_intervention_requested = True
+                set_alert("#0ea5e9", "IC Home requested (soft interrupt at cycle boundary)")
+                print("[GUI] IC Home pressed")
+                return
+
+            state.manual_intervention_requested = False
+            state.manual_mode_active = True
+            state.running = False
+            state.paused = True
+            state.stopped = False
+
+        print("[GUI] IC Home pressed -> no active cycle, moving to IC checkpoint now")
+        ok = go_ic_home_checkpoint()
+        if ok:
+            set_alert("#0ea5e9", "At IC checkpoint. Press Return to Test to resume")
+        else:
+            with state_lock:
+                state.manual_mode_active = False
+            set_alert("red", "IC checkpoint move failed. Check robot state")
+
+    def on_image_capture(_evt):
+        with state_lock:
+            if not state.manual_mode_active:
+                set_alert("#2563eb", "Image Capture ignored (not at IC checkpoint)")
+                print("[GUI] Image Capture ignored: enter IC Home first")
+                return
+            state.image_capture_count += 1
+            capture_num = state.image_capture_count
+        set_alert("#2563eb", f"Image Capture requested (#{capture_num})")
+        print(f"[GUI] Image Capture requested #{capture_num}")
+
+    def on_return_to_test(_evt):
+        with state_lock:
+            state.manual_intervention_requested = False
+            was_manual = state.manual_mode_active
+            if not was_manual:
+                set_alert("#0891b2", "Return to Test ignored (not in manual mode)")
+                print("[GUI] Return to Test ignored: robot was not in manual checkpoint mode")
+                return
+
+            state.manual_mode_active = False
+            state.running = False
+            state.paused = True
+            state.stopped = False
+            state.aligned_to_A = False
+            state.traj_index = 0
+
+        print("[GUI] Return to Test pressed -> Going Home before restart")
+        go_home()
+        if not wait_until_idle():
+            with state_lock:
+                state.running = False
+                state.paused = False
+                state.stopped = True
+            set_alert("red", "Return to Test failed: robot did not reach Home")
+            print("[GUI] Return to Test aborted: timeout waiting at Home")
+            return
+
+        with state_lock:
+            state.running = True
+            state.paused = False
+            state.stopped = False
+        set_alert("#0891b2", "At Home. Restarting cycle test")
+        print("[GUI] Return to Test: automatic cycle resumed")
 
     def on_reset(_evt):
         with state_lock:
@@ -414,6 +557,7 @@ def main():
             state.baseline_peaks = {"A": [], "B": [], "C": [], "D": []}
             state.baseline_mean = {}
             state.baseline_ready = False
+            state.image_capture_count = 0
         print("[GUI] Reset pressed -> counters + baseline cleared")
 
     def build_report_pdf(path):
@@ -557,6 +701,9 @@ def main():
     btn_pause.on_clicked(on_pause)
     btn_stop.on_clicked(on_stop)
     btn_home.on_clicked(on_home)
+    btn_ic_home.on_clicked(on_ic_home)
+    btn_image_capture.on_clicked(on_image_capture)
+    btn_return_test.on_clicked(on_return_to_test)
     btn_reset.on_clicked(on_reset)
     btn_report.on_clicked(on_download_report)
     btn_exit.on_clicked(on_exit)
@@ -794,6 +941,19 @@ def main():
                                 state.cycle_count += 1
                                 print(f"[Robot] Cycle complete -> {state.cycle_count}")
 
+                                if state.manual_intervention_requested:
+                                    state.running = False
+                                    state.paused = True
+                                    state.manual_mode_active = True
+                                    state.manual_intervention_requested = False
+                                    state.aligned_to_A = False
+                                    print("[Robot] Soft interrupt reached at cycle boundary -> moving to IC checkpoint")
+                                    ok = go_ic_home_checkpoint()
+                                    if ok:
+                                        set_alert("#0ea5e9", "At IC checkpoint. Press Return to Test to resume")
+                                    else:
+                                        set_alert("red", "IC checkpoint move failed. Check robot state")
+
             # UI text / alerts
             with state_lock:
                 mode = "RUNNING" if state.running else ("PAUSED" if state.paused else "STOPPED")
@@ -807,6 +967,10 @@ def main():
                     status_dot.set_facecolor(base_color)
                     alert_msg = ""
 
+                manual_state = "Manual: REQUESTED" if state.manual_intervention_requested else (
+                    "Manual: ACTIVE" if state.manual_mode_active else "Manual: OFF"
+                )
+
                 idx = state.traj_index % len(TRAJECTORY)
                 btn, ph = INDEX_TO_META[idx]
 
@@ -817,7 +981,7 @@ def main():
                     baseline_txt = f"Baseline: {min_n}/{state.baseline_cycles} per button"
 
                 status_line.set_text(
-                    f"State: {mode} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
+                    f"State: {mode} | {manual_state} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
                 )
                 param_line.set_text("")
                 fail_line_1.set_text(
