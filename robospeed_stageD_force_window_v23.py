@@ -509,35 +509,24 @@ def main():
     tb_fmin = TextBox(fig.add_axes([fmin_x, force_row_y, force_box_w, 0.05]), "Force", initial=str(state.force_min))
     tb_fmax = TextBox(fig.add_axes([fmax_x, force_row_y, force_box_w, 0.05]), "", initial=str(state.force_max))
 
-    border_inset_x = (3.0 / 25.4) / 14.0  # 3 mm on a 14-inch wide figure
-    border_inset_y = (3.0 / 25.4) / 8.0   # 3 mm on an 8-inch tall figure
-    manual_btn_w = 0.067
+    mm_to_fig_y = (1.0 / 25.4) / 8.0
     manual_btn_h = 0.033
-    manual_btn_gap = 0.008
+    manual_btn_gap = 0.004
 
-    # 3-row camera/manual control layout
-    row1_y = border_inset_y + 2 * (manual_btn_h + manual_btn_gap)
-    row2_y = border_inset_y + (manual_btn_h + manual_btn_gap)
-    row3_y = border_inset_y
+    # Single horizontal row, 8 mm above camera pane
+    camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.25, 0.32, 0.65
+    manual_row_y = camera_ax_y + camera_ax_h + (8.0 * mm_to_fig_y)
+    manual_btn_w = (camera_ax_w - (5 * manual_btn_gap)) / 6
 
-    col4_x = 1.0 - border_inset_x - manual_btn_w
-    col3_x = col4_x - manual_btn_gap - manual_btn_w
-    col2_x = col3_x - manual_btn_gap - manual_btn_w
-    col1_x = col2_x - manual_btn_gap - manual_btn_w
+    fig.text(camera_ax_x, manual_row_y + manual_btn_h + 0.006, "Manual IC / Camera", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
 
-    fig.text(col1_x, row1_y + manual_btn_h + 0.008, "Manual IC / Camera", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
-
-    # Row 1
-    btn_ic_home = Button(fig.add_axes([col1_x, row1_y, manual_btn_w, manual_btn_h]), "IC Home", color="#0ea5e9", hovercolor="#0284c7")
-    btn_return_test = Button(fig.add_axes([col2_x, row1_y, manual_btn_w, manual_btn_h]), "Return to Test", color="#0891b2", hovercolor="#0e7490")
-
-    # Row 2
-    btn_camera_tune = Button(fig.add_axes([col1_x, row2_y, manual_btn_w, manual_btn_h]), "Camera Tune", color="#16a34a", hovercolor="#15803d")
-    btn_golden_capture = Button(fig.add_axes([col2_x, row2_y, manual_btn_w, manual_btn_h]), "Golden Capture", color="#d97706", hovercolor="#b45309")
-    btn_image_capture = Button(fig.add_axes([col3_x, row2_y, manual_btn_w, manual_btn_h]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
-
-    # Row 3
-    btn_run_inspection = Button(fig.add_axes([col1_x, row3_y, manual_btn_w, manual_btn_h]), "Run Inspection", color="#7c3aed", hovercolor="#6d28d9")
+    x0 = camera_ax_x
+    btn_ic_home = Button(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "IC Home", color="#0ea5e9", hovercolor="#0284c7")
+    btn_return_test = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Return to Test", color="#0891b2", hovercolor="#0e7490")
+    btn_camera_tune = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Camera Tune", color="#16a34a", hovercolor="#15803d")
+    btn_golden_capture = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Golden Capture", color="#d97706", hovercolor="#b45309")
+    btn_image_capture = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
+    btn_run_inspection = Button(fig.add_axes([x0 + 5 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Run Inspection", color="#7c3aed", hovercolor="#6d28d9")
 
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report,
                  btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection]:
