@@ -179,6 +179,7 @@ class SystemState:
     alert_msg: str = ""
     manual_intervention_requested: bool = False
     manual_mode_active: bool = False
+    image_capture_count: int = 0
     test_name: str = "test_report"
     exit_requested: bool = False
 
@@ -406,6 +407,7 @@ def main():
                 state.baseline_peaks = {"A": [], "B": [], "C": [], "D": []}
                 state.baseline_mean = {}
                 state.baseline_ready = False
+                state.image_capture_count = 0
             else:
                 state.baseline_cycles = new_base
 
@@ -429,6 +431,7 @@ def main():
             state.window_peak_time = None
             state.manual_intervention_requested = False
             state.manual_mode_active = False
+            state.image_capture_count = 0
 
         print("[GUI] Start pressed -> Going Home before cycle start")
         go_home()
@@ -467,6 +470,7 @@ def main():
             state.window_peak_time = None
             state.manual_intervention_requested = False
             state.manual_mode_active = False
+            state.image_capture_count = 0
         print("[GUI] Stop pressed -> Going Home")
         go_home()
 
@@ -475,6 +479,11 @@ def main():
 
     def on_ic_home(_evt):
         with state_lock:
+            if state.manual_mode_active:
+                set_alert("#0ea5e9", "Already at IC checkpoint")
+                print("[GUI] IC Home ignored: already in manual checkpoint mode")
+                return
+
             if state.running:
                 state.manual_intervention_requested = True
                 set_alert("#0ea5e9", "IC Home requested (soft interrupt at cycle boundary)")
@@ -497,8 +506,15 @@ def main():
             set_alert("red", "IC checkpoint move failed. Check robot state")
 
     def on_image_capture(_evt):
-        set_alert("#2563eb", "Image Capture pressed (phase 1.1 scaffold)")
-        print("[GUI] Image Capture pressed")
+        with state_lock:
+            if not state.manual_mode_active:
+                set_alert("#2563eb", "Image Capture ignored (not at IC checkpoint)")
+                print("[GUI] Image Capture ignored: enter IC Home first")
+                return
+            state.image_capture_count += 1
+            capture_num = state.image_capture_count
+        set_alert("#2563eb", f"Image Capture requested (#{capture_num})")
+        print(f"[GUI] Image Capture requested #{capture_num}")
 
     def on_return_to_test(_evt):
         with state_lock:
@@ -541,6 +557,7 @@ def main():
             state.baseline_peaks = {"A": [], "B": [], "C": [], "D": []}
             state.baseline_mean = {}
             state.baseline_ready = False
+            state.image_capture_count = 0
         print("[GUI] Reset pressed -> counters + baseline cleared")
 
     def build_report_pdf(path):
