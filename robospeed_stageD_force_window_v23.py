@@ -300,15 +300,15 @@ def main():
     manual_btn_w = 0.08
     manual_btn_h = 0.035
     manual_btn_gap = 0.01
-    manual_y = border_inset_y
-    right_btn_x = 1.0 - border_inset_x - manual_btn_w
-    mid_btn_x = right_btn_x - manual_btn_gap - manual_btn_w
-    left_btn_x = mid_btn_x - manual_btn_gap - manual_btn_w
+    manual_x = 1.0 - border_inset_x - manual_btn_w
+    bottom_btn_y = border_inset_y
+    mid_btn_y = bottom_btn_y + manual_btn_h + manual_btn_gap
+    top_btn_y = mid_btn_y + manual_btn_h + manual_btn_gap
 
-    fig.text(left_btn_x, manual_y + manual_btn_h + 0.008, "Manual IC", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
-    btn_ic_home = Button(fig.add_axes([left_btn_x, manual_y, manual_btn_w, manual_btn_h]), "IC Home", color="#0ea5e9", hovercolor="#0284c7")
-    btn_image_capture = Button(fig.add_axes([mid_btn_x, manual_y, manual_btn_w, manual_btn_h]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
-    btn_return_test = Button(fig.add_axes([right_btn_x, manual_y, manual_btn_w, manual_btn_h]), "Return to Test", color="#0891b2", hovercolor="#0e7490")
+    fig.text(manual_x, top_btn_y + manual_btn_h + 0.008, "Manual IC", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
+    btn_ic_home = Button(fig.add_axes([manual_x, top_btn_y, manual_btn_w, manual_btn_h]), "IC Home", color="#0ea5e9", hovercolor="#0284c7")
+    btn_image_capture = Button(fig.add_axes([manual_x, mid_btn_y, manual_btn_w, manual_btn_h]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
+    btn_return_test = Button(fig.add_axes([manual_x, bottom_btn_y, manual_btn_w, manual_btn_h]), "Return to Test", color="#0891b2", hovercolor="#0e7490")
 
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report,
                  btn_ic_home, btn_image_capture, btn_return_test]:
