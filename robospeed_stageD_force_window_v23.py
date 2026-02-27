@@ -15,6 +15,7 @@ import os
 from datetime import datetime
 
 import cv2
+import pyrealsense2 as rs
 
 from Phidget22.Devices.VoltageRatioInput import VoltageRatioInput
 from dorna2 import Dorna
@@ -53,6 +54,9 @@ COLOR_TEXT = "#e5e7eb"
 
 CAMERA_WINDOW_NAME = "IC Camera"
 CAMERA_OUTPUT_DIR = "inspection_output"
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+CAMERA_FPS = 15
 
 
 # ================================
@@ -233,8 +237,13 @@ def main():
 
         def _camera_worker():
             nonlocal camera_latest_frame
-            cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
+            pipeline = rs.pipeline()
+            config = rs.config()
+            config.enable_stream(rs.stream.color, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.bgr8, CAMERA_FPS)
+
+            try:
+                pipeline.start(config)
+            except Exception:
                 _set_camera_status("camera:open_failed")
                 return
 
@@ -243,28 +252,46 @@ def main():
             cv2.moveWindow(CAMERA_WINDOW_NAME, 980, 120)
             _set_camera_status("camera:live")
 
-            while not camera_stop_evt.is_set():
-                ok, frame = cap.read()
-                if not ok:
-                    _set_camera_status("camera:frame_failed")
-                    time.sleep(0.05)
-                    continue
+            # warmup frames
+            for _ in range(8):
+                try:
+                    pipeline.wait_for_frames(1000)
+                except Exception:
+                    break
 
-                with camera_lock:
-                    camera_latest_frame = frame.copy()
-
-                overlay = frame.copy()
-                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                cv2.putText(overlay, f"{CAMERA_WINDOW_NAME}  {stamp}", (20, 36),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                cv2.imshow(CAMERA_WINDOW_NAME, overlay)
-                cv2.waitKey(1)
-
-            cap.release()
             try:
-                cv2.destroyWindow(CAMERA_WINDOW_NAME)
-            except Exception:
-                pass
+                while not camera_stop_evt.is_set():
+                    try:
+                        frames = pipeline.wait_for_frames(1000)
+                    except Exception:
+                        _set_camera_status("camera:frame_timeout")
+                        time.sleep(0.05)
+                        continue
+
+                    color = frames.get_color_frame()
+                    if not color:
+                        _set_camera_status("camera:no_color_frame")
+                        continue
+
+                    frame = np.asanyarray(color.get_data())
+                    with camera_lock:
+                        camera_latest_frame = frame.copy()
+
+                    overlay = frame.copy()
+                    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    cv2.putText(overlay, f"{CAMERA_WINDOW_NAME}  {stamp}", (20, 36),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    cv2.imshow(CAMERA_WINDOW_NAME, overlay)
+                    cv2.waitKey(1)
+            finally:
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+                try:
+                    cv2.destroyWindow(CAMERA_WINDOW_NAME)
+                except Exception:
+                    pass
 
         camera_thread = threading.Thread(target=_camera_worker, daemon=True)
         camera_thread.start()
