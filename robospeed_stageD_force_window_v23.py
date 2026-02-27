@@ -295,10 +295,20 @@ def main():
     tb_fmin = TextBox(fig.add_axes([fmin_x, force_row_y, force_box_w, 0.05]), "Force", initial=str(state.force_min))
     tb_fmax = TextBox(fig.add_axes([fmax_x, force_row_y, force_box_w, 0.05]), "", initial=str(state.force_max))
 
-    fig.text(0.0594, 0.058, "Manual IC", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
-    btn_ic_home = Button(fig.add_axes([0.033, 0.015, 0.06, 0.035]), "IC Home", color="#0ea5e9", hovercolor="#0284c7")
-    btn_image_capture = Button(fig.add_axes([0.097, 0.015, 0.06, 0.035]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
-    btn_return_test = Button(fig.add_axes([0.161, 0.015, 0.06, 0.035]), "Return to Test", color="#0891b2", hovercolor="#0e7490")
+    border_inset_x = (3.0 / 25.4) / 14.0  # 3 mm on a 14-inch wide figure
+    border_inset_y = (3.0 / 25.4) / 8.0   # 3 mm on an 8-inch tall figure
+    manual_btn_w = 0.08
+    manual_btn_h = 0.035
+    manual_btn_gap = 0.01
+    manual_y = border_inset_y
+    right_btn_x = 1.0 - border_inset_x - manual_btn_w
+    mid_btn_x = right_btn_x - manual_btn_gap - manual_btn_w
+    left_btn_x = mid_btn_x - manual_btn_gap - manual_btn_w
+
+    fig.text(left_btn_x, manual_y + manual_btn_h + 0.008, "Manual IC", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
+    btn_ic_home = Button(fig.add_axes([left_btn_x, manual_y, manual_btn_w, manual_btn_h]), "IC Home", color="#0ea5e9", hovercolor="#0284c7")
+    btn_image_capture = Button(fig.add_axes([mid_btn_x, manual_y, manual_btn_w, manual_btn_h]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
+    btn_return_test = Button(fig.add_axes([right_btn_x, manual_y, manual_btn_w, manual_btn_h]), "Return to Test", color="#0891b2", hovercolor="#0e7490")
 
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report,
                  btn_ic_home, btn_image_capture, btn_return_test]:
