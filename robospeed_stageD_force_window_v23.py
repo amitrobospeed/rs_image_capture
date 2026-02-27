@@ -38,6 +38,8 @@ baseline_cycles = 30
 deviation_threshold = 0.50
 
 ALERT_FLASH_S = 1.0
+TARE_WARMUP_S = 3.0
+TARE_SAMPLES = 200
 
 # ================================
 # UI SETTINGS
@@ -197,6 +199,8 @@ class SystemState:
     manual_intervention_requested: bool = False
     manual_mode_active: bool = False
     image_capture_count: int = 0
+    tare_on_start: bool = True
+    tare_in_progress: bool = False
     test_name: str = "test_report"
     exit_requested: bool = False
 
@@ -216,8 +220,8 @@ def main():
     bridge.setDataInterval(data_interval_ms)
 
     print("Taring...")
-    time.sleep(1)
-    zero_offset = float(np.mean([bridge.getVoltageRatio() for _ in range(200)]))
+    time.sleep(TARE_WARMUP_S)
+    zero_offset = float(np.mean([bridge.getVoltageRatio() for _ in range(TARE_SAMPLES)]))
 
     state = SystemState()
     state_lock = threading.RLock()
@@ -516,7 +520,7 @@ def main():
     # Single horizontal row, 4 mm above camera pane
     camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.25, 0.32, 0.65
     manual_row_y = camera_ax_y + camera_ax_h + (4.0 * mm_to_fig_y)
-    manual_btn_w = (camera_ax_w - (5 * manual_btn_gap)) / 6
+    manual_btn_w = (camera_ax_w - (6 * manual_btn_gap)) / 7
 
     fig.text(camera_ax_x, manual_row_y + manual_btn_h + 0.006, "Manual IC / Camera", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
 
@@ -527,11 +531,14 @@ def main():
     btn_golden_capture = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Golden Capture", color="#d97706", hovercolor="#b45309")
     btn_image_capture = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
     btn_run_inspection = Button(fig.add_axes([x0 + 5 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Run Inspection", color="#7c3aed", hovercolor="#6d28d9")
+    btn_re_tare = Button(fig.add_axes([x0 + 6 * (manual_btn_w + manual_btn_gap), manual_row_y, manual_btn_w, manual_btn_h]), "Re-tare", color="#475569", hovercolor="#334155")
 
-    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report,
-                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection]:
+    btn_tare_on_start = Button(fig.add_axes([0.0594, y_top - 7*dy, 0.14, 0.05]), "Tare@Start: ON", color="#0f766e", hovercolor="#115e59")
+
+    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start,
+                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(9 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection] else 12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
@@ -551,6 +558,49 @@ def main():
             state.alert_color = color
             state.alert_msg = msg
             state.alert_until_wall = time.time() + ALERT_FLASH_S
+
+    def update_tare_toggle_button():
+        with state_lock:
+            enabled = state.tare_on_start
+        if enabled:
+            btn_tare_on_start.label.set_text("Tare@Start: ON")
+            btn_tare_on_start.ax.set_facecolor("#0f766e")
+        else:
+            btn_tare_on_start.label.set_text("Tare@Start: OFF")
+            btn_tare_on_start.ax.set_facecolor("#7f1d1d")
+
+    def go_a_above():
+        print("[Robot] Going to A-above for tare")
+        robot.play(-1, {
+            "cmd": "jmove", "rel": 0,
+            "vel": SAFE_START_VEL,
+            "acc": SAFE_START_ACC,
+            "jerk": SAFE_START_JERK,
+            **BUTTON_POSES["A"]["above"]
+        })
+
+    def perform_tare(reason):
+        nonlocal zero_offset
+        with state_lock:
+            if state.tare_in_progress:
+                set_alert("#475569", "Tare already in progress")
+                return False
+            state.tare_in_progress = True
+        try:
+            set_alert("#475569", f"Tare warm-up ({TARE_WARMUP_S:.0f}s): {reason}")
+            time.sleep(TARE_WARMUP_S)
+            samples = [bridge.getVoltageRatio() for _ in range(TARE_SAMPLES)]
+            zero_offset = float(np.mean(samples))
+            set_alert("green", f"Tare complete ({reason})")
+            print(f"[Force] Tare complete ({reason}) zero_offset={zero_offset:.8f}")
+            return True
+        except Exception as exc:
+            set_alert("red", f"Tare failed: {exc}")
+            print(f"[Force] Tare failed: {exc}")
+            return False
+        finally:
+            with state_lock:
+                state.tare_in_progress = False
 
     def go_home():
         print("[Robot] Going Home")
@@ -665,6 +715,26 @@ def main():
             return
 
         with state_lock:
+            tare_on_start = state.tare_on_start
+        if tare_on_start:
+            go_a_above()
+            if not wait_until_idle():
+                with state_lock:
+                    state.running = False
+                    state.paused = False
+                    state.stopped = True
+                set_alert("red", "Start failed: robot did not reach A-above for tare")
+                print("[GUI] Start aborted: timeout waiting at A-above for tare")
+                return
+            if not perform_tare("start"):
+                with state_lock:
+                    state.running = False
+                    state.paused = False
+                    state.stopped = True
+                print("[GUI] Start aborted: tare failed")
+                return
+
+        with state_lock:
             state.running = True
             state.paused = False
             state.stopped = False
@@ -696,6 +766,25 @@ def main():
 
     def on_home(_evt):
         go_home()
+
+    def on_re_tare(_evt):
+        with state_lock:
+            if state.running:
+                set_alert("#475569", "Re-tare blocked while running")
+                print("[GUI] Re-tare blocked: running")
+                return
+        if not wait_until_idle(timeout_s=5.0):
+            set_alert("#475569", "Re-tare blocked: robot not idle")
+            print("[GUI] Re-tare blocked: robot not idle")
+            return
+        perform_tare("manual")
+
+    def on_toggle_tare_on_start(_evt):
+        with state_lock:
+            state.tare_on_start = not state.tare_on_start
+            enabled = state.tare_on_start
+        update_tare_toggle_button()
+        set_alert("#0f766e" if enabled else "#7f1d1d", f"Tare-on-start {'enabled' if enabled else 'disabled'}")
 
     def on_ic_home(_evt):
         with state_lock:
@@ -996,6 +1085,8 @@ def main():
     btn_pause.on_clicked(on_pause)
     btn_stop.on_clicked(on_stop)
     btn_home.on_clicked(on_home)
+    btn_re_tare.on_clicked(on_re_tare)
+    btn_tare_on_start.on_clicked(on_toggle_tare_on_start)
     btn_ic_home.on_clicked(on_ic_home)
     btn_return_test.on_clicked(on_return_to_test)
     btn_camera_tune.on_clicked(on_camera_tune)
@@ -1005,6 +1096,8 @@ def main():
     btn_reset.on_clicked(on_reset)
     btn_report.on_clicked(on_download_report)
     btn_exit.on_clicked(on_exit)
+
+    update_tare_toggle_button()
 
     # TextBox callbacks (kept, but now also locked)
     def on_vel_submit(text):
@@ -1286,8 +1379,9 @@ def main():
                 ax_cam.set_title(f"IC Camera ({camera_txt})", fontsize=20, color=COLOR_TEXT)
 
                 cam_lock_txt = "LOCKED" if camera_settings_locked else "UNLOCKED"
+                tare_txt = "Tare@Start:ON" if state.tare_on_start else "Tare@Start:OFF"
                 status_line.set_text(
-                    f"State: {mode} | {manual_state} | Camera: {camera_txt}/{cam_lock_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
+                    f"State: {mode} | {manual_state} | {tare_txt} | Camera: {camera_txt}/{cam_lock_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
                 )
                 param_line.set_text("")
                 fail_line_1.set_text(
