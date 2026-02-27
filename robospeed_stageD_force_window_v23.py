@@ -417,8 +417,8 @@ def main():
     def on_start(_evt):
         apply_textbox_values()
         with state_lock:
-            state.running = True
-            state.paused = False
+            state.running = False
+            state.paused = True
             state.stopped = False
             state.traj_index = 0
             state.cycle_count = 0
@@ -429,7 +429,23 @@ def main():
             state.window_peak_time = None
             state.manual_intervention_requested = False
             state.manual_mode_active = False
-        print("[GUI] Start pressed")
+
+        print("[GUI] Start pressed -> Going Home before cycle start")
+        go_home()
+        if not wait_until_idle():
+            with state_lock:
+                state.running = False
+                state.paused = False
+                state.stopped = True
+            set_alert("red", "Start failed: robot did not reach Home")
+            print("[GUI] Start aborted: timeout waiting at Home")
+            return
+
+        with state_lock:
+            state.running = True
+            state.paused = False
+            state.stopped = False
+        set_alert("green", "At Home. Starting cycle test")
 
     def on_pause(_evt):
         with state_lock:
@@ -471,16 +487,19 @@ def main():
         with state_lock:
             state.manual_intervention_requested = False
             was_manual = state.manual_mode_active
+            if not was_manual:
+                set_alert("#0891b2", "Return to Test ignored (not in manual mode)")
+                print("[GUI] Return to Test ignored: robot was not in manual checkpoint mode")
+                return
+
             state.manual_mode_active = False
             state.running = True
             state.paused = False
             state.stopped = False
             state.aligned_to_A = False
             state.traj_index = 0
-        if was_manual:
-            set_alert("#0891b2", "Return to Test: resuming automatic cycle")
-        else:
-            set_alert("#0891b2", "Return to Test pressed")
+
+        set_alert("#0891b2", "Return to Test: resuming automatic cycle")
         print("[GUI] Return to Test pressed")
 
     def on_reset(_evt):
