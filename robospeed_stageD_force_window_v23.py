@@ -176,6 +176,8 @@ class SystemState:
     alert_until_wall: float = 0.0
     alert_color: str = "gray"
     alert_msg: str = ""
+    manual_intervention_requested: bool = False
+    manual_mode_active: bool = False
     test_name: str = "test_report"
     exit_requested: bool = False
 
@@ -293,9 +295,15 @@ def main():
     tb_fmin = TextBox(fig.add_axes([fmin_x, force_row_y, force_box_w, 0.05]), "Force", initial=str(state.force_min))
     tb_fmax = TextBox(fig.add_axes([fmax_x, force_row_y, force_box_w, 0.05]), "", initial=str(state.force_max))
 
-    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report]:
+    fig.text(0.0594, 0.058, "Manual IC", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
+    btn_ic_home = Button(fig.add_axes([0.033, 0.015, 0.06, 0.035]), "IC Home", color="#0ea5e9", hovercolor="#0284c7")
+    btn_image_capture = Button(fig.add_axes([0.097, 0.015, 0.06, 0.035]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
+    btn_return_test = Button(fig.add_axes([0.161, 0.015, 0.06, 0.035]), "Return to Test", color="#0891b2", hovercolor="#0e7490")
+
+    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report,
+                 btn_ic_home, btn_image_capture, btn_return_test]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(12)
+        _btn.label.set_fontsize(9 if _btn in [btn_ic_home, btn_image_capture, btn_return_test] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
@@ -406,6 +414,23 @@ def main():
 
     def on_home(_evt):
         go_home()
+
+    def on_ic_home(_evt):
+        with state_lock:
+            state.manual_intervention_requested = True
+        set_alert("#0ea5e9", "IC Home requested (phase 1.1 scaffold)")
+        print("[GUI] IC Home pressed")
+
+    def on_image_capture(_evt):
+        set_alert("#2563eb", "Image Capture pressed (phase 1.1 scaffold)")
+        print("[GUI] Image Capture pressed")
+
+    def on_return_to_test(_evt):
+        with state_lock:
+            state.manual_intervention_requested = False
+            state.manual_mode_active = False
+        set_alert("#0891b2", "Return to Test pressed (phase 1.1 scaffold)")
+        print("[GUI] Return to Test pressed")
 
     def on_reset(_evt):
         with state_lock:
@@ -557,6 +582,9 @@ def main():
     btn_pause.on_clicked(on_pause)
     btn_stop.on_clicked(on_stop)
     btn_home.on_clicked(on_home)
+    btn_ic_home.on_clicked(on_ic_home)
+    btn_image_capture.on_clicked(on_image_capture)
+    btn_return_test.on_clicked(on_return_to_test)
     btn_reset.on_clicked(on_reset)
     btn_report.on_clicked(on_download_report)
     btn_exit.on_clicked(on_exit)
@@ -807,6 +835,10 @@ def main():
                     status_dot.set_facecolor(base_color)
                     alert_msg = ""
 
+                manual_state = "Manual: REQUESTED" if state.manual_intervention_requested else (
+                    "Manual: ACTIVE" if state.manual_mode_active else "Manual: OFF"
+                )
+
                 idx = state.traj_index % len(TRAJECTORY)
                 btn, ph = INDEX_TO_META[idx]
 
@@ -817,7 +849,7 @@ def main():
                     baseline_txt = f"Baseline: {min_n}/{state.baseline_cycles} per button"
 
                 status_line.set_text(
-                    f"State: {mode} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
+                    f"State: {mode} | {manual_state} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
                 )
                 param_line.set_text("")
                 fail_line_1.set_text(
