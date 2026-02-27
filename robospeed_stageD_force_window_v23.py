@@ -493,14 +493,29 @@ def main():
                 return
 
             state.manual_mode_active = False
-            state.running = True
-            state.paused = False
+            state.running = False
+            state.paused = True
             state.stopped = False
             state.aligned_to_A = False
             state.traj_index = 0
 
-        set_alert("#0891b2", "Return to Test: resuming automatic cycle")
-        print("[GUI] Return to Test pressed")
+        print("[GUI] Return to Test pressed -> Going Home before restart")
+        go_home()
+        if not wait_until_idle():
+            with state_lock:
+                state.running = False
+                state.paused = False
+                state.stopped = True
+            set_alert("red", "Return to Test failed: robot did not reach Home")
+            print("[GUI] Return to Test aborted: timeout waiting at Home")
+            return
+
+        with state_lock:
+            state.running = True
+            state.paused = False
+            state.stopped = False
+        set_alert("#0891b2", "At Home. Restarting cycle test")
+        print("[GUI] Return to Test: automatic cycle resumed")
 
     def on_reset(_evt):
         with state_lock:
