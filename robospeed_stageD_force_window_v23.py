@@ -475,9 +475,26 @@ def main():
 
     def on_ic_home(_evt):
         with state_lock:
-            state.manual_intervention_requested = True
-        set_alert("#0ea5e9", "IC Home requested (soft interrupt at cycle boundary)")
-        print("[GUI] IC Home pressed")
+            if state.running:
+                state.manual_intervention_requested = True
+                set_alert("#0ea5e9", "IC Home requested (soft interrupt at cycle boundary)")
+                print("[GUI] IC Home pressed")
+                return
+
+            state.manual_intervention_requested = False
+            state.manual_mode_active = True
+            state.running = False
+            state.paused = True
+            state.stopped = False
+
+        print("[GUI] IC Home pressed -> no active cycle, moving to IC checkpoint now")
+        ok = go_ic_home_checkpoint()
+        if ok:
+            set_alert("#0ea5e9", "At IC checkpoint. Press Return to Test to resume")
+        else:
+            with state_lock:
+                state.manual_mode_active = False
+            set_alert("red", "IC checkpoint move failed. Check robot state")
 
     def on_image_capture(_evt):
         set_alert("#2563eb", "Image Capture pressed (phase 1.1 scaffold)")
