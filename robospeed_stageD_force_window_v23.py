@@ -71,6 +71,7 @@ GAIN_MAX = 32
 DEFAULT_AUTO_CAPTURE_RETRIES = 2
 AUTO_FAIL_POLICY_OPTIONS = ("safe_stop", "continue")
 IC_CAPTURE_SETTLE_S = 0.5
+INSPECTION_MIN_DEFECT_AREA = 15
 
 
 # ================================
@@ -87,7 +88,8 @@ JERK_MIN, JERK_MAX = 0, 10000
 SAFE_START_VEL = 100
 SAFE_START_ACC = 200
 SAFE_START_JERK = 2000
-IC_CLEAR_J0_REL = -50
+IC_CLEAR_J0_REL = -70
+IC_CLEAR_J0_JERK = 1000
 
 
 # ================================
@@ -275,6 +277,7 @@ def main():
 
     manifest_path = os.path.join(CAMERA_OUTPUT_DIR, "manifest.csv")
     reports_dir = os.path.join(CAMERA_OUTPUT_DIR, "reports")
+    masks_dir = os.path.join(CAMERA_OUTPUT_DIR, "masks")
     cycle_video_path = None
     cycle_video_writer = None
     cycle_video_started = False
@@ -285,6 +288,7 @@ def main():
         os.path.join(CAMERA_OUTPUT_DIR, "golden"),
         os.path.join(CAMERA_OUTPUT_DIR, "cyc"),
         os.path.join(CAMERA_OUTPUT_DIR, "anomaly"),
+        masks_dir,
         os.path.join(CAMERA_OUTPUT_DIR, "video"),
         reports_dir,
     ]:
@@ -490,7 +494,11 @@ def main():
             cycle_video_path = None
             return False
         golden_tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        intro = _stamp(golden_img, f"GOLDEN | run={run_id} | {golden_tag}")
+        intro_src = golden_img.copy()
+        if roi_locked and locked_roi is not None:
+            x, y, w, h = locked_roi
+            cv2.rectangle(intro_src, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        intro = _stamp(intro_src, f"GOLDEN | run={run_id} | {golden_tag}")
         cycle_video_writer.write(intro)
         cycle_video_started = True
         return True
@@ -548,26 +556,36 @@ def main():
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        verdict = "PASS" if score < 8.0 else "FAIL"
+
+        defect_found = False
+        defect_rect = None
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) > INSPECTION_MIN_DEFECT_AREA:
+                defect_found = True
+                defect_rect = cv2.boundingRect(largest)
+
+        verdict = "FAIL" if defect_found else "PASS"
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        mask_path = os.path.join(CAMERA_OUTPUT_DIR, f"inspection_mask_{cycle_num}_{ts}.png")
+        mask_path = os.path.join(masks_dir, f"inspection_mask_{cycle_num}_{ts}.png")
         cv2.imwrite(mask_path, mask)
 
         disp = cyc.copy()
-        cv2.putText(disp, f"Cycle:{cycle_num} Verdict:{verdict} Score:{score:.2f}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0) if verdict == "PASS" else (0, 0, 255), 2)
+        label = f"Cycle:{cycle_num} Verdict:{verdict} Score:{score:.2f}"
+        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+        tx = max(20, disp.shape[1] - tw - 20)
+        ty = max(th + 20, disp.shape[0] - 20)
+        cv2.putText(disp, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    (0, 255, 0) if verdict == "PASS" else (0, 0, 255), 2)
 
-        min_defect_area = 15
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest) > min_defect_area:
-                rx, ry, rw, rh = cv2.boundingRect(largest)
-                if roi_locked and locked_roi is not None:
-                    ox, oy, _, _ = locked_roi
-                    cv2.rectangle(disp, (ox + rx, oy + ry), (ox + rx + rw, oy + ry + rh), (0, 0, 255), 2)
-                else:
-                    cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 2)
+        if defect_rect is not None:
+            rx, ry, rw, rh = defect_rect
+            if roi_locked and locked_roi is not None:
+                ox, oy, _, _ = locked_roi
+                cv2.rectangle(disp, (ox + rx, oy + ry), (ox + rx + rw, oy + ry + rh), (0, 0, 255), 2)
+            else:
+                cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 2)
 
         if roi_locked and locked_roi is not None:
             x, y, w, h = locked_roi
@@ -597,7 +615,7 @@ def main():
                 "reason_code": reason_code,
                 "file_path": "",
                 "score": "",
-                "threshold": "8.0",
+                "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}",
                 "verdict": "FAIL",
                 "golden_path": golden_path or "",
                 "video_path": cycle_video_path or "",
@@ -680,7 +698,7 @@ def main():
             "reason_code": reason_code,
             "file_path": out_path,
             "score": score,
-            "threshold": "8.0",
+            "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}",
             "verdict": verdict,
             "golden_path": golden_path or "",
             "video_path": cycle_video_path or "",
@@ -996,7 +1014,7 @@ def main():
             "cmd": "jmove", "rel": 1,
             "vel": SAFE_START_VEL,
             "acc": SAFE_START_ACC,
-            "jerk": SAFE_START_JERK,
+            "jerk": IC_CLEAR_J0_JERK,
             "j0": IC_CLEAR_J0_REL
         })
         if not wait_until_idle():
@@ -1186,7 +1204,7 @@ def main():
                 "reason_code": "golden_initialized",
                 "file_path": out_path,
                 "score": "",
-                "threshold": "8.0",
+                "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}",
                 "verdict": "GOLDEN",
                 "golden_path": out_path,
                 "video_path": cycle_video_path or "",
@@ -1218,12 +1236,13 @@ def main():
         print("[GUI] Pause pressed")
 
     def on_stop(_evt):
+        nonlocal last_saved_report_path, auto_report_written_cycle
         with state_lock:
+            stop_cycle = state.cycle_count
             state.running = False
             state.paused = False
             state.stopped = True
             state.traj_index = 0
-            state.cycle_count = 0
             state.aligned_to_A = False
             state.window_active = False
             state.window_button = None
@@ -1232,8 +1251,16 @@ def main():
             state.manual_intervention_requested = False
             state.manual_mode_active = False
             state.image_capture_count = 0
-            state.golden_ready = False
-            state.last_capture_result = "none"
+            state.last_capture_result = f"stopped_at_cycle_{stop_cycle}"
+        if stop_cycle > 0 and auto_report_written_cycle != stop_cycle:
+            try:
+                path = _auto_report_path()
+                build_report_pdf(path)
+                last_saved_report_path = path
+                auto_report_written_cycle = stop_cycle
+                print(f"[Report] Auto-saved on stop: {path}")
+            except Exception as exc:
+                print(f"[Report] Auto-save on stop failed: {exc}")
         print("[GUI] Stop pressed -> Going Home")
         go_home()
 
@@ -1336,7 +1363,7 @@ def main():
                 "reason_code": "no_camera_frame",
                 "file_path": "",
                 "score": "",
-                "threshold": "8.0",
+                "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}",
                 "verdict": "FAIL",
                 "golden_path": golden_path or "",
                 "video_path": cycle_video_path or "",
@@ -1361,7 +1388,7 @@ def main():
                 "reason_code": "save_failed",
                 "file_path": "",
                 "score": "",
-                "threshold": "8.0",
+                "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}",
                 "verdict": "FAIL",
                 "golden_path": golden_path or "",
                 "video_path": cycle_video_path or "",
@@ -1383,7 +1410,7 @@ def main():
             "reason_code": "manual_capture",
             "file_path": out_path,
             "score": "",
-            "threshold": "8.0",
+            "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}",
             "verdict": "CAPTURED",
             "golden_path": golden_path or "",
             "video_path": cycle_video_path or "",
@@ -1462,8 +1489,8 @@ def main():
         verdict, score, mask_path, anomaly_path, disp = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num)
         _ensure_cycle_video(golden_frame, run_id)
         _append_cycle_video_frame(disp, cyc_num)
-        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.3f}", "threshold": "8.0", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy})
-        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.3f}", "threshold": "8.0", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy})
+        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.3f}", "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy})
+        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.3f}", "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy})
         _record_anomaly_stats(cyc_num, verdict, score)
         with state_lock:
             state.last_capture_result = f"manual/{verdict}"
@@ -1718,11 +1745,22 @@ def main():
             print(f"[Report] Open failed: {exc}")
 
     def on_exit(_evt):
+        nonlocal last_saved_report_path, auto_report_written_cycle
         with state_lock:
+            stop_cycle = state.cycle_count
             state.exit_requested = True
             state.running = False
             state.paused = False
             state.stopped = True
+        if stop_cycle > 0 and auto_report_written_cycle != stop_cycle:
+            try:
+                path = _auto_report_path()
+                build_report_pdf(path)
+                last_saved_report_path = path
+                auto_report_written_cycle = stop_cycle
+                print(f"[Report] Auto-saved on exit: {path}")
+            except Exception as exc:
+                print(f"[Report] Auto-save on exit failed: {exc}")
         plt.close(fig)
 
     btn_start.on_clicked(on_start)
