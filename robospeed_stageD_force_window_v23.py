@@ -70,8 +70,14 @@ GAIN_MAX = 32
 
 DEFAULT_AUTO_CAPTURE_RETRIES = 2
 AUTO_FAIL_POLICY_OPTIONS = ("safe_stop", "continue")
-IC_CAPTURE_SETTLE_S = 0.5
+IC_CAPTURE_SETTLE_S = 2.0
+CAPTURE_AVG_MIN_FRAMES = 10
+CAPTURE_AVG_TIMEOUT_S = 2.5
+INSPECTION_DIFF_THRESHOLD = 25
 INSPECTION_MIN_DEFECT_AREA = 15
+INSPECTION_MIN_DEFECT_W = 3
+INSPECTION_MIN_DEFECT_H = 3
+INSPECTION_EDGE_IGNORE_PX = 2
 
 
 # ================================
@@ -384,6 +390,23 @@ def main():
                 return None
             return camera_latest_frame.copy()
 
+    def capture_average_frame(min_frames=CAPTURE_AVG_MIN_FRAMES, timeout_s=CAPTURE_AVG_TIMEOUT_S):
+        deadline = time.time() + max(0.1, float(timeout_s))
+        frames = []
+        while time.time() < deadline:
+            fr = get_latest_camera_frame()
+            if fr is not None:
+                frames.append(fr.astype(np.float32))
+                if len(frames) >= int(min_frames):
+                    break
+            time.sleep(0.02)
+
+        if len(frames) < int(min_frames):
+            return None, len(frames)
+
+        avg = np.mean(frames, axis=0)
+        return np.clip(avg, 0, 255).astype(np.uint8), len(frames)
+
     def run_camera_auto_tune():
         nonlocal camera_exposure, camera_gain, camera_settings_locked, camera_tuned_once
         with camera_hw_lock:
@@ -545,31 +568,55 @@ def main():
             g_src = golden[y:y + h, x:x + w]
             c_src = cyc[y:y + h, x:x + w]
 
-        g = cv2.cvtColor(g_src, cv2.COLOR_BGR2GRAY)
-        c = cv2.cvtColor(c_src, cv2.COLOR_BGR2GRAY)
-        diff = cv2.absdiff(g, c)
+        g_gray = cv2.cvtColor(g_src, cv2.COLOR_BGR2GRAY)
+        c_gray = cv2.cvtColor(c_src, cv2.COLOR_BGR2GRAY)
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        g_norm = clahe.apply(g_gray)
+        c_norm = clahe.apply(c_gray)
+
+        g_blur = cv2.GaussianBlur(g_norm, (5, 5), 0)
+        c_blur = cv2.GaussianBlur(c_norm, (5, 5), 0)
+
+        diff = cv2.absdiff(g_blur, c_blur)
         score = float(np.mean(diff))
-        _, mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+        _, mask = cv2.threshold(diff, INSPECTION_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
 
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
+        edge = max(0, int(INSPECTION_EDGE_IGNORE_PX))
+        if edge > 0 and mask.shape[0] > 2 * edge and mask.shape[1] > 2 * edge:
+            mask[:edge, :] = 0
+            mask[-edge:, :] = 0
+            mask[:, :edge] = 0
+            mask[:, -edge:] = 0
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         defect_found = False
         defect_rect = None
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest) > INSPECTION_MIN_DEFECT_AREA:
+        max_area = 0.0
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area <= INSPECTION_MIN_DEFECT_AREA:
+                continue
+            rx, ry, rw, rh = cv2.boundingRect(contour)
+            if rw < INSPECTION_MIN_DEFECT_W or rh < INSPECTION_MIN_DEFECT_H:
+                continue
+            if area > max_area:
+                max_area = area
                 defect_found = True
-                defect_rect = cv2.boundingRect(largest)
+                defect_rect = (rx, ry, rw, rh)
 
         verdict = "FAIL" if defect_found else "PASS"
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         mask_path = os.path.join(masks_dir, f"inspection_mask_{cycle_num}_{ts}.png")
+        diff_path = os.path.join(masks_dir, f"inspection_diff_{cycle_num}_{ts}.png")
         cv2.imwrite(mask_path, mask)
+        cv2.imwrite(diff_path, diff)
 
         disp = cyc.copy()
         label = f"Cycle:{cycle_num} Verdict:{verdict} Score:{score:.2f}"
@@ -615,7 +662,7 @@ def main():
                 "reason_code": reason_code,
                 "file_path": "",
                 "score": "",
-                "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}",
+                "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
                 "verdict": "FAIL",
                 "golden_path": golden_path or "",
                 "video_path": cycle_video_path or "",
@@ -638,16 +685,17 @@ def main():
         time.sleep(IC_CAPTURE_SETTLE_S)
 
         frame = None
+        frames_used = 0
         for _ in range(retries + 1):
-            frame = get_latest_camera_frame()
+            frame, frames_used = capture_average_frame()
             if frame is not None:
                 break
             _recover_camera_preview()
             time.sleep(0.1)
         if frame is None:
             with state_lock:
-                state.last_capture_result = f"cycle {cycle_num}: no frame"
-            _log_fail("no_camera_frame", "no_camera_frame")
+                state.last_capture_result = f"cycle {cycle_num}: avg no frame ({frames_used}/{CAPTURE_AVG_MIN_FRAMES})"
+            _log_fail("no_camera_frame", "avg_no_camera_frame")
             return False
 
         capture_type = "cyc"
@@ -698,7 +746,7 @@ def main():
             "reason_code": reason_code,
             "file_path": out_path,
             "score": score,
-            "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}",
+            "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
             "verdict": verdict,
             "golden_path": golden_path or "",
             "video_path": cycle_video_path or "",
@@ -1156,13 +1204,13 @@ def main():
                 set_alert("red", "Auto start failed: camera tune failed")
                 return
 
-            frame = get_latest_camera_frame()
+            frame, frames_used = capture_average_frame()
             if frame is None:
                 with state_lock:
                     state.running = False
                     state.paused = True
                     state.stopped = True
-                set_alert("red", "Auto start failed: no camera frame for golden")
+                set_alert("red", f"Auto start failed: averaged frame unavailable ({frames_used}/{CAPTURE_AVG_MIN_FRAMES})")
                 return
 
             run_id = state.test_name.strip() or "test_report"
@@ -1204,7 +1252,7 @@ def main():
                 "reason_code": "golden_initialized",
                 "file_path": out_path,
                 "score": "",
-                "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}",
+                "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
                 "verdict": "GOLDEN",
                 "golden_path": out_path,
                 "video_path": cycle_video_path or "",
@@ -1348,10 +1396,10 @@ def main():
             state.image_capture_count += 1
             capture_num = state.image_capture_count
 
-        frame = get_latest_camera_frame()
+        frame, frames_used = capture_average_frame()
         if frame is None:
-            set_alert("red", "Image Capture failed: no camera frame")
-            print("[GUI] Image Capture failed: latest camera frame unavailable")
+            set_alert("red", f"Image Capture failed: averaged frame unavailable ({frames_used}/{CAPTURE_AVG_MIN_FRAMES})")
+            print("[GUI] Image Capture failed: not enough camera frames for averaging")
             _manifest_write({
                 "run_id": state.test_name.strip() or "test_report",
                 "cycle": max(1, state.cycle_count),
@@ -1360,10 +1408,10 @@ def main():
                 "camera_status": camera_status,
                 "result": "FAIL",
                 "message": "manual_capture_no_frame",
-                "reason_code": "no_camera_frame",
+                "reason_code": "avg_no_camera_frame",
                 "file_path": "",
                 "score": "",
-                "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}",
+                "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
                 "verdict": "FAIL",
                 "golden_path": golden_path or "",
                 "video_path": cycle_video_path or "",
@@ -1388,7 +1436,7 @@ def main():
                 "reason_code": "save_failed",
                 "file_path": "",
                 "score": "",
-                "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}",
+                "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
                 "verdict": "FAIL",
                 "golden_path": golden_path or "",
                 "video_path": cycle_video_path or "",
@@ -1410,7 +1458,7 @@ def main():
             "reason_code": "manual_capture",
             "file_path": out_path,
             "score": "",
-            "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}",
+            "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
             "verdict": "CAPTURED",
             "golden_path": golden_path or "",
             "video_path": cycle_video_path or "",
@@ -1438,10 +1486,10 @@ def main():
             print("[GUI] Golden Capture blocked: camera not tuned/locked")
             return
 
-        frame = get_latest_camera_frame()
+        frame, frames_used = capture_average_frame()
         if frame is None:
-            set_alert("red", "Golden Capture failed: no camera frame")
-            print("[GUI] Golden Capture failed: latest camera frame unavailable")
+            set_alert("red", f"Golden Capture failed: averaged frame unavailable ({frames_used}/{CAPTURE_AVG_MIN_FRAMES})")
+            print("[GUI] Golden Capture failed: not enough camera frames for averaging")
             return
 
         run_id = state.test_name.strip() or "test_report"
@@ -1489,8 +1537,8 @@ def main():
         verdict, score, mask_path, anomaly_path, disp = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num)
         _ensure_cycle_video(golden_frame, run_id)
         _append_cycle_video_frame(disp, cyc_num)
-        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.3f}", "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy})
-        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.3f}", "threshold": f"area>{INSPECTION_MIN_DEFECT_AREA}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy})
+        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.3f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy})
+        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.3f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy})
         _record_anomaly_stats(cyc_num, verdict, score)
         with state_lock:
             state.last_capture_result = f"manual/{verdict}"
