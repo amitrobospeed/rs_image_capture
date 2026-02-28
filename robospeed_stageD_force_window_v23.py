@@ -656,7 +656,7 @@ def main():
     (line,) = ax.plot([], [], linewidth=2.5, color="#0ea5e9")
 
     # Camera pane (same window as force graph)
-    ax_cam = fig.add_axes([0.65, 0.36, 0.32, 0.54])
+    ax_cam = fig.add_axes([0.65, 0.40, 0.32, 0.50])
     ax_cam.set_title("IC Camera", fontsize=20, color=COLOR_TEXT)
     ax_cam.set_xticks([])
     ax_cam.set_yticks([])
@@ -732,7 +732,7 @@ def main():
     manual_btn_gap = 0.004
 
     # Two-row manual/camera controls above camera pane
-    camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.36, 0.32, 0.54
+    camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.40, 0.32, 0.50
     # Keep control rows above force/camera top edge
     force_ax_top = 0.25 + 0.65
     row2_y = force_ax_top + 0.004
@@ -756,19 +756,28 @@ def main():
     btn_auto_cap = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "AutoCap: OFF", color="#1d4ed8", hovercolor="#1e40af")
     btn_first_gold = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "1stGold: ON", color="#065f46", hovercolor="#064e3b")
 
-    # Auto-capture settings/status panel; bottom edge aligned to force-graph bottom (y=0.25)
+    # Auto-capture settings/status panel; expanded vertically with bottom edge aligned to force-graph bottom
     auto_panel_bottom = 0.25
     auto_panel_top = camera_ax_y - 0.01
     auto_panel_h = auto_panel_top - auto_panel_bottom
     fig.patches.append(Rectangle((camera_ax_x, auto_panel_bottom), camera_ax_w, auto_panel_h,
                                  transform=fig.transFigure, facecolor="#0b1220", edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-0.5))
-    auto_tb_w = 0.12
-    auto_tb_h = 0.035
-    fig.text(camera_ax_x, auto_panel_top - 0.018, "Auto Capture Settings / Camera Status", color="#e2e8f0", fontsize=10, weight="bold", zorder=5)
-    tb_cap_every = TextBox(fig.add_axes([camera_ax_x, auto_panel_top - 0.06, auto_tb_w, auto_tb_h]), "CapEvery", initial=str(state.capture_every_x_cycles))
-    auto_status_1 = fig.text(camera_ax_x, auto_panel_bottom + 0.045, "", fontsize=9, color="#e2e8f0")
-    auto_status_2 = fig.text(camera_ax_x, auto_panel_bottom + 0.028, "", fontsize=9, color="#e2e8f0")
-    auto_status_3 = fig.text(camera_ax_x, auto_panel_bottom + 0.011, "", fontsize=9, color="#e2e8f0")
+    auto_row_h = 0.016
+    auto_tb_w = tb_w  # same width as Baseline box
+    auto_tb_h = 0.03
+    title_y = auto_panel_top - 0.008
+    cap_label_y = title_y - (2 * auto_row_h)  # title moved two rows up from cap-every row
+    cap_box_y = cap_label_y - auto_tb_h - 0.003
+    fig.text(camera_ax_x, title_y, "Auto Capture Settings / Camera Status", color="#e2e8f0", fontsize=10, weight="bold", zorder=5)
+    fig.text(camera_ax_x, cap_label_y, "Cap every", color="#e2e8f0", fontsize=10, zorder=5)
+    tb_cap_every = TextBox(fig.add_axes([camera_ax_x, cap_box_y, auto_tb_w, auto_tb_h]), "", initial=str(state.capture_every_x_cycles))
+
+    msg_row_1 = cap_box_y - 0.012
+    auto_status_1 = fig.text(camera_ax_x, msg_row_1 - (0 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
+    auto_status_2 = fig.text(camera_ax_x, msg_row_1 - (1 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
+    auto_status_3 = fig.text(camera_ax_x, msg_row_1 - (2 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
+    auto_status_4 = fig.text(camera_ax_x, msg_row_1 - (3 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
+    auto_status_5 = fig.text(camera_ax_x, msg_row_1 - (4 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
 
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap, btn_first_gold,
                  btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare]:
@@ -1770,9 +1779,11 @@ def main():
                 )
                 roi_txt = f"ROI:LOCKED {locked_roi}" if (roi_locked and locked_roi is not None) else "ROI:UNSET"
                 first_gold_txt = "ON" if state.first_capture_is_golden else "OFF"
-                auto_status_1.set_text(f"Camera: {camera_txt} / {cam_lock_txt} | AutoCap: {sched_txt} every={state.capture_every_x_cycles} next={next_cap}")
-                auto_status_2.set_text(f"Golden: {gold_txt} | 1stGold: {first_gold_txt} | {roi_txt}")
-                auto_status_3.set_text(f"Inspection/Capture: {state.last_capture_result}")
+                auto_status_1.set_text(f"Camera: {camera_txt} / {cam_lock_txt}")
+                auto_status_2.set_text(f"AutoCap: {sched_txt} every={state.capture_every_x_cycles} next={next_cap}")
+                auto_status_3.set_text(f"Golden ready: {gold_txt} | 1stGold: {first_gold_txt}")
+                auto_status_4.set_text(f"{roi_txt}")
+                auto_status_5.set_text(f"Inspection/Capture: {state.last_capture_result}")
                 param_line.set_text("")
                 fail_line_1.set_text(
                     f"Force out of range  A:{state.force_out_of_range['A']}  B:{state.force_out_of_range['B']}  C:{state.force_out_of_range['C']}  D:{state.force_out_of_range['D']} | "
