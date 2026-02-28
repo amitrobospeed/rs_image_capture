@@ -9,10 +9,10 @@ import matplotlib.image as mpimg
 from matplotlib.patches import Circle, Rectangle
 from matplotlib.widgets import Button, TextBox
 from matplotlib.backends.backend_pdf import PdfPages
-import tkinter as tk
-from tkinter import filedialog
 import os
 import csv
+import sys
+import subprocess
 from datetime import datetime
 
 import cv2
@@ -70,6 +70,7 @@ GAIN_MAX = 32
 
 DEFAULT_AUTO_CAPTURE_RETRIES = 2
 AUTO_FAIL_POLICY_OPTIONS = ("safe_stop", "continue")
+IC_CAPTURE_SETTLE_S = 0.5
 
 
 # ================================
@@ -209,7 +210,6 @@ class SystemState:
     exit_requested: bool = False
 
     capture_every_x_cycles: int = 0
-    first_capture_is_golden: bool = True
     golden_ready: bool = False
     auto_capture_enabled: bool = False
     next_auto_capture_cycle: int = 0
@@ -274,15 +274,19 @@ def main():
     roi_locked = False
 
     manifest_path = os.path.join(CAMERA_OUTPUT_DIR, "manifest.csv")
+    reports_dir = os.path.join(CAMERA_OUTPUT_DIR, "reports")
     cycle_video_path = None
     cycle_video_writer = None
     cycle_video_started = False
+    last_saved_report_path = None
+    auto_report_written_cycle = -1
 
     for _d in [
         os.path.join(CAMERA_OUTPUT_DIR, "golden"),
         os.path.join(CAMERA_OUTPUT_DIR, "cyc"),
         os.path.join(CAMERA_OUTPUT_DIR, "anomaly"),
         os.path.join(CAMERA_OUTPUT_DIR, "video"),
+        reports_dir,
     ]:
         os.makedirs(_d, exist_ok=True)
 
@@ -538,6 +542,12 @@ def main():
         diff = cv2.absdiff(g, c)
         score = float(np.mean(diff))
         _, mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         verdict = "PASS" if score < 8.0 else "FAIL"
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -547,6 +557,18 @@ def main():
         disp = cyc.copy()
         cv2.putText(disp, f"Cycle:{cycle_num} Verdict:{verdict} Score:{score:.2f}", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0) if verdict == "PASS" else (0, 0, 255), 2)
+
+        min_defect_area = 15
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) > min_defect_area:
+                rx, ry, rw, rh = cv2.boundingRect(largest)
+                if roi_locked and locked_roi is not None:
+                    ox, oy, _, _ = locked_roi
+                    cv2.rectangle(disp, (ox + rx, oy + ry), (ox + rx + rw, oy + ry + rh), (0, 0, 255), 2)
+                else:
+                    cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 2)
+
         if roi_locked and locked_roi is not None:
             x, y, w, h = locked_roi
             cv2.rectangle(disp, (x, y), (x + w, y + h), (255, 0, 0), 2)
@@ -595,6 +617,8 @@ def main():
             _log_fail("checkpoint_failed", "checkpoint_failed")
             return False
 
+        time.sleep(IC_CAPTURE_SETTLE_S)
+
         frame = None
         for _ in range(retries + 1):
             frame = get_latest_camera_frame()
@@ -609,9 +633,6 @@ def main():
             return False
 
         capture_type = "cyc"
-        with state_lock:
-            if (not state.golden_ready) and state.first_capture_is_golden:
-                capture_type = "golden"
 
         ok, out_name, out_path = save_capture_frame(frame, capture_type, run_id, cycle_num)
         if not ok:
@@ -769,7 +790,7 @@ def main():
     btn_stop = Button(fig.add_axes([0.0594, y_top - 2*dy, 0.14, 0.05]), "Stop", color="#ef4444", hovercolor="#dc2626")
     btn_home = Button(fig.add_axes([0.0594, y_top - 3*dy, 0.14, 0.05]), "Home", color="#64748b", hovercolor="#475569")
     btn_reset = Button(fig.add_axes([0.0594, y_top - 4*dy, 0.14, 0.05]), "Reset", color="#94a3b8", hovercolor="#64748b")
-    btn_report = Button(fig.add_axes([0.0594, y_top - 5*dy, 0.14, 0.05]), "Download Report", color="#3b82f6", hovercolor="#2563eb")
+    btn_report = Button(fig.add_axes([0.0594, y_top - 5*dy, 0.14, 0.05]), "View Report", color="#3b82f6", hovercolor="#2563eb")
     btn_exit = Button(fig.add_axes([0.0594, y_top - 6*dy, 0.14, 0.05]), "Exit", color="#b91c1c", hovercolor="#991b1b")
 
     tb_w = 0.06174
@@ -814,39 +835,54 @@ def main():
     btn_re_tare = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Re-tare", color="#475569", hovercolor="#334155")
     btn_tare_on_start = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Tare@Start: ON", color="#0f766e", hovercolor="#115e59")
     btn_auto_cap = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "AutoCap: OFF", color="#1d4ed8", hovercolor="#1e40af")
-    btn_first_gold = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "1stGold: ON", color="#065f46", hovercolor="#064e3b")
 
-    # Auto-capture settings/status panel; expanded vertically with bottom edge aligned to force-graph bottom
+    # Auto-capture settings/status panel
+    px_x = 1.0 / (fig.get_figwidth() * fig.dpi)
+    px_y = 1.0 / (fig.get_figheight() * fig.dpi)
+    content_shift_x = 8.0 * px_x
+    panel_pad_x = 3.0 * px_x
+    panel_pad_y = 3.0 * px_y
+
     auto_panel_bottom = 0.25
     auto_panel_top = camera_ax_y - 0.01
-    auto_panel_h = auto_panel_top - auto_panel_bottom
-    fig.patches.append(Rectangle((camera_ax_x, auto_panel_bottom), camera_ax_w, auto_panel_h,
-                                 transform=fig.transFigure, facecolor="#0b1220", edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-0.5))
-    auto_row_h = 0.016
+    content_x = camera_ax_x + content_shift_x + panel_pad_x
+
+    auto_msg_font = 8.8
+    auto_row_h = ((1.5 * auto_msg_font) / 72.0) / fig.get_figheight()
     auto_tb_w = tb_w  # same width as Baseline box
     auto_tb_h = 0.03
-    title_y = auto_panel_top - 0.008
-    cap_label_y = title_y - (2 * auto_row_h)  # title moved two rows up from cap-every row
+    title_y = auto_panel_top - (2.2 * auto_row_h)
+    cap_label_y = title_y - (2 * auto_row_h)
     cap_box_y = cap_label_y - auto_tb_h - 0.003
-    retry_label_x = camera_ax_x + auto_tb_w + 0.012
-    fig.text(camera_ax_x, title_y, "Auto Capture Settings / Camera Status", color="#e2e8f0", fontsize=10, weight="bold", zorder=5)
-    fig.text(camera_ax_x, cap_label_y, "Cap every", color="#e2e8f0", fontsize=10, zorder=5)
+    retry_label_x = content_x + auto_tb_w + 0.012
+    fig.text(content_x, title_y, "Auto Capture Settings / Camera Status", color="#e2e8f0", fontsize=10, weight="bold", zorder=5)
+    fig.text(content_x, cap_label_y, "Cap every", color="#e2e8f0", fontsize=10, zorder=5)
     fig.text(retry_label_x, cap_label_y, "Retries", color="#e2e8f0", fontsize=10, zorder=5)
-    tb_cap_every = TextBox(fig.add_axes([camera_ax_x, cap_box_y, auto_tb_w, auto_tb_h]), "", initial=str(state.capture_every_x_cycles))
+    tb_cap_every = TextBox(fig.add_axes([content_x, cap_box_y, auto_tb_w, auto_tb_h]), "", initial=str(state.capture_every_x_cycles))
     tb_cap_retry = TextBox(fig.add_axes([retry_label_x, cap_box_y, auto_tb_w, auto_tb_h]), "", initial=str(state.auto_capture_retries))
     btn_fail_policy = Button(fig.add_axes([retry_label_x + auto_tb_w + 0.012, cap_box_y, auto_tb_w + 0.02, auto_tb_h]), "Fail:STOP", color="#991b1b", hovercolor="#7f1d1d")
 
-    msg_row_1 = cap_box_y - 0.012
-    auto_status_1 = fig.text(camera_ax_x, msg_row_1 - (0 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
-    auto_status_2 = fig.text(camera_ax_x, msg_row_1 - (1 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
-    auto_status_3 = fig.text(camera_ax_x, msg_row_1 - (2 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
-    auto_status_4 = fig.text(camera_ax_x, msg_row_1 - (3 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
-    auto_status_5 = fig.text(camera_ax_x, msg_row_1 - (4 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
+    msg_row_1 = cap_box_y - (1.3 * auto_row_h)
+    auto_status_1 = fig.text(content_x, msg_row_1 - (0 * auto_row_h), "", fontsize=auto_msg_font, color="#e2e8f0")
+    auto_status_2 = fig.text(content_x, msg_row_1 - (1 * auto_row_h), "", fontsize=auto_msg_font, color="#e2e8f0")
+    auto_status_3 = fig.text(content_x, msg_row_1 - (2 * auto_row_h), "", fontsize=auto_msg_font, color="#e2e8f0")
+    auto_status_4 = fig.text(content_x, msg_row_1 - (3 * auto_row_h), "", fontsize=auto_msg_font, color="#e2e8f0")
+    auto_status_5 = fig.text(content_x, msg_row_1 - (4 * auto_row_h), "", fontsize=auto_msg_font, color="#e2e8f0")
 
-    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap, btn_first_gold, btn_fail_policy,
+    content_right = retry_label_x + auto_tb_w + 0.012 + (auto_tb_w + 0.02)
+    content_top = title_y + auto_row_h
+    content_bottom = msg_row_1 - (4 * auto_row_h)
+    panel_x = content_x - panel_pad_x
+    panel_y = content_bottom - panel_pad_y
+    panel_w = (content_right - content_x) + (2 * panel_pad_x)
+    panel_h = (content_top - content_bottom) + (2 * panel_pad_y)
+    fig.patches.append(Rectangle((panel_x, panel_y), panel_w, panel_h,
+                                 transform=fig.transFigure, facecolor="#0b1220", edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-0.5))
+
+    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap, btn_fail_policy,
                  btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_tare_on_start, btn_auto_cap, btn_first_gold, btn_fail_policy] else 12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
@@ -887,16 +923,6 @@ def main():
         else:
             btn_auto_cap.label.set_text("AutoCap: OFF")
             btn_auto_cap.ax.set_facecolor("#1d4ed8")
-
-    def update_first_gold_button():
-        with state_lock:
-            enabled = state.first_capture_is_golden
-        if enabled:
-            btn_first_gold.label.set_text("1stGold: ON")
-            btn_first_gold.ax.set_facecolor("#065f46")
-        else:
-            btn_first_gold.label.set_text("1stGold: OFF")
-            btn_first_gold.ax.set_facecolor("#7f1d1d")
 
     def update_fail_policy_button():
         with state_lock:
@@ -1030,6 +1056,8 @@ def main():
 
     def on_start(_evt):
         apply_textbox_values()
+        nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
+        nonlocal auto_report_written_cycle
         with state_lock:
             state.running = False
             state.paused = True
@@ -1048,9 +1076,13 @@ def main():
             state.last_capture_result = "none"
             state.next_auto_capture_cycle = state.capture_every_x_cycles if state.capture_every_x_cycles > 0 else 0
 
-        nonlocal last_capture_frame, last_capture_path
         last_capture_frame = None
         last_capture_path = None
+        golden_frame = None
+        golden_path = None
+        locked_roi = None
+        roi_locked = False
+        auto_report_written_cycle = -1
 
         print("[GUI] Start pressed -> Going Home before cycle start")
         go_home()
@@ -1084,9 +1116,99 @@ def main():
                 return
 
         with state_lock:
+            auto_mode = state.auto_capture_enabled and state.capture_every_x_cycles > 0
+
+        if auto_mode:
+            print("[GUI] Auto mode start: preparing golden at IC checkpoint")
+            ok_ckpt = go_ic_home_checkpoint()
+            if not ok_ckpt:
+                with state_lock:
+                    state.running = False
+                    state.paused = True
+                    state.stopped = True
+                set_alert("red", "Auto start failed: could not reach IC checkpoint")
+                return
+
+            time.sleep(IC_CAPTURE_SETTLE_S)
+            if not run_camera_auto_tune():
+                with state_lock:
+                    state.running = False
+                    state.paused = True
+                    state.stopped = True
+                set_alert("red", "Auto start failed: camera tune failed")
+                return
+
+            frame = get_latest_camera_frame()
+            if frame is None:
+                with state_lock:
+                    state.running = False
+                    state.paused = True
+                    state.stopped = True
+                set_alert("red", "Auto start failed: no camera frame for golden")
+                return
+
+            run_id = state.test_name.strip() or "test_report"
+            ok, out_name, out_path = save_capture_frame(frame, "golden", run_id, 0)
+            if not ok:
+                with state_lock:
+                    state.running = False
+                    state.paused = True
+                    state.stopped = True
+                set_alert("red", "Auto start failed: could not save golden")
+                return
+
+            roi = cv2.selectROI("ROI Selector", frame, False, False)
+            cv2.destroyWindow("ROI Selector")
+            if not roi or roi[2] <= 0 or roi[3] <= 0:
+                with state_lock:
+                    state.running = False
+                    state.paused = True
+                    state.stopped = True
+                set_alert("red", "Auto start aborted: ROI not selected")
+                return
+
+            locked_roi = tuple(map(int, roi))
+            roi_locked = True
+            golden_frame = frame.copy()
+            golden_path = out_path
+            _ensure_cycle_video(golden_frame, run_id)
+            with state_lock:
+                state.golden_ready = True
+
+            _manifest_write({
+                "run_id": run_id,
+                "cycle": 0,
+                "capture_type": "golden",
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "camera_status": camera_status,
+                "result": "OK",
+                "message": "auto_start_golden_ready",
+                "reason_code": "golden_initialized",
+                "file_path": out_path,
+                "score": "",
+                "threshold": "8.0",
+                "verdict": "GOLDEN",
+                "golden_path": out_path,
+                "video_path": cycle_video_path or "",
+                "anomaly_path": "",
+                "policy": state.auto_fail_policy,
+            })
+
+            go_home()
+            if not wait_until_idle():
+                with state_lock:
+                    state.running = False
+                    state.paused = True
+                    state.stopped = True
+                set_alert("red", "Auto start failed: unable to return home")
+                return
+
+        with state_lock:
             state.running = True
             state.paused = False
             state.stopped = False
+            if state.capture_every_x_cycles > 0:
+                state.next_auto_capture_cycle = state.capture_every_x_cycles
         set_alert("green", "At Home. Starting cycle test")
 
     def on_pause(_evt):
@@ -1149,13 +1271,6 @@ def main():
                 msg = "Auto capture enabled" if state.auto_capture_enabled else "Auto capture disabled"
         update_auto_cap_button()
         set_alert("#1d4ed8", msg)
-
-    def on_toggle_first_gold(_evt):
-        with state_lock:
-            state.first_capture_is_golden = not state.first_capture_is_golden
-            enabled = state.first_capture_is_golden
-        update_first_gold_button()
-        set_alert("#065f46" if enabled else "#7f1d1d", f"1st capture as Golden {'enabled' if enabled else 'disabled'}")
 
     def on_toggle_fail_policy(_evt):
         with state_lock:
@@ -1391,7 +1506,7 @@ def main():
 
     def on_reset(_evt):
         nonlocal golden_frame, golden_path, last_capture_frame, last_capture_path, locked_roi, roi_locked
-        nonlocal cycle_video_writer, cycle_video_path, cycle_video_started
+        nonlocal cycle_video_writer, cycle_video_path, cycle_video_started, auto_report_written_cycle
         with state_lock:
             state.force_out_of_range = {"A": 0, "B": 0, "C": 0, "D": 0}
             state.button_did_not_retract = {"A": 0, "B": 0, "C": 0, "D": 0}
@@ -1423,6 +1538,7 @@ def main():
         cycle_video_writer = None
         cycle_video_path = None
         cycle_video_started = False
+        auto_report_written_cycle = -1
         _recover_camera_preview()
         with state_lock:
             state.golden_ready = False
@@ -1562,37 +1678,44 @@ def main():
         finally:
             pdf.close()
 
+    def _auto_report_path():
+        run_id = state.test_name.strip() or "test_report"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.join(reports_dir, f"report_{run_id}_{ts}.pdf")
+
+    def _open_file(path):
+        if sys.platform.startswith("win"):
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+
+    def _latest_report_path():
+        files = [os.path.join(reports_dir, f) for f in os.listdir(reports_dir) if f.lower().endswith(".pdf")]
+        if not files:
+            return None
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return files[0]
+
     def on_download_report(_evt):
+        nonlocal last_saved_report_path
         apply_textbox_values()
-        with state_lock:
-            default_name = "test_report.pdf"
-
-        root = tk.Tk()
-        root.withdraw()
         try:
-            path = filedialog.asksaveasfilename(
-                title="Save test report",
-                defaultextension=".pdf",
-                initialfile=default_name,
-                initialdir=os.path.expanduser("~"),
-                filetypes=[("PDF files", "*.pdf")],
-            )
-        finally:
-            root.destroy()
-
-        if path:
-            try:
-                with state_lock:
-                    state.test_name = os.path.splitext(os.path.basename(path))[0] or "test_report"
+            path = last_saved_report_path if (last_saved_report_path and os.path.exists(last_saved_report_path)) else _latest_report_path()
+            if path is None:
+                path = _auto_report_path()
                 build_report_pdf(path)
-                set_alert("green", f"Report saved: {path}")
-                print(f"[Report] Saved: {path}")
-            except PermissionError as exc:
-                set_alert("red", f"Report save failed: {exc}")
-                print(f"[Report] Permission error: {exc}")
-            except Exception as exc:
-                set_alert("red", f"Report save failed: {exc}")
-                print(f"[Report] Save failed: {exc}")
+                last_saved_report_path = path
+            _open_file(path)
+            set_alert("green", f"Report opened: {path}")
+            print(f"[Report] Opened: {path}")
+        except PermissionError as exc:
+            set_alert("red", f"Report open failed: {exc}")
+            print(f"[Report] Permission error: {exc}")
+        except Exception as exc:
+            set_alert("red", f"Report open failed: {exc}")
+            print(f"[Report] Open failed: {exc}")
 
     def on_exit(_evt):
         with state_lock:
@@ -1609,7 +1732,6 @@ def main():
     btn_re_tare.on_clicked(on_re_tare)
     btn_tare_on_start.on_clicked(on_toggle_tare_on_start)
     btn_auto_cap.on_clicked(on_toggle_auto_cap)
-    btn_first_gold.on_clicked(on_toggle_first_gold)
     btn_fail_policy.on_clicked(on_toggle_fail_policy)
     btn_ic_home.on_clicked(on_ic_home)
     btn_return_test.on_clicked(on_return_to_test)
@@ -1623,7 +1745,6 @@ def main():
 
     update_tare_toggle_button()
     update_auto_cap_button()
-    update_first_gold_button()
     update_fail_policy_button()
 
     # TextBox callbacks (kept, but now also locked)
@@ -1772,6 +1893,7 @@ def main():
                 running = state.running
 
             auto_capture_cycle = None
+            report_cycle_to_write = None
             if running and is_idle(robot):
                 with state_lock:
                     if state.cycle_count >= state.target_cycles:
@@ -1780,6 +1902,9 @@ def main():
                         state.stopped = True
                         state.traj_index = 0
                         state.aligned_to_A = False
+                        if auto_report_written_cycle != state.cycle_count:
+                            report_cycle_to_write = state.cycle_count
+                            auto_report_written_cycle = state.cycle_count
                         print("[Robot] Target cycles reached. Stopping.")
                     else:
                         if not state.aligned_to_A:
@@ -1928,6 +2053,17 @@ def main():
                     else:
                         set_alert("orange", f"Auto capture failed at cycle {auto_capture_cycle}; safe-stop by policy")
 
+            if report_cycle_to_write is not None:
+                try:
+                    path = _auto_report_path()
+                    build_report_pdf(path)
+                    last_saved_report_path = path
+                    set_alert("green", f"Auto report saved: {os.path.basename(path)}")
+                    print(f"[Report] Auto-saved: {path}")
+                except Exception as exc:
+                    set_alert("red", f"Auto report failed: {exc}")
+                    print(f"[Report] Auto-save failed: {exc}")
+
             # UI text / alerts
             with state_lock:
                 mode = "RUNNING" if state.running else ("PAUSED" if state.paused else "STOPPED")
@@ -1971,10 +2107,9 @@ def main():
                     f"State: {mode} | {manual_state} | {tare_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
                 )
                 roi_txt = f"ROI:LOCKED {locked_roi}" if (roi_locked and locked_roi is not None) else "ROI:UNSET"
-                first_gold_txt = "ON" if state.first_capture_is_golden else "OFF"
                 auto_status_1.set_text(f"Camera: {camera_txt} / {cam_lock_txt}")
                 auto_status_2.set_text(f"AutoCap: {sched_txt} every={state.capture_every_x_cycles} next={next_cap} retries={state.auto_capture_retries}")
-                auto_status_3.set_text(f"Golden ready: {gold_txt} | 1stGold: {first_gold_txt}")
+                auto_status_3.set_text(f"Golden ready: {gold_txt}")
                 auto_status_4.set_text(f"{roi_txt} | FailPolicy: {fail_pol}")
                 auto_status_5.set_text(f"Inspection/Capture: {state.last_capture_result}")
                 param_line.set_text("")
