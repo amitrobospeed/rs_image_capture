@@ -415,42 +415,70 @@ def main():
             set_alert("red", "Camera tune failed: sensor not ready")
             return False
 
-        frame = get_latest_camera_frame()
+        frame, frames_used = capture_average_frame(min_frames=6, timeout_s=1.5)
         if frame is None:
-            set_alert("red", "Camera tune failed: no camera frame")
+            set_alert("red", f"Camera tune failed: averaged frame unavailable ({frames_used}/6)")
             return False
 
         exp = int(camera_exposure)
         gain = int(camera_gain)
 
+        # Stage 1: exposure-first alignment
         for _ in range(TUNE_MAX_ITERS):
             mean_l, sat = compute_luma_stats(frame)
 
             if sat > MAX_SAT_PCT:
                 exp = int(exp * 0.85)
-                gain = int(gain * 0.9)
+            elif mean_l > TARGET_LUMA_MEAN + 5:
+                exp = int(exp * 0.9)
+            elif mean_l < TARGET_LUMA_MEAN - 5:
+                exp = int(exp * 1.05)
             else:
-                if mean_l > TARGET_LUMA_MEAN + 5:
-                    exp = int(exp * 0.9)
-                elif mean_l < TARGET_LUMA_MEAN - 5:
-                    exp = int(exp * 1.05)
-                else:
-                    break
+                break
 
             exp = int(np.clip(exp, EXPOSURE_MIN, EXPOSURE_MAX))
-            gain = int(np.clip(gain, GAIN_MIN, GAIN_MAX))
 
             try:
                 sensor.set_option(rs.option.exposure, exp)
                 sensor.set_option(rs.option.gain, gain)
             except Exception:
-                set_alert("red", "Camera tune failed: cannot apply settings")
+                set_alert("red", "Camera tune failed: cannot apply exposure")
                 return False
 
-            time.sleep(0.15)
-            newer = get_latest_camera_frame()
-            if newer is not None:
-                frame = newer
+            time.sleep(0.12)
+            frame, _ = capture_average_frame(min_frames=6, timeout_s=1.2)
+            if frame is None:
+                frame = get_latest_camera_frame()
+                if frame is None:
+                    break
+
+        # Stage 2: gain-only fine tune
+        for _ in range(max(2, TUNE_MAX_ITERS // 2)):
+            mean_l, sat = compute_luma_stats(frame)
+
+            if sat > MAX_SAT_PCT:
+                gain = int(gain * 0.9)
+            elif mean_l > TARGET_LUMA_MEAN + 3:
+                gain = int(gain * 0.9)
+            elif mean_l < TARGET_LUMA_MEAN - 3:
+                gain = int(gain * 1.1)
+            else:
+                break
+
+            gain = int(np.clip(gain, GAIN_MIN, GAIN_MAX))
+
+            try:
+                sensor.set_option(rs.option.gain, gain)
+            except Exception:
+                set_alert("red", "Camera tune failed: cannot apply gain")
+                return False
+
+            time.sleep(0.10)
+            frame, _ = capture_average_frame(min_frames=6, timeout_s=1.0)
+            if frame is None:
+                frame = get_latest_camera_frame()
+                if frame is None:
+                    break
 
         camera_exposure = exp
         camera_gain = gain
@@ -640,10 +668,10 @@ def main():
         cv2.imwrite(diff_path, diff)
 
         disp = cyc.copy()
-        label = f"Cycle:{cycle_num} Verdict:{verdict} Mean pixel diff:{score:.2f}"
-        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
-        tx = max(20, disp.shape[1] - tw - 20)
-        ty = max(th + 20, disp.shape[0] - 20)
+        label = f"Verdict:{verdict} Mean pixel diff:{score:.2f}"
+        (_, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+        tx = 20
+        ty = max(th + 72, 72)
         cv2.putText(disp, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                     (0, 255, 0) if verdict == "PASS" else (0, 0, 255), 2)
 
@@ -767,7 +795,7 @@ def main():
             "message": msg,
             "reason_code": reason_code,
             "file_path": out_path,
-            "score": score,
+            "score": f"{score:.2f}" if score not in ("", None) else "",
             "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
             "verdict": verdict,
             "golden_path": golden_path or "",
@@ -1762,9 +1790,13 @@ def main():
                 anomaly_fig.text(0.06, y, head, fontsize=11, weight="bold")
                 y -= 0.03
                 for rec in inspection_records[-28:]:
+                    try:
+                        score_txt = f"{float(rec.get('score', '')):.2f}"
+                    except Exception:
+                        score_txt = str(rec.get('score', ''))
                     line_txt = (
                         f"{rec.get('cycle','')} | {rec.get('capture_type','')} | {rec.get('verdict','')} | "
-                        f"{rec.get('score','')} | {rec.get('reason_code', rec.get('message',''))} | {rec.get('timestamp','')}"
+                        f"{score_txt} | {rec.get('reason_code', rec.get('message',''))} | {rec.get('timestamp','')}"
                     )
                     anomaly_fig.text(0.06, y, line_txt, fontsize=9)
                     y -= 0.026
@@ -1784,7 +1816,11 @@ def main():
                         cyc = rec.get("cycle", "")
                         anomaly_fig.text(0.06, y, f"Cycle {cyc}: {logic}", fontsize=8.8)
                         y -= 0.021
-                        anomaly_fig.text(0.08, y, f"Mean pixel diff (info): {rec.get('score','')}  ", fontsize=8.6, color="#334155")
+                        try:
+                            fail_score_txt = f"{float(rec.get('score', '')):.2f}"
+                        except Exception:
+                            fail_score_txt = str(rec.get('score', ''))
+                        anomaly_fig.text(0.08, y, f"Mean pixel diff (info): {fail_score_txt}  ", fontsize=8.6, color="#334155")
                         y -= 0.020
                         anomaly_fig.text(0.08, y, f"Triggered metric: contour gate (area={area_val}, bbox={bbox_val})", fontsize=8.6, color="red")
                         y -= 0.024
