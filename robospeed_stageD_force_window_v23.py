@@ -656,7 +656,7 @@ def main():
     (line,) = ax.plot([], [], linewidth=2.5, color="#0ea5e9")
 
     # Camera pane (same window as force graph)
-    ax_cam = fig.add_axes([0.65, 0.25, 0.32, 0.65])
+    ax_cam = fig.add_axes([0.65, 0.40, 0.32, 0.50])
     ax_cam.set_title("IC Camera", fontsize=20, color=COLOR_TEXT)
     ax_cam.set_xticks([])
     ax_cam.set_yticks([])
@@ -731,12 +731,12 @@ def main():
     manual_btn_h = 0.033
     manual_btn_gap = 0.004
 
-    # Two-row manual/camera controls, 4 mm above camera pane
-    camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.25, 0.32, 0.65
-    # Align Row 1 top edge with force graph top edge
+    # Two-row manual/camera controls above camera pane
+    camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.40, 0.32, 0.50
+    # Keep control rows above force/camera top edge
     force_ax_top = 0.25 + 0.65
-    row1_y = force_ax_top - manual_btn_h
-    row2_y = row1_y - (manual_btn_h + manual_btn_gap)
+    row2_y = force_ax_top + 0.004
+    row1_y = row2_y + manual_btn_h + manual_btn_gap
     manual_btn_w = (camera_ax_w - (4 * manual_btn_gap)) / 5
 
     fig.text(camera_ax_x, row1_y + manual_btn_h + 0.006, "Manual IC / Camera", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
@@ -754,28 +754,41 @@ def main():
     btn_re_tare = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Re-tare", color="#475569", hovercolor="#334155")
     btn_tare_on_start = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Tare@Start: ON", color="#0f766e", hovercolor="#115e59")
     btn_auto_cap = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "AutoCap: OFF", color="#1d4ed8", hovercolor="#1e40af")
+    btn_first_gold = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "1stGold: ON", color="#065f46", hovercolor="#064e3b")
 
-    # Auto-capture settings/status panel below IC camera window
-    auto_panel_y = camera_ax_y - 0.09
-    auto_tb_w = 0.12
-    auto_tb_h = 0.04
-    auto_gap = 0.02
-    fig.text(camera_ax_x, auto_panel_y + auto_tb_h + 0.01, "Auto Capture Settings", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
-    tb_cap_every = TextBox(fig.add_axes([camera_ax_x, auto_panel_y, auto_tb_w, auto_tb_h]), "CapEvery", initial=str(state.capture_every_x_cycles))
-    tb_first_gold = TextBox(fig.add_axes([camera_ax_x + auto_tb_w + auto_gap, auto_panel_y, auto_tb_w, auto_tb_h]), "1stGold(0/1)", initial="1")
-    auto_status_1 = fig.text(camera_ax_x, auto_panel_y - 0.03, "", fontsize=10, color="#e2e8f0")
-    auto_status_2 = fig.text(camera_ax_x, auto_panel_y - 0.055, "", fontsize=10, color="#e2e8f0")
+    # Auto-capture settings/status panel; expanded vertically with bottom edge aligned to force-graph bottom
+    auto_panel_bottom = 0.25
+    auto_panel_top = camera_ax_y - 0.01
+    auto_panel_h = auto_panel_top - auto_panel_bottom
+    fig.patches.append(Rectangle((camera_ax_x, auto_panel_bottom), camera_ax_w, auto_panel_h,
+                                 transform=fig.transFigure, facecolor="#0b1220", edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-0.5))
+    auto_row_h = 0.016
+    auto_tb_w = tb_w  # same width as Baseline box
+    auto_tb_h = 0.03
+    title_y = auto_panel_top - 0.008
+    cap_label_y = title_y - (2 * auto_row_h)  # title moved two rows up from cap-every row
+    cap_box_y = cap_label_y - auto_tb_h - 0.003
+    fig.text(camera_ax_x, title_y, "Auto Capture Settings / Camera Status", color="#e2e8f0", fontsize=10, weight="bold", zorder=5)
+    fig.text(camera_ax_x, cap_label_y, "Cap every", color="#e2e8f0", fontsize=10, zorder=5)
+    tb_cap_every = TextBox(fig.add_axes([camera_ax_x, cap_box_y, auto_tb_w, auto_tb_h]), "", initial=str(state.capture_every_x_cycles))
 
-    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap,
+    msg_row_1 = cap_box_y - 0.012
+    auto_status_1 = fig.text(camera_ax_x, msg_row_1 - (0 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
+    auto_status_2 = fig.text(camera_ax_x, msg_row_1 - (1 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
+    auto_status_3 = fig.text(camera_ax_x, msg_row_1 - (2 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
+    auto_status_4 = fig.text(camera_ax_x, msg_row_1 - (3 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
+    auto_status_5 = fig.text(camera_ax_x, msg_row_1 - (4 * auto_row_h), "", fontsize=8.8, color="#e2e8f0")
+
+    for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap, btn_first_gold,
                  btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_tare_on_start, btn_auto_cap] else 12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_tare_on_start, btn_auto_cap, btn_first_gold] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
         _tb.label.set_horizontalalignment("left")
         _tb.label.set_position((-1.27, 0.5))
-    for _tb in [tb_fmin, tb_fmax, tb_cap_every, tb_first_gold]:
+    for _tb in [tb_fmin, tb_fmax, tb_cap_every]:
         _tb.label.set_color("white")
     tb_fmin.label.set_horizontalalignment("left")
     force_label_x = -1.27 * (tb_w / force_box_w)
@@ -810,6 +823,16 @@ def main():
         else:
             btn_auto_cap.label.set_text("AutoCap: OFF")
             btn_auto_cap.ax.set_facecolor("#1d4ed8")
+
+    def update_first_gold_button():
+        with state_lock:
+            enabled = state.first_capture_is_golden
+        if enabled:
+            btn_first_gold.label.set_text("1stGold: ON")
+            btn_first_gold.ax.set_facecolor("#065f46")
+        else:
+            btn_first_gold.label.set_text("1stGold: OFF")
+            btn_first_gold.ax.set_facecolor("#7f1d1d")
 
     def go_a_above():
         print("[Robot] Going to A-above for tare")
@@ -904,7 +927,6 @@ def main():
             fmin = _parse_float(tb_fmin.text, state.force_min)
             fmax = _parse_float(tb_fmax.text, state.force_max)
             cap_every = _parse_int(tb_cap_every.text, state.capture_every_x_cycles)
-            first_gold = _parse_int(tb_first_gold.text, 1 if state.first_capture_is_golden else 0)
 
             state.vel = clamp(v, VEL_MIN, VEL_MAX)
             state.acc = clamp(a, ACC_MIN, ACC_MAX)
@@ -927,7 +949,6 @@ def main():
 
             state.capture_every_x_cycles = max(0, cap_every)
             state.auto_capture_enabled = state.capture_every_x_cycles > 0
-            state.first_capture_is_golden = bool(first_gold)
             state.next_auto_capture_cycle = state.capture_every_x_cycles if state.auto_capture_enabled else 0
 
 
@@ -1052,6 +1073,13 @@ def main():
                 msg = "Auto capture enabled" if state.auto_capture_enabled else "Auto capture disabled"
         update_auto_cap_button()
         set_alert("#1d4ed8", msg)
+
+    def on_toggle_first_gold(_evt):
+        with state_lock:
+            state.first_capture_is_golden = not state.first_capture_is_golden
+            enabled = state.first_capture_is_golden
+        update_first_gold_button()
+        set_alert("#065f46" if enabled else "#7f1d1d", f"1st capture as Golden {'enabled' if enabled else 'disabled'}")
 
     def on_ic_home(_evt):
         with state_lock:
@@ -1410,6 +1438,7 @@ def main():
     btn_re_tare.on_clicked(on_re_tare)
     btn_tare_on_start.on_clicked(on_toggle_tare_on_start)
     btn_auto_cap.on_clicked(on_toggle_auto_cap)
+    btn_first_gold.on_clicked(on_toggle_first_gold)
     btn_ic_home.on_clicked(on_ic_home)
     btn_return_test.on_clicked(on_return_to_test)
     btn_camera_tune.on_clicked(on_camera_tune)
@@ -1422,6 +1451,7 @@ def main():
 
     update_tare_toggle_button()
     update_auto_cap_button()
+    update_first_gold_button()
 
     # TextBox callbacks (kept, but now also locked)
     def on_vel_submit(text):
@@ -1501,14 +1531,6 @@ def main():
         except Exception:
             pass
 
-    def on_first_gold_submit(text):
-        try:
-            v = int(float(text))
-            with state_lock:
-                state.first_capture_is_golden = bool(v)
-        except Exception:
-            pass
-
     tb_vel.on_submit(on_vel_submit)
     tb_acc.on_submit(on_acc_submit)
     tb_jerk.on_submit(on_jerk_submit)
@@ -1517,7 +1539,6 @@ def main():
     tb_fmin.on_submit(on_fmin_submit)
     tb_fmax.on_submit(on_fmax_submit)
     tb_cap_every.on_submit(on_cap_every_submit)
-    tb_first_gold.on_submit(on_first_gold_submit)
 
     # ---- Force buffers ----
     times = deque()
@@ -1754,17 +1775,21 @@ def main():
                 gold_txt = "READY" if state.golden_ready else "NO"
                 next_cap = state.next_auto_capture_cycle if state.auto_capture_enabled else "-"
                 status_line.set_text(
-                    f"State: {mode} | {manual_state} | {tare_txt} | Camera: {camera_txt}/{cam_lock_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | AutoCap:{sched_txt}@{next_cap} | Golden:{gold_txt} | {baseline_txt} | {alert_msg}"
+                    f"State: {mode} | {manual_state} | {tare_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
                 )
                 roi_txt = f"ROI:LOCKED {locked_roi}" if (roi_locked and locked_roi is not None) else "ROI:UNSET"
-                auto_status_1.set_text(f"AutoCap {sched_txt} every={state.capture_every_x_cycles} next={next_cap} | Golden:{gold_txt}")
-                auto_status_2.set_text(f"{roi_txt} | Last capture: {state.last_capture_result}")
+                first_gold_txt = "ON" if state.first_capture_is_golden else "OFF"
+                auto_status_1.set_text(f"Camera: {camera_txt} / {cam_lock_txt}")
+                auto_status_2.set_text(f"AutoCap: {sched_txt} every={state.capture_every_x_cycles} next={next_cap}")
+                auto_status_3.set_text(f"Golden ready: {gold_txt} | 1stGold: {first_gold_txt}")
+                auto_status_4.set_text(f"{roi_txt}")
+                auto_status_5.set_text(f"Inspection/Capture: {state.last_capture_result}")
                 param_line.set_text("")
                 fail_line_1.set_text(
                     f"Force out of range  A:{state.force_out_of_range['A']}  B:{state.force_out_of_range['B']}  C:{state.force_out_of_range['C']}  D:{state.force_out_of_range['D']} | "
                     f"Button did not retract  A:{state.button_did_not_retract['A']}  B:{state.button_did_not_retract['B']}  C:{state.button_did_not_retract['C']}  D:{state.button_did_not_retract['D']}"
                 )
-                fail_line_2.set_text(f"Last capture: {state.last_capture_result}")
+                fail_line_2.set_text("")
 
                 force_band.remove()
                 force_band = ax.axhspan(state.force_min, state.force_max, alpha=0.18, color="#93c5fd")
