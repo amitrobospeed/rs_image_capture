@@ -464,7 +464,8 @@ def main():
         fields = [
             "run_id", "cycle", "capture_type", "timestamp", "camera_status", "result",
             "message", "reason_code", "file_path", "score", "threshold", "verdict",
-            "golden_path", "video_path", "anomaly_path", "policy"
+            "golden_path", "video_path", "anomaly_path", "policy",
+            "decision_logic", "failed_metric", "max_contour_area", "max_bbox", "score_role"
         ]
         with open(manifest_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
@@ -598,6 +599,7 @@ def main():
         defect_found = False
         defect_rect = None
         max_area = 0.0
+        max_bbox = (0, 0)
         for contour in contours:
             area = float(cv2.contourArea(contour))
             if area <= INSPECTION_MIN_DEFECT_AREA:
@@ -607,10 +609,23 @@ def main():
                 continue
             if area > max_area:
                 max_area = area
+                max_bbox = (rw, rh)
                 defect_found = True
                 defect_rect = (rx, ry, rw, rh)
 
         verdict = "FAIL" if defect_found else "PASS"
+        decision_logic = (
+            f"FAIL if contour passes: diff>{INSPECTION_DIFF_THRESHOLD}, "
+            f"area>{INSPECTION_MIN_DEFECT_AREA}, bbox>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}"
+        )
+        failed_metric = "contour_gate_triggered" if verdict == "FAIL" else "none"
+        decision_trace = {
+            "decision_logic": decision_logic,
+            "failed_metric": failed_metric,
+            "max_contour_area": f"{max_area:.2f}",
+            "max_bbox": f"{max_bbox[0]}x{max_bbox[1]}",
+            "score_role": "informational_mean_pixel_diff",
+        }
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         mask_path = os.path.join(masks_dir, f"inspection_mask_{cycle_num}_{ts}.png")
@@ -619,7 +634,7 @@ def main():
         cv2.imwrite(diff_path, diff)
 
         disp = cyc.copy()
-        label = f"Cycle:{cycle_num} Verdict:{verdict} Score:{score:.2f}"
+        label = f"Cycle:{cycle_num} Verdict:{verdict} Mean pixel diff:{score:.2f}"
         (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
         tx = max(20, disp.shape[1] - tw - 20)
         ty = max(th + 20, disp.shape[0] - 20)
@@ -641,7 +656,7 @@ def main():
         if not ok_a:
             anomaly_path = ""
 
-        return verdict, score, mask_path, anomaly_path, disp
+        return verdict, score, mask_path, anomaly_path, disp, decision_trace
 
     def _auto_capture_cycle(cycle_num):
         nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path
@@ -713,6 +728,7 @@ def main():
         verdict = "WARN"
         score = ""
         anomaly_path = ""
+        decision_trace = {"decision_logic": "", "failed_metric": "", "max_contour_area": "", "max_bbox": "", "score_role": ""}
         msg = "captured"
 
         if capture_type == "golden":
@@ -725,7 +741,7 @@ def main():
             _ensure_cycle_video(golden_frame, run_id)
             reason_code = "golden_initialized"
         elif golden_frame is not None:
-            verdict, score, _mask_path, anomaly_path, disp = run_basic_inspection(golden_frame, frame, run_id, cycle_num)
+            verdict, score, _mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, frame, run_id, cycle_num)
             _ensure_cycle_video(golden_frame, run_id)
             _append_cycle_video_frame(disp, cycle_num)
             msg = "inspection_done"
@@ -752,6 +768,11 @@ def main():
             "video_path": cycle_video_path or "",
             "anomaly_path": anomaly_path,
             "policy": fail_policy,
+            "decision_logic": decision_trace.get("decision_logic", ""),
+            "failed_metric": decision_trace.get("failed_metric", ""),
+            "max_contour_area": decision_trace.get("max_contour_area", ""),
+            "max_bbox": decision_trace.get("max_bbox", ""),
+            "score_role": decision_trace.get("score_role", ""),
         }
         _manifest_write(rec)
         inspection_records.append(dict(rec, anomaly_path=anomaly_path))
@@ -1534,16 +1555,16 @@ def main():
             print("[GUI] Run Inspection blocked: ROI missing")
             return
 
-        verdict, score, mask_path, anomaly_path, disp = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num)
+        verdict, score, mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num)
         _ensure_cycle_video(golden_frame, run_id)
         _append_cycle_video_frame(disp, cyc_num)
-        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.3f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy})
-        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.3f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy})
+        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.3f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", "")})
+        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.3f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", "")})
         _record_anomaly_stats(cyc_num, verdict, score)
         with state_lock:
             state.last_capture_result = f"manual/{verdict}"
-        set_alert("green" if verdict == "PASS" else "orange", f"Inspection {verdict} score={score:.2f}")
-        print(f"[GUI] Run Inspection -> {verdict} score={score:.2f} mask={mask_path} anomaly={anomaly_path}")
+        set_alert("green" if verdict == "PASS" else "orange", f"Inspection {verdict} mean pixel diff={score:.2f}")
+        print(f"[GUI] Run Inspection -> {verdict} mean_pixel_diff={score:.2f} mask={mask_path} anomaly={anomaly_path}")
 
     def on_return_to_test(_evt):
         with state_lock:
@@ -1726,12 +1747,12 @@ def main():
             worst_score_txt = f"{anomaly_stats['worst_score']:.3f}" if anomaly_stats["worst_score"] >= 0 else "n/a"
             stats_txt = (
                 f"Scored: {anomaly_stats['total_scored']}   PASS: {anomaly_stats['pass_count']}   FAIL: {anomaly_stats['fail_count']}   WARN: {anomaly_stats['warn_count']}\n"
-                f"First FAIL cycle: {anomaly_stats['first_fail_cycle'] or 'n/a'}   Worst score: {worst_score_txt} (cycle {anomaly_stats['worst_cycle'] or 'n/a'})"
+                f"First FAIL cycle: {anomaly_stats['first_fail_cycle'] or 'n/a'}   Worst mean pixel diff: {worst_score_txt} (cycle {anomaly_stats['worst_cycle'] or 'n/a'})"
             )
             anomaly_fig.text(0.06, y, stats_txt, fontsize=9)
             y -= 0.06
             if inspection_records:
-                head = "Cycle | Type | Verdict | Score | Reason | Timestamp"
+                head = "Cycle | Type | Verdict | Mean pixel diff (info) | Reason | Timestamp"
                 anomaly_fig.text(0.06, y, head, fontsize=11, weight="bold")
                 y -= 0.03
                 for rec in inspection_records[-28:]:
@@ -1743,6 +1764,26 @@ def main():
                     y -= 0.026
                     if y < 0.08:
                         break
+                fail_rows = [r for r in inspection_records if str(r.get("verdict", "")).upper() == "FAIL"]
+                if fail_rows:
+                    y = max(0.30, y - 0.01)
+                    anomaly_fig.text(0.06, y, "FAIL Explainability (per inspection decision)", fontsize=11, weight="bold")
+                    y -= 0.03
+                    anomaly_fig.text(0.06, y, "Legend: Red = metric that triggered FAIL", fontsize=9, color="red")
+                    y -= 0.025
+                    for rec in fail_rows[-8:]:
+                        logic = rec.get("decision_logic", "") or "Decision trace unavailable"
+                        area_val = rec.get("max_contour_area", "") or "n/a"
+                        bbox_val = rec.get("max_bbox", "") or "n/a"
+                        cyc = rec.get("cycle", "")
+                        anomaly_fig.text(0.06, y, f"Cycle {cyc}: {logic}", fontsize=8.8)
+                        y -= 0.021
+                        anomaly_fig.text(0.08, y, f"Mean pixel diff (info): {rec.get('score','')}  ", fontsize=8.6, color="#334155")
+                        y -= 0.020
+                        anomaly_fig.text(0.08, y, f"Triggered metric: contour gate (area={area_val}, bbox={bbox_val})", fontsize=8.6, color="red")
+                        y -= 0.024
+                        if y < 0.10:
+                            break
                 recent_anomaly = inspection_records[-1].get("anomaly_path", "") if inspection_records else ""
                 anomaly_fig.text(0.06, 0.07, f"Latest frame_anamoly: {recent_anomaly or 'not_created'}", fontsize=9)
                 anomaly_fig.text(0.06, 0.05, f"Cycle inspection video: {cycle_video_path or 'not_created'}", fontsize=9)
