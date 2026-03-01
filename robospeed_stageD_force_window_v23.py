@@ -548,27 +548,203 @@ def main():
         cv2.putText(out, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
         return out
 
-    def _select_roi_with_hint(window_name, frame):
-        preview = frame.copy()
-        hint = "Draw area to inspect and press enter to continue"
-        cv2.putText(preview, hint, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        return cv2.selectROI(window_name, preview, False, False)
+    def _roi_bounds(roi_like, shape):
+        if isinstance(roi_like, dict):
+            rshape = roi_like.get("shape", "rect")
+            if rshape == "circle":
+                cx, cy, r = int(roi_like.get("cx", 0)), int(roi_like.get("cy", 0)), int(roi_like.get("r", 0))
+                return (cx - r, cy - r, 2 * r, 2 * r)
+            if rshape == "poly":
+                pts = np.array(roi_like.get("points", []), dtype=np.int32)
+                if len(pts) < 3:
+                    return (0, 0, 1, 1)
+                x, y, w, h = cv2.boundingRect(pts)
+                return (x, y, w, h)
+            return (int(roi_like.get("x", 0)), int(roi_like.get("y", 0)), int(roi_like.get("w", 0)), int(roi_like.get("h", 0)))
+        return tuple(map(int, roi_like))
 
-    def _sanitize_roi(roi, shape):
-        x, y, w, h = map(int, roi)
+    def _sanitize_roi(roi_like, shape):
+        x, y, w, h = _roi_bounds(roi_like, shape)
         h_img, w_img = shape[:2]
         x = max(0, min(x, w_img - 1))
         y = max(0, min(y, h_img - 1))
         w = max(1, min(w, w_img - x))
         h = max(1, min(h, h_img - y))
+        if isinstance(roi_like, dict):
+            rshape = roi_like.get("shape", "rect")
+            if rshape == "circle":
+                cx = int(np.clip(int(roi_like.get("cx", x + w // 2)), x, x + w - 1))
+                cy = int(np.clip(int(roi_like.get("cy", y + h // 2)), y, y + h - 1))
+                r_max = max(1, min(cx - x, x + w - 1 - cx, cy - y, y + h - 1 - cy))
+                r = int(max(1, min(int(roi_like.get("r", 1)), r_max)))
+                return {"shape": "circle", "cx": cx, "cy": cy, "r": r}
+            if rshape == "poly":
+                pts = []
+                for px, py in roi_like.get("points", []):
+                    pts.append((int(np.clip(int(px), 0, w_img - 1)), int(np.clip(int(py), 0, h_img - 1))))
+                if len(pts) < 3:
+                    pts = [(x, y), (x + w - 1, y), (x + w - 1, y + h - 1), (x, y + h - 1)]
+                return {"shape": "poly", "points": pts}
+            return {"shape": "rect", "x": x, "y": y, "w": w, "h": h}
         return (x, y, w, h)
 
+    def _draw_roi(frame, roi_like, color=(255, 0, 0), label=None):
+        out = frame
+        roi = _sanitize_roi(roi_like, frame.shape)
+        if isinstance(roi, dict):
+            if roi.get("shape") == "circle":
+                cv2.circle(out, (roi["cx"], roi["cy"]), roi["r"], color, 2)
+                lx, ly = roi["cx"] - roi["r"], roi["cy"] - roi["r"]
+            elif roi.get("shape") == "poly":
+                pts = np.array(roi.get("points", []), dtype=np.int32)
+                cv2.polylines(out, [pts], True, color, 2)
+                lx, ly = int(pts[:, 0].min()), int(pts[:, 1].min())
+            else:
+                x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
+                cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
+                lx, ly = x, y
+        else:
+            x, y, w, h = roi
+            cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
+            lx, ly = x, y
+        if label:
+            cv2.putText(out, label, (lx + 2, max(14, ly - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        return out
+
+    def _roi_mask_from_spec(shape, roi_like):
+        roi = _sanitize_roi(roi_like, shape)
+        mask = np.zeros(shape[:2], dtype=np.uint8)
+        if isinstance(roi, dict):
+            if roi.get("shape") == "circle":
+                cv2.circle(mask, (roi["cx"], roi["cy"]), roi["r"], 255, -1)
+            elif roi.get("shape") == "poly":
+                pts = np.array(roi.get("points", []), dtype=np.int32)
+                cv2.fillPoly(mask, [pts], 255)
+            else:
+                x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
+                mask[y:y + h, x:x + w] = 255
+        else:
+            x, y, w, h = roi
+            mask[y:y + h, x:x + w] = 255
+        return mask, _roi_bounds(roi, shape)
+
+    def _select_roi_with_shape(window_name, frame):
+        shape_mode = "rect"
+        start_pt = None
+        drag_pt = None
+        poly_pts = []
+        finalized = None
+        actions = {}
+
+        def _draw_buttons(canvas):
+            nonlocal actions
+            actions = {}
+            items = [("rect", "Rectangle"), ("circle", "Circle"), ("poly", "Polygon"), ("lock", "Lock ROI")]
+            x0 = 20
+            for key, title in items:
+                w, h = 150, 34
+                x1, y1 = x0 + w, 50 + h
+                fill = (46, 204, 113) if (key == shape_mode and key != "lock") else ((192, 57, 43) if key == "lock" else (44, 62, 80))
+                cv2.rectangle(canvas, (x0, 50), (x1, y1), fill, -1)
+                cv2.rectangle(canvas, (x0, 50), (x1, y1), (236, 240, 241), 1)
+                cv2.putText(canvas, title, (x0 + 8, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+                actions[key] = (x0, 50, x1, y1)
+                x0 += w + 10
+
+        def _hit_button(x, y):
+            for key, (x0, y0, x1, y1) in actions.items():
+                if x0 <= x <= x1 and y0 <= y <= y1:
+                    return key
+            return None
+
+        def _mouse_cb(evt, x, y, _flags, _param):
+            nonlocal shape_mode, start_pt, drag_pt, poly_pts, finalized
+            if evt == cv2.EVENT_LBUTTONDOWN:
+                k = _hit_button(x, y)
+                if k in ("rect", "circle", "poly"):
+                    shape_mode = k
+                    start_pt = None
+                    drag_pt = None
+                    if k != "poly":
+                        poly_pts = []
+                    return
+                if k == "lock":
+                    if shape_mode == "poly" and len(poly_pts) >= 3:
+                        finalized = {"shape": "poly", "points": poly_pts.copy()}
+                    return
+                if shape_mode == "poly":
+                    poly_pts.append((x, y))
+                    return
+                start_pt = (x, y)
+                drag_pt = (x, y)
+            elif evt == cv2.EVENT_MOUSEMOVE:
+                if shape_mode in ("rect", "circle") and start_pt is not None:
+                    drag_pt = (x, y)
+            elif evt == cv2.EVENT_LBUTTONUP:
+                if shape_mode in ("rect", "circle") and start_pt is not None and drag_pt is not None:
+                    sx, sy = start_pt
+                    ex, ey = drag_pt
+                    if shape_mode == "rect":
+                        finalized = {"shape": "rect", "x": min(sx, ex), "y": min(sy, ey), "w": abs(ex - sx), "h": abs(ey - sy)}
+                    else:
+                        r = int(np.hypot(ex - sx, ey - sy))
+                        finalized = {"shape": "circle", "cx": sx, "cy": sy, "r": r}
+                    start_pt = None
+
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(window_name, _mouse_cb)
+        while True:
+            canvas = frame.copy()
+            cv2.putText(canvas, "Draw area to inspect and press enter to continue", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+            cv2.putText(canvas, "Choose ROI shape: Rectangle / Circle / Polygon", (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1)
+            cv2.putText(canvas, "Polygon: click points, Enter or Lock ROI to finish", (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+            _draw_buttons(canvas)
+
+            if shape_mode == "poly" and poly_pts:
+                pts = np.array(poly_pts, dtype=np.int32)
+                cv2.polylines(canvas, [pts], False, (255, 0, 0), 2)
+                for p in poly_pts:
+                    cv2.circle(canvas, p, 3, (255, 0, 0), -1)
+                if finalized and finalized.get("shape") == "poly":
+                    _draw_roi(canvas, finalized, (255, 0, 0))
+            elif start_pt is not None and drag_pt is not None and shape_mode in ("rect", "circle"):
+                sx, sy = start_pt
+                ex, ey = drag_pt
+                preview = {"shape": "rect", "x": min(sx, ex), "y": min(sy, ey), "w": abs(ex - sx), "h": abs(ey - sy)} if shape_mode == "rect" else {"shape": "circle", "cx": sx, "cy": sy, "r": int(np.hypot(ex - sx, ey - sy))}
+                _draw_roi(canvas, preview, (255, 0, 0))
+            elif finalized is not None:
+                _draw_roi(canvas, finalized, (255, 0, 0))
+
+            cv2.imshow(window_name, canvas)
+            key = cv2.waitKey(20) & 0xFF
+            if key in (13, 10):
+                if finalized is not None:
+                    return _sanitize_roi(finalized, frame.shape)
+            elif key == 27:
+                return None
+            elif key in (8, 127):
+                if shape_mode == "poly" and poly_pts:
+                    poly_pts.pop()
+                    finalized = None
+
     def _roi_crop(frame, roi):
-        x, y, w, h = _sanitize_roi(roi, frame.shape)
+        x, y, w, h = _roi_bounds(_sanitize_roi(roi, frame.shape), frame.shape)
         return frame[y:y+h, x:x+w], (x, y, w, h)
 
     def _compute_button_color_stats(frame, roi, button_name):
-        crop, roi_norm = _roi_crop(frame, roi)
+        roi_norm = _sanitize_roi(roi, frame.shape)
+        mask_full, (x, y, w, h) = _roi_mask_from_spec(frame.shape, roi_norm)
+        crop = frame[y:y+h, x:x+w]
+        local_mask = mask_full[y:y+h, x:x+w]
+        if crop.size == 0 or local_mask.size == 0 or np.count_nonzero(local_mask) == 0:
+            return {
+                "roi": roi_norm,
+                "white_px": 0,
+                "color_px": 0,
+                "white_to_color": 0.0,
+                "luma_mean": 0.0,
+                "sat_pct": 0.0,
+            }
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         white_lo, white_hi = WHITE_HSV_RANGE
         white_mask = cv2.inRange(hsv, np.array(white_lo, dtype=np.uint8), np.array(white_hi, dtype=np.uint8))
@@ -577,10 +753,13 @@ def main():
         for lo, hi in BUTTON_COLOR_RULES.get(button_name, {}).get("hsv", []):
             color_mask = cv2.bitwise_or(color_mask, cv2.inRange(hsv, np.array(lo, dtype=np.uint8), np.array(hi, dtype=np.uint8)))
 
+        white_mask = cv2.bitwise_and(white_mask, local_mask)
+        color_mask = cv2.bitwise_and(color_mask, local_mask)
+
         white_px = int(np.count_nonzero(white_mask))
         color_px = int(np.count_nonzero(color_mask))
         ratio = float(white_px / max(color_px, 1))
-        luma_mean, sat_pct = compute_luma_stats(crop)
+        luma_mean, sat_pct = compute_luma_stats(cv2.bitwise_and(crop, crop, mask=local_mask))
         return {
             "roi": roi_norm,
             "white_px": white_px,
@@ -609,9 +788,9 @@ def main():
         baseline = {}
         for btn in BUTTON_ORDER:
             color_name = BUTTON_COLOR_RULES.get(btn, {}).get("name", "target")
-            roi = _select_roi_with_hint(f"ROI Selector {btn} ({color_name})", frame)
+            roi = _select_roi_with_shape(f"ROI Selector {btn} ({color_name})", frame)
             cv2.destroyWindow(f"ROI Selector {btn} ({color_name})")
-            if not roi or roi[2] <= 0 or roi[3] <= 0:
+            if not roi:
                 return False
             roi = _sanitize_roi(roi, frame.shape)
             selected[btn] = roi
@@ -621,10 +800,11 @@ def main():
         button_color_baselines = baseline
         button_roi_locked = True
 
-        xs = [r[0] for r in selected.values()]
-        ys = [r[1] for r in selected.values()]
-        x2 = [r[0] + r[2] for r in selected.values()]
-        y2 = [r[1] + r[3] for r in selected.values()]
+        bounds = [_roi_bounds(r, frame.shape) for r in selected.values()]
+        xs = [r[0] for r in bounds]
+        ys = [r[1] for r in bounds]
+        x2 = [r[0] + r[2] for r in bounds]
+        y2 = [r[1] + r[3] for r in bounds]
         locked_roi = (min(xs), min(ys), max(x2) - min(xs), max(y2) - min(ys))
         roi_locked = True
         return True
@@ -645,9 +825,7 @@ def main():
         intro_src = golden_img.copy()
         if button_roi_locked and button_rois:
             for _btn, _roi in button_rois.items():
-                x, y, w, h = _roi
-                cv2.rectangle(intro_src, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                cv2.putText(intro_src, _btn, (x + 2, max(14, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+                _draw_roi(intro_src, _roi, color=(255, 0, 0), label=_btn)
         elif roi_locked and locked_roi is not None:
             x, y, w, h = locked_roi
             cv2.rectangle(intro_src, (x, y), (x + w, y + h), (255, 0, 0), 2)
@@ -817,9 +995,7 @@ def main():
 
         if button_roi_locked and button_rois:
             for _btn, _roi in button_rois.items():
-                x, y, w, h = _roi
-                cv2.rectangle(disp, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                cv2.putText(disp, _btn, (x + 2, max(14, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+                _draw_roi(disp, _roi, color=(255, 0, 0), label=_btn)
         elif roi_locked and locked_roi is not None:
             x, y, w, h = locked_roi
             cv2.rectangle(disp, (x, y), (x + w, y + h), (255, 0, 0), 2)
@@ -1098,6 +1274,7 @@ def main():
     row3_y = row2_y - (manual_btn_h + manual_btn_gap)
     btn_detect_contour = Button(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "Contour: ON", color="#166534", hovercolor="#15803d")
     btn_detect_white = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "WhiteRatio: ON", color="#166534", hovercolor="#15803d")
+    btn_lock_roi = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "Lock ROI", color="#0f766e", hovercolor="#115e59")
 
     # Auto-capture settings/status panel
     px_x = 1.0 / (fig.get_figwidth() * fig.dpi)
@@ -1143,9 +1320,9 @@ def main():
                                  transform=fig.transFigure, facecolor="#0b1220", edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-0.5))
 
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap, btn_fail_policy,
-                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white]:
+                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_lock_roi]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
@@ -1581,6 +1758,22 @@ def main():
                 state.detect_contour_enabled = True
         update_detector_buttons()
         set_alert("#166534" if white_on else "#7f1d1d", f"White-ratio detector {'enabled' if white_on else 'disabled'}")
+
+    def on_lock_roi(_evt):
+        nonlocal golden_frame, button_rois, button_color_baselines, button_roi_locked
+        frame = capture_average_frame()
+        if frame is None:
+            set_alert("#7f1d1d", "Lock ROI failed: no camera frame")
+            return
+        if _select_button_rois_and_calibrate(frame):
+            golden_frame = frame.copy() if golden_frame is None else golden_frame
+            set_alert("#0f766e", f"Button ROIs locked: {list(button_rois.keys())}")
+            print(f"[GUI] Button ROIs locked -> {button_rois}")
+        else:
+            button_rois = {}
+            button_color_baselines = {}
+            button_roi_locked = False
+            set_alert("#d97706", "ROI selection canceled before lock")
 
     def on_ic_home(_evt):
         with state_lock:
@@ -2077,6 +2270,7 @@ def main():
     btn_fail_policy.on_clicked(on_toggle_fail_policy)
     btn_detect_contour.on_clicked(on_toggle_detect_contour)
     btn_detect_white.on_clicked(on_toggle_detect_white)
+    btn_lock_roi.on_clicked(on_lock_roi)
     btn_ic_home.on_clicked(on_ic_home)
     btn_return_test.on_clicked(on_return_to_test)
     btn_camera_tune.on_clicked(on_camera_tune)
