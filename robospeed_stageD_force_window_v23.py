@@ -234,7 +234,7 @@ class SystemState:
     last_capture_result: str = "none"
     auto_capture_retries: int = DEFAULT_AUTO_CAPTURE_RETRIES
     auto_fail_policy: str = "safe_stop"
-    detect_contour_enabled: bool = True
+    detect_contour_enabled: bool = False
     detect_white_ratio_enabled: bool = True
 
 
@@ -593,19 +593,19 @@ def main():
         roi = _sanitize_roi(roi_like, frame.shape)
         if isinstance(roi, dict):
             if roi.get("shape") == "circle":
-                cv2.circle(out, (roi["cx"], roi["cy"]), roi["r"], color, 2)
+                cv2.circle(out, (roi["cx"], roi["cy"]), roi["r"], color, 1)
                 lx, ly = roi["cx"] - roi["r"], roi["cy"] - roi["r"]
             elif roi.get("shape") == "poly":
                 pts = np.array(roi.get("points", []), dtype=np.int32)
-                cv2.polylines(out, [pts], True, color, 2)
+                cv2.polylines(out, [pts], True, color, 1)
                 lx, ly = int(pts[:, 0].min()), int(pts[:, 1].min())
             else:
                 x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
-                cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
+                cv2.rectangle(out, (x, y), (x + w, y + h), color, 1)
                 lx, ly = x, y
         else:
             x, y, w, h = roi
-            cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
+            cv2.rectangle(out, (x, y), (x + w, y + h), color, 1)
             lx, ly = x, y
         if label:
             cv2.putText(out, label, (lx + 2, max(14, ly - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
@@ -738,7 +738,7 @@ def main():
 
             if shape_mode == "poly" and poly_pts:
                 pts = np.array(poly_pts, dtype=np.int32)
-                cv2.polylines(canvas, [pts], False, (255, 0, 0), 2)
+                cv2.polylines(canvas, [pts], False, (255, 0, 0), 1)
                 for p in poly_pts:
                     cv2.circle(canvas, p, 3, (255, 0, 0), -1)
                 if finalized and finalized.get("shape") == "poly":
@@ -821,23 +821,180 @@ def main():
 
     def _select_button_rois_and_calibrate(frame):
         nonlocal button_rois, button_color_baselines, button_roi_locked, locked_roi, roi_locked
-        selected = {}
-        baseline = {}
-        for btn in BUTTON_ORDER:
-            color_name = BUTTON_COLOR_RULES.get(btn, {}).get("name", "target")
-            roi = _select_roi_with_shape(f"ROI Selector {btn} ({color_name})", frame)
-            cv2.destroyWindow(f"ROI Selector {btn} ({color_name})")
+        selected = dict(button_rois) if (button_roi_locked and button_rois) else {}
+        shape_mode = "rect"
+        start_pt = None
+        drag_pt = None
+        poly_pts = []
+        working_roi = None
+        actions = {}
+        current_idx = 0
+        status_msg = "Draw ROI then Next; Draw all four then Lock All"
+
+        def _is_valid_roi(roi):
             if not roi:
                 return False
-            roi = _sanitize_roi(roi, frame.shape)
-            selected[btn] = roi
-            baseline[btn] = _compute_button_color_stats(frame, roi, btn)
+            if isinstance(roi, dict):
+                rshape = roi.get("shape", "rect")
+                if rshape == "rect":
+                    return int(roi.get("w", 0)) >= 4 and int(roi.get("h", 0)) >= 4
+                if rshape == "circle":
+                    return int(roi.get("r", 0)) >= 3
+                if rshape == "poly":
+                    return len(roi.get("points", [])) >= 3
+            return False
 
-        button_rois = selected
-        button_color_baselines = baseline
+        def _target_btn():
+            return BUTTON_ORDER[current_idx]
+
+        def _draw_buttons(canvas):
+            nonlocal actions
+            actions = {}
+            items = [
+                ("rect", "Rectangle", 140),
+                ("circle", "Circle", 120),
+                ("poly", "Polygon", 130),
+                ("next", "Next Button", 150),
+                ("lock", "Lock All", 120),
+            ]
+            x0, y0 = 20, 50
+            for key, title, w in items:
+                h = 34
+                x1, y1 = x0 + w, y0 + h
+                active = key == shape_mode and key in ("rect", "circle", "poly")
+                fill = (46, 204, 113) if active else ((192, 57, 43) if key == "lock" else (44, 62, 80))
+                cv2.rectangle(canvas, (x0, y0), (x1, y1), fill, -1)
+                cv2.rectangle(canvas, (x0, y0), (x1, y1), (236, 240, 241), 1)
+                cv2.putText(canvas, title, (x0 + 8, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+                actions[key] = (x0, y0, x1, y1)
+                x0 += w + 8
+
+        def _hit_button(x, y):
+            for key, (x0, y0, x1, y1) in actions.items():
+                if x0 <= x <= x1 and y0 <= y <= y1:
+                    return key
+            return None
+
+        def _finalize_working_from_poly():
+            nonlocal working_roi, status_msg
+            if len(poly_pts) >= 3:
+                working_roi = {"shape": "poly", "points": poly_pts.copy()}
+                status_msg = f"{_target_btn()} polygon ready"
+                return True
+            status_msg = "Polygon needs >=3 points"
+            return False
+
+        def _commit_current_btn():
+            nonlocal status_msg, working_roi
+            btn = _target_btn()
+            if shape_mode == "poly":
+                _finalize_working_from_poly()
+            if not _is_valid_roi(working_roi):
+                status_msg = f"Draw valid ROI for button {btn}"
+                return False
+            selected[btn] = _sanitize_roi(working_roi, frame.shape)
+            status_msg = f"Saved ROI for button {btn}"
+            return True
+
+        def _try_lock_all():
+            nonlocal status_msg
+            if _is_valid_roi(working_roi):
+                _commit_current_btn()
+            missing = [b for b in BUTTON_ORDER if b not in selected]
+            if missing:
+                status_msg = f"Missing ROI: {','.join(missing)}"
+                return False
+            return True
+
+        def _mouse_cb(evt, x, y, _flags, _param):
+            nonlocal shape_mode, start_pt, drag_pt, poly_pts, working_roi, current_idx, status_msg
+            if evt == cv2.EVENT_LBUTTONDOWN:
+                k = _hit_button(x, y)
+                if k in ("rect", "circle", "poly"):
+                    shape_mode = k
+                    start_pt = None
+                    drag_pt = None
+                    working_roi = None
+                    if k != "poly":
+                        poly_pts = []
+                    status_msg = f"{k.title()} mode for button {_target_btn()}"
+                    return
+                if k == "next":
+                    if _commit_current_btn():
+                        current_idx = (current_idx + 1) % len(BUTTON_ORDER)
+                        start_pt = None
+                        drag_pt = None
+                        poly_pts = []
+                        working_roi = selected.get(_target_btn())
+                    return
+                if k == "lock":
+                    _try_lock_all()
+                    return
+                if shape_mode == "poly":
+                    poly_pts.append((x, y))
+                    working_roi = None
+                    status_msg = f"{_target_btn()} polygon points: {len(poly_pts)}"
+                    return
+                start_pt = (x, y)
+                drag_pt = (x, y)
+            elif evt == cv2.EVENT_MOUSEMOVE:
+                if shape_mode in ("rect", "circle") and start_pt is not None:
+                    drag_pt = (x, y)
+            elif evt == cv2.EVENT_LBUTTONUP:
+                if shape_mode in ("rect", "circle") and start_pt is not None and drag_pt is not None:
+                    sx, sy = start_pt
+                    ex, ey = drag_pt
+                    if shape_mode == "rect":
+                        working_roi = {"shape": "rect", "x": min(sx, ex), "y": min(sy, ey), "w": abs(ex - sx), "h": abs(ey - sy)}
+                    else:
+                        working_roi = {"shape": "circle", "cx": sx, "cy": sy, "r": int(np.hypot(ex - sx, ey - sy))}
+                    start_pt = None
+                    status_msg = f"ROI drawn for {_target_btn()}"
+
+        window_name = "ROI Selector All Buttons"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(window_name, _mouse_cb)
+        while True:
+            canvas = frame.copy()
+            cv2.putText(canvas, "Draw all button ROIs in one window, then Lock All", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+            cv2.putText(canvas, f"Current button: {_target_btn()}  |  Enter=Lock All  Esc=Cancel  Backspace=Undo poly point", (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1)
+            cv2.putText(canvas, status_msg, (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 255, 180), 1)
+            _draw_buttons(canvas)
+
+            for b in BUTTON_ORDER:
+                if b in selected:
+                    _draw_roi(canvas, selected[b], color=(255, 0, 0), label=b)
+
+            if shape_mode == "poly" and poly_pts:
+                pts = np.array(poly_pts, dtype=np.int32)
+                cv2.polylines(canvas, [pts], False, (0, 255, 255), 1)
+                for p in poly_pts:
+                    cv2.circle(canvas, p, 2, (0, 255, 255), -1)
+            elif start_pt is not None and drag_pt is not None and shape_mode in ("rect", "circle"):
+                sx, sy = start_pt
+                ex, ey = drag_pt
+                preview = {"shape": "rect", "x": min(sx, ex), "y": min(sy, ey), "w": abs(ex - sx), "h": abs(ey - sy)} if shape_mode == "rect" else {"shape": "circle", "cx": sx, "cy": sy, "r": int(np.hypot(ex - sx, ey - sy))}
+                _draw_roi(canvas, preview, color=(0, 255, 255), label=_target_btn())
+            elif working_roi is not None:
+                _draw_roi(canvas, working_roi, color=(0, 255, 255), label=_target_btn())
+
+            cv2.imshow(window_name, canvas)
+            key = cv2.waitKey(20) & 0xFF
+            if key in (13, 10):
+                if _try_lock_all():
+                    break
+            elif key == 27:
+                return False
+            elif key in (8, 127) and shape_mode == "poly" and poly_pts:
+                poly_pts.pop()
+                working_roi = None
+                status_msg = f"{_target_btn()} polygon points: {len(poly_pts)}"
+
+        button_rois = {b: _sanitize_roi(selected[b], frame.shape) for b in BUTTON_ORDER}
+        button_color_baselines = {b: _compute_button_color_stats(frame, button_rois[b], b) for b in BUTTON_ORDER}
         button_roi_locked = True
 
-        bounds = [_roi_bounds(r, frame.shape) for r in selected.values()]
+        bounds = [_roi_bounds(r, frame.shape) for r in button_rois.values()]
         xs = [r[0] for r in bounds]
         ys = [r[1] for r in bounds]
         x2 = [r[0] + r[2] for r in bounds]
@@ -967,6 +1124,8 @@ def main():
                     defect_rect = (rx, ry, rw, rh)
 
         white_fail = False
+        worst_ratio_drop_pct = 0.0
+        worst_ratio_btn = ""
         if white_enabled and button_roi_locked and button_rois and button_color_baselines:
             for btn, roi in button_rois.items():
                 base = button_color_baselines.get(btn)
@@ -976,8 +1135,12 @@ def main():
                 base_ratio = float(base.get("white_to_color", 0.0))
                 cur_ratio = float(cur.get("white_to_color", 0.0))
                 ratio_drop = (base_ratio - cur_ratio) / max(base_ratio, 1e-6) if base_ratio > 0 else 0.0
+                ratio_drop_pct = max(0.0, ratio_drop * 100.0)
+                if ratio_drop_pct >= worst_ratio_drop_pct:
+                    worst_ratio_drop_pct = ratio_drop_pct
+                    worst_ratio_btn = btn
                 low_color = cur.get("color_px", 0) < BUTTON_MIN_COLOR_PIXELS
-                ratio_detail[btn] = f"{base_ratio:.3f}->{cur_ratio:.3f} drop={ratio_drop*100:.1f}%"
+                ratio_detail[btn] = f"{base_ratio:.3f}->{cur_ratio:.3f} drop={ratio_drop_pct:.1f}%"
                 if ratio_drop > BUTTON_WHITE_RATIO_DROP_PCT or low_color:
                     ratio_fail_buttons.append(btn)
             white_fail = len(ratio_fail_buttons) > 0
@@ -999,13 +1162,18 @@ def main():
             failed_metric = "contour_gate_triggered"
         else:
             failed_metric = "none"
+        score_role = "informational_mean_pixel_diff" if contour_enabled else "white_ratio_change_pct"
+        score_value = score if contour_enabled else worst_ratio_drop_pct
         decision_trace = {
             "decision_logic": decision_logic,
             "failed_metric": failed_metric,
             "max_contour_area": f"{max_area:.2f}",
             "max_bbox": f"{max_bbox[0]}x{max_bbox[1]}",
-            "score_role": "informational_mean_pixel_diff",
+            "score_role": score_role,
             "button_ratio": "; ".join([f"{k}:{v}" for k, v in ratio_detail.items()]),
+            "white_ratio_change_pct": f"{worst_ratio_drop_pct:.2f}",
+            "white_ratio_button": worst_ratio_btn,
+            "display_score": f"{score_value:.2f}",
         }
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1015,7 +1183,12 @@ def main():
         cv2.imwrite(diff_path, diff)
 
         disp = cyc.copy()
-        label = f"Verdict:{verdict} Mean pixel diff:{score:.2f}"
+        if contour_enabled:
+            metric_txt = f"Mean pixel diff:{score:.2f}"
+        else:
+            suffix = f" ({worst_ratio_btn})" if worst_ratio_btn else ""
+            metric_txt = f"White ratio change:{worst_ratio_drop_pct:.2f}%{suffix}"
+        label = f"Cycle:{cycle_num} Verdict:{verdict} {metric_txt}"
         (_, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
         tx = 20
         ty = max(th + 72, 72)
@@ -1040,7 +1213,8 @@ def main():
         if not ok_a:
             anomaly_path = ""
 
-        return verdict, score, mask_path, anomaly_path, disp, decision_trace
+        score_out = score if contour_enabled else worst_ratio_drop_pct
+        return verdict, score_out, mask_path, anomaly_path, disp, decision_trace
 
     def _auto_capture_cycle(cycle_num):
         nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path
@@ -1194,8 +1368,10 @@ def main():
                                  facecolor=COLOR_PANEL, edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-1))
 
     # Plot area (force + camera in same matplotlib window)
-    ax = fig.add_axes([0.30, 0.25, 0.32, 0.65])
-    ax.set_ylim(-0.2, 2.0)
+    force_ax_x, force_ax_y, force_ax_w = 0.30, 0.25, 0.32
+    force_ax_h = force_ax_w * 9.0 / 16.0
+    ax = fig.add_axes([force_ax_x, force_ax_y, force_ax_w, force_ax_h])
+    ax.set_ylim(-0.2, max(2.0, state.force_max + 1.5))
     ax.set_ylabel("Force (lbs)", fontsize=22, color="white")
     ax.set_xlabel("Time (s)", fontsize=16, color="white")
     ax.set_title("Live Force (Last 10s)", fontsize=26, color=COLOR_TEXT)
@@ -1237,7 +1413,8 @@ def main():
     # Bottom-right logo (same anchor style as gui_test), enlarged 1.5x and nudged left/up
     if app_logo_path:
         try:
-            force_ax_x, force_ax_y, force_ax_w, _force_ax_h = 0.30, 0.25, 0.67, 0.65
+            force_ax_x, force_ax_y, force_ax_w = 0.30, 0.25, 0.67
+            _force_ax_h = force_ax_w * 9.0 / 16.0
             logo_w, logo_h = 0.297, 0.0432  # 1.5x current size while preserving aspect ratio
             logo_x = (force_ax_x + force_ax_w) - logo_w + (1.0 / 14.0) - ((3.0 / 25.4) / 14.0)
             logo_y = 0.01 + ((1.0 / 25.4) / 8.0)
@@ -1286,7 +1463,7 @@ def main():
     # Two-row manual/camera controls above camera pane
     camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.40, 0.32, 0.50
     # Keep control rows above force/camera top edge
-    force_ax_top = 0.25 + 0.65
+    force_ax_top = force_ax_y + force_ax_h
     row2_y = force_ax_top + 0.004
     row1_y = row2_y + manual_btn_h + manual_btn_gap
     manual_btn_w = (camera_ax_w - (4 * manual_btn_gap)) / 5
@@ -2115,7 +2292,8 @@ def main():
 
         pdf = PdfPages(path)
         try:
-            summary_fig = plt.figure(figsize=(11, 8.5), facecolor="white")
+            landscape_size = (11, 8.5)
+            summary_fig = plt.figure(figsize=landscape_size, facecolor="white")
             summary_fig.suptitle(f"Test Report: {report_name}", fontsize=20, weight="bold", y=0.96)
 
             if app_logo_path:
@@ -2140,14 +2318,14 @@ def main():
             plt.close(summary_fig)
 
             for b in BUTTON_ORDER:
-                fig_btn, ax_btn = plt.subplots(figsize=(11, 4.5))
+                fig_btn, ax_btn = plt.subplots(figsize=landscape_size)
                 ax_btn.set_title(f"Button {b}: Force vs Cycle")
                 ax_btn.set_xlabel("Cycle Count")
                 ax_btn.set_ylabel("Peak Force (lbs)")
                 ax_btn.grid(True, axis='y', alpha=0.3)
 
                 if peak_copy[b]:
-                    ax_btn.plot(peak_copy[b], force_copy[b], marker='o', linewidth=1.5, color='black', label='Peak force')
+                    ax_btn.plot(peak_copy[b], force_copy[b], linewidth=1.5, color='black', label='Peak force')
 
                 for i, cyc in enumerate(miss_copy[b]):
                     ax_btn.axvline(cyc, color='red', linestyle='--', linewidth=1.5,
@@ -2176,7 +2354,7 @@ def main():
                 pdf.savefig(fig_btn)
                 plt.close(fig_btn)
 
-            anomaly_fig = plt.figure(figsize=(11, 8.5), facecolor="white")
+            anomaly_fig = plt.figure(figsize=landscape_size, facecolor="white")
             anomaly_fig.suptitle("Anomaly Detection During Cycling", fontsize=18, weight="bold", y=0.96)
             y = 0.90
             anomaly_fig.text(0.06, y, "Original v23 report sections preserved. This section is appended.", fontsize=10, color="#334155")
@@ -2184,12 +2362,12 @@ def main():
             worst_score_txt = f"{anomaly_stats['worst_score']:.2f}" if anomaly_stats["worst_score"] >= 0 else "n/a"
             stats_txt = (
                 f"Scored: {anomaly_stats['total_scored']}   PASS: {anomaly_stats['pass_count']}   FAIL: {anomaly_stats['fail_count']}   WARN: {anomaly_stats['warn_count']}\n"
-                f"First FAIL cycle: {anomaly_stats['first_fail_cycle'] or 'n/a'}   Worst mean pixel diff: {worst_score_txt} (cycle {anomaly_stats['worst_cycle'] or 'n/a'})"
+                f"First FAIL cycle: {anomaly_stats['first_fail_cycle'] or 'n/a'}   Worst inspection metric: {worst_score_txt} (cycle {anomaly_stats['worst_cycle'] or 'n/a'})"
             )
             anomaly_fig.text(0.06, y, stats_txt, fontsize=9)
             y -= 0.06
             if inspection_records:
-                head = "Cycle | Type | Verdict | Mean pixel diff (info) | Reason | Timestamp"
+                head = "Cycle | Type | Verdict | Inspection metric | Reason | Timestamp"
                 anomaly_fig.text(0.06, y, head, fontsize=11, weight="bold")
                 y -= 0.03
                 for rec in inspection_records[-28:]:
@@ -2223,9 +2401,10 @@ def main():
                             fail_score_txt = f"{float(rec.get('score', '')):.2f}"
                         except Exception:
                             fail_score_txt = str(rec.get('score', ''))
-                        anomaly_fig.text(0.08, y, f"Mean pixel diff (info): {fail_score_txt}  ", fontsize=8.6, color="#334155")
+                        metric_label = rec.get("score_role", "inspection_metric")
+                        anomaly_fig.text(0.08, y, f"{metric_label}: {fail_score_txt}  ", fontsize=8.6, color="#334155")
                         y -= 0.020
-                        anomaly_fig.text(0.08, y, f"Triggered metric: contour gate (area={area_val}, bbox={bbox_val})", fontsize=8.6, color="red")
+                        anomaly_fig.text(0.08, y, f"Triggered metric: {rec.get('failed_metric', 'n/a')} (area={area_val}, bbox={bbox_val})", fontsize=8.6, color="red")
                         y -= 0.024
                         if y < 0.10:
                             break
@@ -2695,6 +2874,7 @@ def main():
                 )
                 fail_line_2.set_text("")
 
+                ax.set_ylim(-0.2, max(2.0, state.force_max + 1.5))
                 force_band.remove()
                 force_band = ax.axhspan(state.force_min, state.force_max, alpha=0.18, color="#93c5fd")
 
