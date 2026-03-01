@@ -241,9 +241,16 @@ class SystemState:
 def main():
     # --- Connect robot (keep alive) ---
     robot = Dorna()
+    robot_connected = True
+    robot_mode_text = "ROBOT"
     print("Connecting to Dorna...")
-    robot.connect(host=DORNA_HOST, port=DORNA_PORT)
-    print("Robot Connected!")
+    try:
+        robot.connect(host=DORNA_HOST, port=DORNA_PORT)
+        print("Robot Connected!")
+    except Exception as exc:
+        robot_connected = False
+        robot_mode_text = "VISUAL_INSPECTION_ONLY"
+        print(f"[Robot] Connect failed -> visual inspection mode: {exc}")
 
     # --- Force sensor ---
     bridge = VoltageRatioInput()
@@ -1639,6 +1646,8 @@ def main():
                 state.tare_in_progress = False
 
     def go_home():
+        if not robot_connected:
+            return False
         print("[Robot] Going Home")
         robot.play(-1, {
             "cmd": "jmove", "rel": 0,
@@ -1647,8 +1656,11 @@ def main():
             "jerk": SAFE_START_JERK,
             **HOME_POSE
         })
+        return True
 
     def wait_until_idle(timeout_s=20.0):
+        if not robot_connected:
+            return False
         t0 = time.time()
         while time.time() - t0 < timeout_s:
             if is_idle(robot):
@@ -1657,6 +1669,8 @@ def main():
         return False
 
     def go_ic_home_checkpoint():
+        if not robot_connected:
+            return False
         go_home()
         if not wait_until_idle():
             print("[Robot] Timeout waiting to reach Home before IC clear")
@@ -1727,6 +1741,15 @@ def main():
 
     def on_start(_evt):
         apply_textbox_values()
+        if not robot_connected:
+            with state_lock:
+                state.running = False
+                state.paused = True
+                state.stopped = True
+                state.manual_mode_active = True
+            set_alert("#d97706", "Robot disconnected: visual inspection mode only")
+            print("[GUI] Start blocked: robot disconnected (visual inspection mode)")
+            return
         nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
         nonlocal button_rois, button_color_baselines, button_roi_locked
         nonlocal auto_report_written_cycle
@@ -1918,6 +1941,9 @@ def main():
         go_home()
 
     def on_home(_evt):
+        if not robot_connected:
+            set_alert("#d97706", "Robot disconnected: Home unavailable in visual mode")
+            return
         go_home()
 
     def on_re_tare(_evt):
@@ -1983,9 +2009,9 @@ def main():
 
     def on_lock_roi(_evt):
         nonlocal golden_frame, button_rois, button_color_baselines, button_roi_locked
-        frame = capture_average_frame()
+        frame, frames_used = capture_average_frame()
         if frame is None:
-            set_alert("#7f1d1d", "Lock ROI failed: no camera frame")
+            set_alert("#7f1d1d", f"Lock ROI failed: no camera frame ({frames_used}/{CAPTURE_AVG_MIN_FRAMES})")
             return
         if _select_button_rois_and_calibrate(frame):
             golden_frame = frame.copy() if golden_frame is None else golden_frame
@@ -1998,6 +2024,12 @@ def main():
                 set_alert("#d97706", "ROI selection canceled before lock")
 
     def on_ic_home(_evt):
+        if not robot_connected:
+            with state_lock:
+                state.manual_mode_active = True
+                state.paused = True
+            set_alert("#d97706", "Robot disconnected: visual inspection mode active")
+            return
         with state_lock:
             if state.manual_mode_active:
                 set_alert("#0ea5e9", "Already at IC checkpoint")
@@ -2028,14 +2060,6 @@ def main():
     def on_image_capture(_evt):
         nonlocal last_capture_frame, last_capture_path
         with state_lock:
-            if not state.manual_mode_active:
-                set_alert("#2563eb", "Image Capture ignored (not at IC checkpoint)")
-                print("[GUI] Image Capture ignored: enter IC Home first")
-                return
-            if not camera_settings_locked:
-                set_alert("#2563eb", "Image Capture blocked: run Camera Tune first")
-                print("[GUI] Image Capture blocked: camera not tuned/locked")
-                return
             state.image_capture_count += 1
             capture_num = state.image_capture_count
 
@@ -2118,17 +2142,6 @@ def main():
 
     def on_golden_capture(_evt):
         nonlocal golden_frame, golden_path, locked_roi, roi_locked, button_rois, button_color_baselines, button_roi_locked
-        with state_lock:
-            if not state.manual_mode_active:
-                set_alert("#d97706", "Golden Capture ignored (not at IC checkpoint)")
-                print("[GUI] Golden Capture ignored: enter IC Home first")
-                return
-
-        if not camera_settings_locked:
-            set_alert("#d97706", "Golden Capture blocked: run Camera Tune first")
-            print("[GUI] Golden Capture blocked: camera not tuned/locked")
-            return
-
         frame, frames_used = capture_average_frame()
         if frame is None:
             set_alert("red", f"Golden Capture failed: averaged frame unavailable ({frames_used}/{CAPTURE_AVG_MIN_FRAMES})")
@@ -2888,7 +2901,7 @@ def main():
                 next_cap = state.next_auto_capture_cycle if state.auto_capture_enabled else "-"
                 fail_pol = state.auto_fail_policy
                 status_line.set_text(
-                    f"State: {mode} | {manual_state} | {tare_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
+                    f"State: {mode} | Mode: {robot_mode_text} | {manual_state} | {tare_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
                 )
                 roi_txt = f"ROI:LOCKED {list(button_rois.keys())}" if (button_roi_locked and button_rois) else (f"ROI:LOCKED {locked_roi}" if (roi_locked and locked_roi is not None) else "ROI:UNSET")
                 auto_status_1.set_text(f"Camera: {camera_txt} / {cam_lock_txt}")
