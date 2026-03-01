@@ -78,8 +78,7 @@ INSPECTION_MIN_DEFECT_AREA = 15
 INSPECTION_MIN_DEFECT_W = 3
 INSPECTION_MIN_DEFECT_H = 3
 INSPECTION_EDGE_IGNORE_PX = 2
-BUTTON_WHITE_RATIO_DROP_PCT = 0.20
-BUTTON_MIN_COLOR_PIXELS = 50
+BUTTON_COATING_DEGRADATION_PCT_DEFAULT = 10.0
 
 BUTTON_COLOR_RULES = {
     "A": {"name": "green",  "hsv": [((35, 40, 40), (90, 255, 255))]},
@@ -236,6 +235,7 @@ class SystemState:
     auto_fail_policy: str = "safe_stop"
     detect_contour_enabled: bool = False
     detect_white_ratio_enabled: bool = True
+    coating_degradation_pct: float = BUTTON_COATING_DEGRADATION_PCT_DEFAULT
 
 
 def main():
@@ -786,6 +786,7 @@ def main():
                 "roi": roi_norm,
                 "white_px": 0,
                 "color_px": 0,
+                "non_white_px": 0,
                 "white_to_color": 0.0,
                 "luma_mean": 0.0,
                 "sat_pct": 0.0,
@@ -802,13 +803,15 @@ def main():
         color_mask = cv2.bitwise_and(color_mask, local_mask)
 
         white_px = int(np.count_nonzero(white_mask))
-        color_px = int(np.count_nonzero(color_mask))
-        ratio = float(white_px / max(color_px, 1))
+        roi_px = int(np.count_nonzero(local_mask))
+        non_white_px = int(max(roi_px - white_px, 0))
+        ratio = float(white_px / max(non_white_px, 1))
         luma_mean, sat_pct = compute_luma_stats(cv2.bitwise_and(crop, crop, mask=local_mask))
         return {
             "roi": roi_norm,
             "white_px": white_px,
-            "color_px": color_px,
+            "color_px": non_white_px,
+            "non_white_px": non_white_px,
             "white_to_color": ratio,
             "luma_mean": luma_mean,
             "sat_pct": sat_pct,
@@ -1135,23 +1138,24 @@ def main():
         white_fail = False
         worst_ratio_drop_pct = 0.0
         worst_ratio_btn = ""
+        with state_lock:
+            coating_gate_pct = float(state.coating_degradation_pct)
         if white_enabled and button_roi_locked and button_rois and button_color_baselines:
             for btn, roi in button_rois.items():
                 base = button_color_baselines.get(btn)
                 if not base:
                     continue
                 cur = _compute_button_color_stats(cyc, roi, btn)
-                base_ratio = float(base.get("white_to_color", 0.0))
-                cur_ratio = float(cur.get("white_to_color", 0.0))
-                ratio_drop = (base_ratio - cur_ratio) / max(base_ratio, 1e-6) if base_ratio > 0 else 0.0
-                ratio_drop_pct = max(0.0, ratio_drop * 100.0)
+                base_white = float(base.get("white_px", 0.0))
+                cur_white = float(cur.get("white_px", 0.0))
+                white_drop = (base_white - cur_white) / max(base_white, 1e-6) if base_white > 0 else 0.0
+                ratio_drop_pct = max(0.0, white_drop * 100.0)
                 ratio_drop_by_button[btn] = ratio_drop_pct
                 if ratio_drop_pct >= worst_ratio_drop_pct:
                     worst_ratio_drop_pct = ratio_drop_pct
                     worst_ratio_btn = btn
-                low_color = cur.get("color_px", 0) < BUTTON_MIN_COLOR_PIXELS
-                ratio_detail[btn] = f"{base_ratio:.3f}->{cur_ratio:.3f} drop={ratio_drop_pct:.1f}%"
-                if ratio_drop > BUTTON_WHITE_RATIO_DROP_PCT or low_color:
+                ratio_detail[btn] = f"white_px {int(base_white)}->{int(cur_white)} drop={ratio_drop_pct:.1f}%"
+                if ratio_drop_pct > coating_gate_pct:
                     ratio_fail_buttons.append(btn)
             white_fail = len(ratio_fail_buttons) > 0
 
@@ -1162,17 +1166,17 @@ def main():
             f"Enabled detectors -> contour={'ON' if contour_enabled else 'OFF'}, white_ratio={'ON' if white_enabled else 'OFF'}; "
             f"contour gate: diff>{INSPECTION_DIFF_THRESHOLD}, area>{INSPECTION_MIN_DEFECT_AREA}, "
             f"bbox>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}; "
-            f"white gate: drop>{int(BUTTON_WHITE_RATIO_DROP_PCT*100)}%"
+            f"white gate: white_px_drop>{coating_gate_pct:.1f}%"
         )
         if contour_fail and white_fail:
             failed_metric = f"contour+white_ratio:{','.join(ratio_fail_buttons)}"
         elif white_fail:
-            failed_metric = f"white_ratio_drop:{','.join(ratio_fail_buttons)}"
+            failed_metric = f"white_px_drop:{','.join(ratio_fail_buttons)}"
         elif contour_fail:
             failed_metric = "contour_gate_triggered"
         else:
             failed_metric = "none"
-        score_role = "informational_mean_pixel_diff" if contour_enabled else "white_ratio_change_pct"
+        score_role = "informational_mean_pixel_diff" if contour_enabled else "white_pixel_drop_pct"
         score_value = score if contour_enabled else worst_ratio_drop_pct
         decision_trace = {
             "decision_logic": decision_logic,
@@ -1183,6 +1187,7 @@ def main():
             "button_ratio": "; ".join([f"{k}:{v}" for k, v in ratio_detail.items()]),
             "button_drop_pct": "|".join([f"{b}:{ratio_drop_by_button.get(b, 0.0):.2f}" for b in BUTTON_ORDER]),
             "white_ratio_change_pct": f"{worst_ratio_drop_pct:.2f}",
+            "coating_gate_pct": f"{coating_gate_pct:.1f}",
             "white_ratio_button": worst_ratio_btn,
             "display_score": f"{score_value:.2f}",
         }
@@ -1199,7 +1204,7 @@ def main():
         else:
             suffix = f" ({worst_ratio_btn})" if worst_ratio_btn else ""
             fail_btn_txt = f" failBtn:{','.join(ratio_fail_buttons)}" if ratio_fail_buttons else ""
-            metric_txt = f"White ratio change:{worst_ratio_drop_pct:.2f}%{suffix}{fail_btn_txt}"
+            metric_txt = f"White pixel drop:{worst_ratio_drop_pct:.2f}%{suffix}{fail_btn_txt}"
         label = f"Cycle:{cycle_num} Verdict:{verdict} {metric_txt}"
         (_, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
         tx = 20
@@ -1504,6 +1509,7 @@ def main():
     btn_detect_contour = Button(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "Contour: ON", color="#166534", hovercolor="#15803d")
     btn_detect_white = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "WhiteRatio: ON", color="#166534", hovercolor="#15803d")
     btn_lock_roi = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "Lock ROI", color="#0f766e", hovercolor="#115e59")
+    btn_coating_gate = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "Coating degr%:10", color="#334155", hovercolor="#1f2937")
 
     # Auto-capture settings/status panel
     px_x = 1.0 / (fig.get_figwidth() * fig.dpi)
@@ -1549,9 +1555,9 @@ def main():
                                  transform=fig.transFigure, facecolor="#0b1220", edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-0.5))
 
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap, btn_fail_policy,
-                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_lock_roi]:
+                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
@@ -1611,6 +1617,13 @@ def main():
         btn_detect_contour.ax.set_facecolor("#166534" if contour_on else "#7f1d1d")
         btn_detect_white.label.set_text("WhiteRatio: ON" if white_on else "WhiteRatio: OFF")
         btn_detect_white.ax.set_facecolor("#166534" if white_on else "#7f1d1d")
+
+
+    def update_coating_gate_button():
+        with state_lock:
+            gate = float(state.coating_degradation_pct)
+        btn_coating_gate.label.set_text(f"Coating degr%:{gate:.0f}")
+        btn_coating_gate.ax.set_facecolor("#334155")
 
     def go_a_above():
         print("[Robot] Going to A-above for tare")
@@ -2006,6 +2019,20 @@ def main():
                 state.detect_contour_enabled = True
         update_detector_buttons()
         set_alert("#166534" if white_on else "#7f1d1d", f"White-ratio detector {'enabled' if white_on else 'disabled'}")
+
+
+    def on_toggle_coating_gate(_evt):
+        levels = [5.0, 10.0, 15.0, 20.0]
+        with state_lock:
+            cur = float(state.coating_degradation_pct)
+            try:
+                idx = levels.index(cur)
+            except ValueError:
+                idx = 1
+            state.coating_degradation_pct = levels[(idx + 1) % len(levels)]
+            gate = state.coating_degradation_pct
+        update_coating_gate_button()
+        set_alert("#334155", f"Coating degradation gate set to {gate:.0f}%")
 
     def on_lock_roi(_evt):
         nonlocal golden_frame, button_rois, button_color_baselines, button_roi_locked
@@ -2529,6 +2556,7 @@ def main():
     btn_detect_contour.on_clicked(on_toggle_detect_contour)
     btn_detect_white.on_clicked(on_toggle_detect_white)
     btn_lock_roi.on_clicked(on_lock_roi)
+    btn_coating_gate.on_clicked(on_toggle_coating_gate)
     btn_ic_home.on_clicked(on_ic_home)
     btn_return_test.on_clicked(on_return_to_test)
     btn_camera_tune.on_clicked(on_camera_tune)
@@ -2543,6 +2571,7 @@ def main():
     update_auto_cap_button()
     update_fail_policy_button()
     update_detector_buttons()
+    update_coating_gate_button()
 
     # TextBox callbacks (kept, but now also locked)
     def on_vel_submit(text):
@@ -2907,7 +2936,7 @@ def main():
                 auto_status_1.set_text(f"Camera: {camera_txt} / {cam_lock_txt}")
                 auto_status_2.set_text(f"AutoCap: {sched_txt} every={state.capture_every_x_cycles} next={next_cap} retries={state.auto_capture_retries}")
                 auto_status_3.set_text(f"Golden ready: {gold_txt}")
-                auto_status_4.set_text(f"{roi_txt} | FailPolicy: {fail_pol}")
+                auto_status_4.set_text(f"{roi_txt} | FailPolicy: {fail_pol} | CoatGate:{state.coating_degradation_pct:.0f}%")
                 auto_status_5.set_text(f"Inspection/Capture: {state.last_capture_result}")
                 param_line.set_text("")
                 fail_line_1.set_text(
