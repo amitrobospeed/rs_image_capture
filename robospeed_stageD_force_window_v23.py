@@ -635,6 +635,36 @@ def main():
         poly_pts = []
         finalized = None
         actions = {}
+        status_msg = "Draw ROI, then press Enter to confirm"
+
+        def _is_valid_roi(roi):
+            if not roi:
+                return False
+            if isinstance(roi, dict):
+                rshape = roi.get("shape", "rect")
+                if rshape == "rect":
+                    return int(roi.get("w", 0)) >= 4 and int(roi.get("h", 0)) >= 4
+                if rshape == "circle":
+                    return int(roi.get("r", 0)) >= 3
+                if rshape == "poly":
+                    return len(roi.get("points", [])) >= 3
+                return False
+            return len(roi) == 4 and int(roi[2]) >= 4 and int(roi[3]) >= 4
+
+        def _finalize_current():
+            nonlocal finalized, status_msg
+            if shape_mode == "poly":
+                if len(poly_pts) >= 3:
+                    finalized = {"shape": "poly", "points": poly_pts.copy()}
+                    status_msg = "Polygon ready. Press Enter to confirm"
+                    return True
+                status_msg = "Polygon needs at least 3 points"
+                return False
+            if _is_valid_roi(finalized):
+                status_msg = "ROI ready. Press Enter to confirm"
+                return True
+            status_msg = "Draw a larger ROI first"
+            return False
 
         def _draw_buttons(canvas):
             nonlocal actions
@@ -658,22 +688,26 @@ def main():
             return None
 
         def _mouse_cb(evt, x, y, _flags, _param):
-            nonlocal shape_mode, start_pt, drag_pt, poly_pts, finalized
+            nonlocal shape_mode, start_pt, drag_pt, poly_pts, finalized, status_msg
             if evt == cv2.EVENT_LBUTTONDOWN:
                 k = _hit_button(x, y)
                 if k in ("rect", "circle", "poly"):
                     shape_mode = k
                     start_pt = None
                     drag_pt = None
+                    finalized = None
                     if k != "poly":
                         poly_pts = []
+                    status_msg = f"{k.title()} mode selected"
                     return
                 if k == "lock":
-                    if shape_mode == "poly" and len(poly_pts) >= 3:
-                        finalized = {"shape": "poly", "points": poly_pts.copy()}
+                    if _finalize_current():
+                        status_msg = "ROI locked. Press Enter to continue"
                     return
                 if shape_mode == "poly":
                     poly_pts.append((x, y))
+                    finalized = None
+                    status_msg = f"Polygon points: {len(poly_pts)}"
                     return
                 start_pt = (x, y)
                 drag_pt = (x, y)
@@ -690,6 +724,7 @@ def main():
                         r = int(np.hypot(ex - sx, ey - sy))
                         finalized = {"shape": "circle", "cx": sx, "cy": sy, "r": r}
                     start_pt = None
+                    status_msg = "ROI drawn. Press Enter to confirm"
 
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(window_name, _mouse_cb)
@@ -697,7 +732,8 @@ def main():
             canvas = frame.copy()
             cv2.putText(canvas, "Draw area to inspect and press enter to continue", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
             cv2.putText(canvas, "Choose ROI shape: Rectangle / Circle / Polygon", (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1)
-            cv2.putText(canvas, "Polygon: click points, Enter or Lock ROI to finish", (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+            cv2.putText(canvas, "Polygon: click points, Enter/Lock ROI to finish", (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+            cv2.putText(canvas, status_msg, (20, 152), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 255, 180), 1)
             _draw_buttons(canvas)
 
             if shape_mode == "poly" and poly_pts:
@@ -718,7 +754,7 @@ def main():
             cv2.imshow(window_name, canvas)
             key = cv2.waitKey(20) & 0xFF
             if key in (13, 10):
-                if finalized is not None:
+                if _finalize_current() and _is_valid_roi(finalized):
                     return _sanitize_roi(finalized, frame.shape)
             elif key == 27:
                 return None
@@ -726,6 +762,7 @@ def main():
                 if shape_mode == "poly" and poly_pts:
                     poly_pts.pop()
                     finalized = None
+                    status_msg = f"Polygon points: {len(poly_pts)}"
 
     def _roi_crop(frame, roi):
         x, y, w, h = _roi_bounds(_sanitize_roi(roi, frame.shape), frame.shape)
@@ -1770,10 +1807,10 @@ def main():
             set_alert("#0f766e", f"Button ROIs locked: {list(button_rois.keys())}")
             print(f"[GUI] Button ROIs locked -> {button_rois}")
         else:
-            button_rois = {}
-            button_color_baselines = {}
-            button_roi_locked = False
-            set_alert("#d97706", "ROI selection canceled before lock")
+            if button_roi_locked and button_rois:
+                set_alert("#d97706", "ROI update canceled. Existing locked ROIs kept")
+            else:
+                set_alert("#d97706", "ROI selection canceled before lock")
 
     def on_ic_home(_evt):
         with state_lock:
