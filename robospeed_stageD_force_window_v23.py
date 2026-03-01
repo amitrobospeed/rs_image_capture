@@ -78,6 +78,16 @@ INSPECTION_MIN_DEFECT_AREA = 15
 INSPECTION_MIN_DEFECT_W = 3
 INSPECTION_MIN_DEFECT_H = 3
 INSPECTION_EDGE_IGNORE_PX = 2
+BUTTON_WHITE_RATIO_DROP_PCT = 0.20
+BUTTON_MIN_COLOR_PIXELS = 50
+
+BUTTON_COLOR_RULES = {
+    "A": {"name": "green",  "hsv": [((35, 40, 40), (90, 255, 255))]},
+    "B": {"name": "blue",   "hsv": [((90, 40, 40), (140, 255, 255))]},
+    "C": {"name": "red",    "hsv": [((0, 40, 40), (10, 255, 255)), ((160, 40, 40), (179, 255, 255))]},
+    "D": {"name": "yellow", "hsv": [((15, 40, 40), (40, 255, 255))]},
+}
+WHITE_HSV_RANGE = ((0, 0, 160), (179, 60, 255))
 
 
 # ================================
@@ -224,6 +234,8 @@ class SystemState:
     last_capture_result: str = "none"
     auto_capture_retries: int = DEFAULT_AUTO_CAPTURE_RETRIES
     auto_fail_policy: str = "safe_stop"
+    detect_contour_enabled: bool = True
+    detect_white_ratio_enabled: bool = True
 
 
 def main():
@@ -280,6 +292,9 @@ def main():
     }
     locked_roi = None
     roi_locked = False
+    button_rois = {}
+    button_color_baselines = {}
+    button_roi_locked = False
 
     manifest_path = os.path.join(CAMERA_OUTPUT_DIR, "manifest.csv")
     reports_dir = os.path.join(CAMERA_OUTPUT_DIR, "reports")
@@ -425,7 +440,7 @@ def main():
 
         # Stage 1: exposure-first alignment
         for _ in range(TUNE_MAX_ITERS):
-            mean_l, sat = compute_luma_stats(frame)
+            mean_l, sat = _compute_button_luma_stats(frame)
 
             if sat > MAX_SAT_PCT:
                 exp = int(exp * 0.85)
@@ -454,7 +469,7 @@ def main():
 
         # Stage 2: gain-only fine tune
         for _ in range(max(2, TUNE_MAX_ITERS // 2)):
-            mean_l, sat = compute_luma_stats(frame)
+            mean_l, sat = _compute_button_luma_stats(frame)
 
             if sat > MAX_SAT_PCT:
                 gain = int(gain * 0.9)
@@ -539,6 +554,81 @@ def main():
         cv2.putText(preview, hint, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
         return cv2.selectROI(window_name, preview, False, False)
 
+    def _sanitize_roi(roi, shape):
+        x, y, w, h = map(int, roi)
+        h_img, w_img = shape[:2]
+        x = max(0, min(x, w_img - 1))
+        y = max(0, min(y, h_img - 1))
+        w = max(1, min(w, w_img - x))
+        h = max(1, min(h, h_img - y))
+        return (x, y, w, h)
+
+    def _roi_crop(frame, roi):
+        x, y, w, h = _sanitize_roi(roi, frame.shape)
+        return frame[y:y+h, x:x+w], (x, y, w, h)
+
+    def _compute_button_color_stats(frame, roi, button_name):
+        crop, roi_norm = _roi_crop(frame, roi)
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        white_lo, white_hi = WHITE_HSV_RANGE
+        white_mask = cv2.inRange(hsv, np.array(white_lo, dtype=np.uint8), np.array(white_hi, dtype=np.uint8))
+
+        color_mask = np.zeros(white_mask.shape, dtype=np.uint8)
+        for lo, hi in BUTTON_COLOR_RULES.get(button_name, {}).get("hsv", []):
+            color_mask = cv2.bitwise_or(color_mask, cv2.inRange(hsv, np.array(lo, dtype=np.uint8), np.array(hi, dtype=np.uint8)))
+
+        white_px = int(np.count_nonzero(white_mask))
+        color_px = int(np.count_nonzero(color_mask))
+        ratio = float(white_px / max(color_px, 1))
+        luma_mean, sat_pct = compute_luma_stats(crop)
+        return {
+            "roi": roi_norm,
+            "white_px": white_px,
+            "color_px": color_px,
+            "white_to_color": ratio,
+            "luma_mean": luma_mean,
+            "sat_pct": sat_pct,
+        }
+
+    def _compute_button_luma_stats(frame):
+        if not button_roi_locked or not button_rois:
+            return compute_luma_stats(frame)
+        means = []
+        sats = []
+        for btn, roi in button_rois.items():
+            st = _compute_button_color_stats(frame, roi, btn)
+            means.append(st["luma_mean"])
+            sats.append(st["sat_pct"])
+        if not means:
+            return compute_luma_stats(frame)
+        return float(np.mean(means)), float(max(sats))
+
+    def _select_button_rois_and_calibrate(frame):
+        nonlocal button_rois, button_color_baselines, button_roi_locked, locked_roi, roi_locked
+        selected = {}
+        baseline = {}
+        for btn in BUTTON_ORDER:
+            color_name = BUTTON_COLOR_RULES.get(btn, {}).get("name", "target")
+            roi = _select_roi_with_hint(f"ROI Selector {btn} ({color_name})", frame)
+            cv2.destroyWindow(f"ROI Selector {btn} ({color_name})")
+            if not roi or roi[2] <= 0 or roi[3] <= 0:
+                return False
+            roi = _sanitize_roi(roi, frame.shape)
+            selected[btn] = roi
+            baseline[btn] = _compute_button_color_stats(frame, roi, btn)
+
+        button_rois = selected
+        button_color_baselines = baseline
+        button_roi_locked = True
+
+        xs = [r[0] for r in selected.values()]
+        ys = [r[1] for r in selected.values()]
+        x2 = [r[0] + r[2] for r in selected.values()]
+        y2 = [r[1] + r[3] for r in selected.values()]
+        locked_roi = (min(xs), min(ys), max(x2) - min(xs), max(y2) - min(ys))
+        roi_locked = True
+        return True
+
     def _ensure_cycle_video(golden_img, run_id):
         nonlocal cycle_video_path, cycle_video_writer, cycle_video_started
         if cycle_video_writer is not None:
@@ -553,7 +643,12 @@ def main():
             return False
         golden_tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         intro_src = golden_img.copy()
-        if roi_locked and locked_roi is not None:
+        if button_roi_locked and button_rois:
+            for _btn, _roi in button_rois.items():
+                x, y, w, h = _roi
+                cv2.rectangle(intro_src, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                cv2.putText(intro_src, _btn, (x + 2, max(14, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        elif roi_locked and locked_roi is not None:
             x, y, w, h = locked_roi
             cv2.rectangle(intro_src, (x, y), (x + w, y + h), (255, 0, 0), 2)
         intro = _stamp(intro_src, f"GOLDEN | run={run_id} | {golden_tag}")
@@ -589,7 +684,7 @@ def main():
         return ok, out_name, out_path
 
     def run_basic_inspection(golden, cyc, run_id, cycle_num):
-        nonlocal locked_roi
+        nonlocal locked_roi, button_rois, button_color_baselines, button_roi_locked
         g_src = golden
         c_src = cyc
         if roi_locked and locked_roi is not None:
@@ -630,35 +725,72 @@ def main():
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        with state_lock:
+            contour_enabled = state.detect_contour_enabled
+            white_enabled = state.detect_white_ratio_enabled
+
         defect_found = False
         defect_rect = None
         max_area = 0.0
         max_bbox = (0, 0)
-        for contour in contours:
-            area = float(cv2.contourArea(contour))
-            if area <= INSPECTION_MIN_DEFECT_AREA:
-                continue
-            rx, ry, rw, rh = cv2.boundingRect(contour)
-            if rw < INSPECTION_MIN_DEFECT_W or rh < INSPECTION_MIN_DEFECT_H:
-                continue
-            if area > max_area:
-                max_area = area
-                max_bbox = (rw, rh)
-                defect_found = True
-                defect_rect = (rx, ry, rw, rh)
+        ratio_fail_buttons = []
+        ratio_detail = {}
+
+        contour_fail = False
+        if contour_enabled:
+            for contour in contours:
+                area = float(cv2.contourArea(contour))
+                if area <= INSPECTION_MIN_DEFECT_AREA:
+                    continue
+                rx, ry, rw, rh = cv2.boundingRect(contour)
+                if rw < INSPECTION_MIN_DEFECT_W or rh < INSPECTION_MIN_DEFECT_H:
+                    continue
+                if area > max_area:
+                    max_area = area
+                    max_bbox = (rw, rh)
+                    contour_fail = True
+                    defect_rect = (rx, ry, rw, rh)
+
+        white_fail = False
+        if white_enabled and button_roi_locked and button_rois and button_color_baselines:
+            for btn, roi in button_rois.items():
+                base = button_color_baselines.get(btn)
+                if not base:
+                    continue
+                cur = _compute_button_color_stats(cyc, roi, btn)
+                base_ratio = float(base.get("white_to_color", 0.0))
+                cur_ratio = float(cur.get("white_to_color", 0.0))
+                ratio_drop = (base_ratio - cur_ratio) / max(base_ratio, 1e-6) if base_ratio > 0 else 0.0
+                low_color = cur.get("color_px", 0) < BUTTON_MIN_COLOR_PIXELS
+                ratio_detail[btn] = f"{base_ratio:.3f}->{cur_ratio:.3f} drop={ratio_drop*100:.1f}%"
+                if ratio_drop > BUTTON_WHITE_RATIO_DROP_PCT or low_color:
+                    ratio_fail_buttons.append(btn)
+            white_fail = len(ratio_fail_buttons) > 0
+
+        defect_found = contour_fail or white_fail
 
         verdict = "FAIL" if defect_found else "PASS"
         decision_logic = (
-            f"FAIL if contour passes: diff>{INSPECTION_DIFF_THRESHOLD}, "
-            f"area>{INSPECTION_MIN_DEFECT_AREA}, bbox>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}"
+            f"Enabled detectors -> contour={'ON' if contour_enabled else 'OFF'}, white_ratio={'ON' if white_enabled else 'OFF'}; "
+            f"contour gate: diff>{INSPECTION_DIFF_THRESHOLD}, area>{INSPECTION_MIN_DEFECT_AREA}, "
+            f"bbox>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}; "
+            f"white gate: drop>{int(BUTTON_WHITE_RATIO_DROP_PCT*100)}%"
         )
-        failed_metric = "contour_gate_triggered" if verdict == "FAIL" else "none"
+        if contour_fail and white_fail:
+            failed_metric = f"contour+white_ratio:{','.join(ratio_fail_buttons)}"
+        elif white_fail:
+            failed_metric = f"white_ratio_drop:{','.join(ratio_fail_buttons)}"
+        elif contour_fail:
+            failed_metric = "contour_gate_triggered"
+        else:
+            failed_metric = "none"
         decision_trace = {
             "decision_logic": decision_logic,
             "failed_metric": failed_metric,
             "max_contour_area": f"{max_area:.2f}",
             "max_bbox": f"{max_bbox[0]}x{max_bbox[1]}",
             "score_role": "informational_mean_pixel_diff",
+            "button_ratio": "; ".join([f"{k}:{v}" for k, v in ratio_detail.items()]),
         }
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -683,7 +815,12 @@ def main():
             else:
                 cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 2)
 
-        if roi_locked and locked_roi is not None:
+        if button_roi_locked and button_rois:
+            for _btn, _roi in button_rois.items():
+                x, y, w, h = _roi
+                cv2.rectangle(disp, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                cv2.putText(disp, _btn, (x + 2, max(14, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        elif roi_locked and locked_roi is not None:
             x, y, w, h = locked_roi
             cv2.rectangle(disp, (x, y), (x + w, y + h), (255, 0, 0), 2)
         ok_a, _, anomaly_path = save_capture_frame(disp, "anomaly", run_id, cycle_num)
@@ -957,6 +1094,11 @@ def main():
     btn_tare_on_start = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Tare@Start: ON", color="#0f766e", hovercolor="#115e59")
     btn_auto_cap = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "AutoCap: OFF", color="#1d4ed8", hovercolor="#1e40af")
 
+    # Row 3: Anomaly detector toggles
+    row3_y = row2_y - (manual_btn_h + manual_btn_gap)
+    btn_detect_contour = Button(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "Contour: ON", color="#166534", hovercolor="#15803d")
+    btn_detect_white = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "WhiteRatio: ON", color="#166534", hovercolor="#15803d")
+
     # Auto-capture settings/status panel
     px_x = 1.0 / (fig.get_figwidth() * fig.dpi)
     px_y = 1.0 / (fig.get_figheight() * fig.dpi)
@@ -1001,9 +1143,9 @@ def main():
                                  transform=fig.transFigure, facecolor="#0b1220", edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-0.5))
 
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap, btn_fail_policy,
-                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare]:
+                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
@@ -1054,6 +1196,15 @@ def main():
         else:
             btn_fail_policy.label.set_text("Fail:STOP")
             btn_fail_policy.ax.set_facecolor("#991b1b")
+
+    def update_detector_buttons():
+        with state_lock:
+            contour_on = state.detect_contour_enabled
+            white_on = state.detect_white_ratio_enabled
+        btn_detect_contour.label.set_text("Contour: ON" if contour_on else "Contour: OFF")
+        btn_detect_contour.ax.set_facecolor("#166534" if contour_on else "#7f1d1d")
+        btn_detect_white.label.set_text("WhiteRatio: ON" if white_on else "WhiteRatio: OFF")
+        btn_detect_white.ax.set_facecolor("#166534" if white_on else "#7f1d1d")
 
     def go_a_above():
         print("[Robot] Going to A-above for tare")
@@ -1178,6 +1329,7 @@ def main():
     def on_start(_evt):
         apply_textbox_values()
         nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
+        nonlocal button_rois, button_color_baselines, button_roi_locked
         nonlocal auto_report_written_cycle
         with state_lock:
             state.running = False
@@ -1203,6 +1355,9 @@ def main():
         golden_path = None
         locked_roi = None
         roi_locked = False
+        button_rois = {}
+        button_color_baselines = {}
+        button_roi_locked = False
         auto_report_written_cycle = -1
 
         print("[GUI] Start pressed -> Going Home before cycle start")
@@ -1278,18 +1433,14 @@ def main():
                 set_alert("red", "Auto start failed: could not save golden")
                 return
 
-            roi = _select_roi_with_hint("ROI Selector", frame)
-            cv2.destroyWindow("ROI Selector")
-            if not roi or roi[2] <= 0 or roi[3] <= 0:
+            if not _select_button_rois_and_calibrate(frame):
                 with state_lock:
                     state.running = False
                     state.paused = True
                     state.stopped = True
-                set_alert("red", "Auto start aborted: ROI not selected")
+                set_alert("red", "Auto start aborted: all button ROIs not selected")
                 return
 
-            locked_roi = tuple(map(int, roi))
-            roi_locked = True
             golden_frame = frame.copy()
             golden_path = out_path
             _ensure_cycle_video(golden_frame, run_id)
@@ -1408,6 +1559,28 @@ def main():
             pol = state.auto_fail_policy
         update_fail_policy_button()
         set_alert("#92400e" if pol == "continue" else "#991b1b", f"Auto capture fail policy: {pol}")
+
+    def on_toggle_detect_contour(_evt):
+        with state_lock:
+            state.detect_contour_enabled = not state.detect_contour_enabled
+            contour_on = state.detect_contour_enabled
+            white_on = state.detect_white_ratio_enabled
+        if not contour_on and not white_on:
+            with state_lock:
+                state.detect_white_ratio_enabled = True
+        update_detector_buttons()
+        set_alert("#166534" if contour_on else "#7f1d1d", f"Contour detector {'enabled' if contour_on else 'disabled'}")
+
+    def on_toggle_detect_white(_evt):
+        with state_lock:
+            state.detect_white_ratio_enabled = not state.detect_white_ratio_enabled
+            white_on = state.detect_white_ratio_enabled
+            contour_on = state.detect_contour_enabled
+        if not contour_on and not white_on:
+            with state_lock:
+                state.detect_contour_enabled = True
+        update_detector_buttons()
+        set_alert("#166534" if white_on else "#7f1d1d", f"White-ratio detector {'enabled' if white_on else 'disabled'}")
 
     def on_ic_home(_evt):
         with state_lock:
@@ -1529,7 +1702,7 @@ def main():
             print(f"[GUI] Camera tuned and locked exp={camera_exposure} gain={camera_gain}")
 
     def on_golden_capture(_evt):
-        nonlocal golden_frame, golden_path, locked_roi, roi_locked
+        nonlocal golden_frame, golden_path, locked_roi, roi_locked, button_rois, button_color_baselines, button_roi_locked
         with state_lock:
             if not state.manual_mode_active:
                 set_alert("#d97706", "Golden Capture ignored (not at IC checkpoint)")
@@ -1558,17 +1731,16 @@ def main():
         golden_path = out_path
         with state_lock:
             state.golden_ready = True
-        roi = _select_roi_with_hint("ROI Selector", golden_frame)
-        cv2.destroyWindow("ROI Selector")
-        if roi and roi[2] > 0 and roi[3] > 0:
-            locked_roi = tuple(map(int, roi))
-            roi_locked = True
-            set_alert("#d97706", f"Golden saved + ROI locked: {out_name}")
-            print(f"[GUI] ROI locked -> {locked_roi}")
+        if _select_button_rois_and_calibrate(golden_frame):
+            set_alert("#d97706", f"Golden saved + button ROIs locked: {out_name}")
+            print(f"[GUI] Button ROIs locked -> {button_rois}")
         else:
             locked_roi = None
             roi_locked = False
-            set_alert("orange", "Golden saved but ROI not selected")
+            button_rois = {}
+            button_color_baselines = {}
+            button_roi_locked = False
+            set_alert("orange", "Golden saved but button ROIs not fully selected")
         print(f"[GUI] Golden saved -> {out_path}")
 
     def on_run_inspection(_evt):
@@ -1584,7 +1756,7 @@ def main():
 
         run_id = state.test_name.strip() or "test_report"
         cyc_num = max(1, state.cycle_count)
-        if not roi_locked or locked_roi is None:
+        if (not button_roi_locked and (not roi_locked or locked_roi is None)):
             set_alert("#7c3aed", "Run Inspection blocked: capture Golden + select ROI first")
             print("[GUI] Run Inspection blocked: ROI missing")
             return
@@ -1636,6 +1808,7 @@ def main():
 
     def on_reset(_evt):
         nonlocal golden_frame, golden_path, last_capture_frame, last_capture_path, locked_roi, roi_locked
+        nonlocal button_rois, button_color_baselines, button_roi_locked
         nonlocal cycle_video_writer, cycle_video_path, cycle_video_started, auto_report_written_cycle
         with state_lock:
             state.force_out_of_range = {"A": 0, "B": 0, "C": 0, "D": 0}
@@ -1902,6 +2075,8 @@ def main():
     btn_tare_on_start.on_clicked(on_toggle_tare_on_start)
     btn_auto_cap.on_clicked(on_toggle_auto_cap)
     btn_fail_policy.on_clicked(on_toggle_fail_policy)
+    btn_detect_contour.on_clicked(on_toggle_detect_contour)
+    btn_detect_white.on_clicked(on_toggle_detect_white)
     btn_ic_home.on_clicked(on_ic_home)
     btn_return_test.on_clicked(on_return_to_test)
     btn_camera_tune.on_clicked(on_camera_tune)
@@ -1915,6 +2090,7 @@ def main():
     update_tare_toggle_button()
     update_auto_cap_button()
     update_fail_policy_button()
+    update_detector_buttons()
 
     # TextBox callbacks (kept, but now also locked)
     def on_vel_submit(text):
@@ -2275,7 +2451,7 @@ def main():
                 status_line.set_text(
                     f"State: {mode} | {manual_state} | {tare_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
                 )
-                roi_txt = f"ROI:LOCKED {locked_roi}" if (roi_locked and locked_roi is not None) else "ROI:UNSET"
+                roi_txt = f"ROI:LOCKED {list(button_rois.keys())}" if (button_roi_locked and button_rois) else (f"ROI:LOCKED {locked_roi}" if (roi_locked and locked_roi is not None) else "ROI:UNSET")
                 auto_status_1.set_text(f"Camera: {camera_txt} / {cam_lock_txt}")
                 auto_status_2.set_text(f"AutoCap: {sched_txt} every={state.capture_every_x_cycles} next={next_cap} retries={state.auto_capture_retries}")
                 auto_status_3.set_text(f"Golden ready: {gold_txt}")
