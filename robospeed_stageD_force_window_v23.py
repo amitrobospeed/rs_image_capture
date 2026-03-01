@@ -279,6 +279,7 @@ def main():
     # session-level camera settings lock
     camera_exposure = 4500
     camera_gain = 8
+    camera_white_balance = 4600
     camera_settings_locked = False
     camera_tuned_once = False
 
@@ -333,6 +334,25 @@ def main():
         sat_pct = float(np.mean(gray >= 250) * 100.0)
         return mean_luma, sat_pct
 
+    def detect_white_pixels(image, roi_mask=None, percentile=95):
+        image = image.astype(np.float32) / 255.0
+        gray = np.mean(image, axis=2)
+        if roi_mask is not None:
+            roi_pixels = gray[roi_mask]
+        else:
+            roi_pixels = gray.flatten()
+        if roi_pixels.size == 0:
+            return 0, 0, 1.0
+        roi_max = float(np.max(roi_pixels))
+        if roi_max <= 1e-6:
+            return 0, int(roi_pixels.size), 1.0
+        roi_pixels = roi_pixels / roi_max
+        threshold = float(np.percentile(roi_pixels, percentile))
+        white_pixels = int(np.sum(roi_pixels > threshold))
+        total_pixels = int(len(roi_pixels))
+        color_pixels = int(max(total_pixels - white_pixels, 0))
+        return white_pixels, color_pixels, threshold
+
     def start_camera_preview():
         nonlocal camera_thread, camera_latest_frame, camera_sensor
         if camera_thread is not None and camera_thread.is_alive():
@@ -357,6 +377,11 @@ def main():
                 sensor.set_option(rs.option.enable_auto_exposure, 0)
                 sensor.set_option(rs.option.exposure, int(camera_exposure))
                 sensor.set_option(rs.option.gain, int(camera_gain))
+                try:
+                    sensor.set_option(rs.option.enable_auto_white_balance, 0)
+                    sensor.set_option(rs.option.white_balance, int(camera_white_balance))
+                except Exception:
+                    pass
                 with camera_hw_lock:
                     camera_sensor = sensor
             except Exception:
@@ -430,7 +455,7 @@ def main():
         return np.clip(avg, 0, 255).astype(np.uint8), len(frames)
 
     def run_camera_auto_tune():
-        nonlocal camera_exposure, camera_gain, camera_settings_locked, camera_tuned_once
+        nonlocal camera_exposure, camera_gain, camera_white_balance, camera_settings_locked, camera_tuned_once
         with camera_hw_lock:
             sensor = camera_sensor
         if sensor is None:
@@ -506,7 +531,7 @@ def main():
         camera_gain = gain
         camera_settings_locked = True
         camera_tuned_once = True
-        set_alert("green", f"Camera tuned+locked exp={exp} gain={gain}")
+        set_alert("green", f"Camera tuned+locked exp={exp} gain={gain} wb={camera_white_balance}")
         return True
 
     def _manifest_write(row):
@@ -788,31 +813,21 @@ def main():
                 "color_px": 0,
                 "non_white_px": 0,
                 "white_to_color": 0.0,
+                "adaptive_white_thr": 1.0,
                 "luma_mean": 0.0,
                 "sat_pct": 0.0,
             }
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        white_lo, white_hi = WHITE_HSV_RANGE
-        white_mask = cv2.inRange(hsv, np.array(white_lo, dtype=np.uint8), np.array(white_hi, dtype=np.uint8))
-
-        color_mask = np.zeros(white_mask.shape, dtype=np.uint8)
-        for lo, hi in BUTTON_COLOR_RULES.get(button_name, {}).get("hsv", []):
-            color_mask = cv2.bitwise_or(color_mask, cv2.inRange(hsv, np.array(lo, dtype=np.uint8), np.array(hi, dtype=np.uint8)))
-
-        white_mask = cv2.bitwise_and(white_mask, local_mask)
-        color_mask = cv2.bitwise_and(color_mask, local_mask)
-
-        white_px = int(np.count_nonzero(white_mask))
-        roi_px = int(np.count_nonzero(local_mask))
-        non_white_px = int(max(roi_px - white_px, 0))
+        roi_bool = (local_mask > 0)
+        white_px, non_white_px, adaptive_thr = detect_white_pixels(crop, roi_mask=roi_bool, percentile=95)
         ratio = float(white_px / max(non_white_px, 1))
         luma_mean, sat_pct = compute_luma_stats(cv2.bitwise_and(crop, crop, mask=local_mask))
         return {
             "roi": roi_norm,
-            "white_px": white_px,
-            "color_px": non_white_px,
-            "non_white_px": non_white_px,
+            "white_px": int(white_px),
+            "color_px": int(non_white_px),
+            "non_white_px": int(non_white_px),
             "white_to_color": ratio,
+            "adaptive_white_thr": float(adaptive_thr),
             "luma_mean": luma_mean,
             "sat_pct": sat_pct,
         }
@@ -2165,7 +2180,7 @@ def main():
     def on_camera_tune(_evt):
         ok = run_camera_auto_tune()
         if ok:
-            print(f"[GUI] Camera tuned and locked exp={camera_exposure} gain={camera_gain}")
+            print(f"[GUI] Camera tuned and locked exp={camera_exposure} gain={camera_gain} wb={camera_white_balance}")
 
     def on_golden_capture(_evt):
         nonlocal golden_frame, golden_path, locked_roi, roi_locked, button_rois, button_color_baselines, button_roi_locked
