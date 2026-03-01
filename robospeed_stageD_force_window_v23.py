@@ -353,6 +353,23 @@ def main():
         color_pixels = int(max(total_pixels - white_pixels, 0))
         return white_pixels, color_pixels, threshold
 
+    def _try_set_sensor_option(sensor, option_name, value):
+        try:
+            sensor.set_option(option_name, value)
+            return True
+        except Exception:
+            return False
+
+    def _apply_locked_camera_settings(sensor):
+        _try_set_sensor_option(sensor, rs.option.enable_auto_exposure, 0)
+        _try_set_sensor_option(sensor, rs.option.exposure, int(camera_exposure))
+        _try_set_sensor_option(sensor, rs.option.gain, int(camera_gain))
+        _try_set_sensor_option(sensor, rs.option.enable_auto_white_balance, 0)
+        _try_set_sensor_option(sensor, rs.option.white_balance, int(camera_white_balance))
+        # D415 safety: force all active IR emitters off when the option is available.
+        _try_set_sensor_option(sensor, rs.option.emitter_enabled, 0)
+        _try_set_sensor_option(sensor, rs.option.laser_power, 0)
+
     def start_camera_preview():
         nonlocal camera_thread, camera_latest_frame, camera_sensor
         if camera_thread is not None and camera_thread.is_alive():
@@ -374,14 +391,7 @@ def main():
 
             try:
                 sensor = profile.get_device().first_color_sensor()
-                sensor.set_option(rs.option.enable_auto_exposure, 0)
-                sensor.set_option(rs.option.exposure, int(camera_exposure))
-                sensor.set_option(rs.option.gain, int(camera_gain))
-                try:
-                    sensor.set_option(rs.option.enable_auto_white_balance, 0)
-                    sensor.set_option(rs.option.white_balance, int(camera_white_balance))
-                except Exception:
-                    pass
+                _apply_locked_camera_settings(sensor)
                 with camera_hw_lock:
                     camera_sensor = sensor
             except Exception:
@@ -470,12 +480,13 @@ def main():
         exp = int(camera_exposure)
         gain = int(camera_gain)
 
-        # Stage 1: exposure-first alignment
+        # Stage 1: exposure-first alignment with strong clipping suppression
         for _ in range(TUNE_MAX_ITERS):
             mean_l, sat = _compute_button_luma_stats(frame)
 
+            # First priority: reduce clipped highlights (gray>=250) before any brightening.
             if sat > MAX_SAT_PCT:
-                exp = int(exp * 0.85)
+                exp = int(exp * 0.80)
             elif mean_l > TARGET_LUMA_MEAN + 5:
                 exp = int(exp * 0.9)
             elif mean_l < TARGET_LUMA_MEAN - 5:
@@ -488,6 +499,7 @@ def main():
             try:
                 sensor.set_option(rs.option.exposure, exp)
                 sensor.set_option(rs.option.gain, gain)
+                sensor.set_option(rs.option.enable_auto_exposure, 0)
             except Exception:
                 set_alert("red", "Camera tune failed: cannot apply exposure")
                 return False
@@ -499,16 +511,16 @@ def main():
                 if frame is None:
                     break
 
-        # Stage 2: gain-only fine tune
+        # Stage 2: gain-only fine tune (never brighten if highlights are clipping)
         for _ in range(max(2, TUNE_MAX_ITERS // 2)):
             mean_l, sat = _compute_button_luma_stats(frame)
 
             if sat > MAX_SAT_PCT:
-                gain = int(gain * 0.9)
+                gain = int(gain * 0.85)
             elif mean_l > TARGET_LUMA_MEAN + 3:
                 gain = int(gain * 0.9)
-            elif mean_l < TARGET_LUMA_MEAN - 3:
-                gain = int(gain * 1.1)
+            elif mean_l < TARGET_LUMA_MEAN - 3 and sat <= (MAX_SAT_PCT * 0.5):
+                gain = int(gain * 1.08)
             else:
                 break
 
@@ -516,6 +528,7 @@ def main():
 
             try:
                 sensor.set_option(rs.option.gain, gain)
+                sensor.set_option(rs.option.enable_auto_exposure, 0)
             except Exception:
                 set_alert("red", "Camera tune failed: cannot apply gain")
                 return False
@@ -529,9 +542,11 @@ def main():
 
         camera_exposure = exp
         camera_gain = gain
+        _apply_locked_camera_settings(sensor)
+        _, final_sat = _compute_button_luma_stats(frame)
         camera_settings_locked = True
         camera_tuned_once = True
-        set_alert("green", f"Camera tuned+locked exp={exp} gain={gain} wb={camera_white_balance}")
+        set_alert("green", f"Camera tuned+locked exp={exp} gain={gain} wb={camera_white_balance} sat={final_sat:.2f}%")
         return True
 
     def _manifest_write(row):
