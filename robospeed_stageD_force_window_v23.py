@@ -335,23 +335,33 @@ def main():
         return mean_luma, sat_pct
 
     def detect_white_pixels(image, roi_mask=None, percentile=95):
+        """
+        image: RGB image as numpy array (H x W x 3)
+        roi_mask: optional boolean mask (H x W)
+        percentile: brightness percentile for adaptive threshold
+        Returns: (white_pixels, threshold)
+        """
         image = image.astype(np.float32) / 255.0
         gray = np.mean(image, axis=2)
+
         if roi_mask is not None:
+            roi_mask = roi_mask.astype(bool)
             roi_pixels = gray[roi_mask]
         else:
             roi_pixels = gray.flatten()
+
         if roi_pixels.size == 0:
-            return 0, 0, 1.0
+            return 0, 1.0
+
         roi_max = float(np.max(roi_pixels))
         if roi_max <= 1e-6:
-            return 0, int(roi_pixels.size), 1.0
+            return 0, 1.0
+
         roi_pixels = roi_pixels / roi_max
         threshold = float(np.percentile(roi_pixels, percentile))
         white_pixels = int(np.sum(roi_pixels > threshold))
-        total_pixels = int(len(roi_pixels))
-        color_pixels = int(max(total_pixels - white_pixels, 0))
-        return white_pixels, color_pixels, threshold
+
+        return white_pixels, threshold
 
     def _try_set_sensor_option(sensor, option_name, value):
         try:
@@ -364,8 +374,6 @@ def main():
         _try_set_sensor_option(sensor, rs.option.enable_auto_exposure, 0)
         _try_set_sensor_option(sensor, rs.option.exposure, int(camera_exposure))
         _try_set_sensor_option(sensor, rs.option.gain, int(camera_gain))
-        _try_set_sensor_option(sensor, rs.option.enable_auto_white_balance, 0)
-        _try_set_sensor_option(sensor, rs.option.white_balance, int(camera_white_balance))
         # D415 safety: force all active IR emitters off when the option is available.
         _try_set_sensor_option(sensor, rs.option.emitter_enabled, 0)
         _try_set_sensor_option(sensor, rs.option.laser_power, 0)
@@ -480,21 +488,37 @@ def main():
         exp = int(camera_exposure)
         gain = int(camera_gain)
 
-        # Stage 1: exposure-first alignment with strong clipping suppression
+        # Stage 1: hard specular rejection first (reduce exposure until clipping is controlled)
         for _ in range(TUNE_MAX_ITERS):
             mean_l, sat = _compute_button_luma_stats(frame)
+            if sat <= MAX_SAT_PCT:
+                break
+            exp = int(np.clip(exp * 0.75, EXPOSURE_MIN, EXPOSURE_MAX))
+            try:
+                sensor.set_option(rs.option.exposure, exp)
+                sensor.set_option(rs.option.gain, gain)
+                sensor.set_option(rs.option.enable_auto_exposure, 0)
+            except Exception:
+                set_alert("red", "Camera tune failed: cannot apply exposure")
+                return False
+            time.sleep(0.12)
+            frame, _ = capture_average_frame(min_frames=6, timeout_s=1.2)
+            if frame is None:
+                frame = get_latest_camera_frame()
+                if frame is None:
+                    break
 
-            # First priority: reduce clipped highlights (gray>=250) before any brightening.
+        # Stage 2: exposure alignment around target mean, but never if clipping returns
+        for _ in range(max(2, TUNE_MAX_ITERS // 2)):
+            mean_l, sat = _compute_button_luma_stats(frame)
             if sat > MAX_SAT_PCT:
-                exp = int(exp * 0.80)
+                exp = int(np.clip(exp * 0.8, EXPOSURE_MIN, EXPOSURE_MAX))
             elif mean_l > TARGET_LUMA_MEAN + 5:
-                exp = int(exp * 0.9)
-            elif mean_l < TARGET_LUMA_MEAN - 5:
-                exp = int(exp * 1.05)
+                exp = int(np.clip(exp * 0.9, EXPOSURE_MIN, EXPOSURE_MAX))
+            elif mean_l < TARGET_LUMA_MEAN - 5 and sat <= (MAX_SAT_PCT * 0.5):
+                exp = int(np.clip(exp * 1.05, EXPOSURE_MIN, EXPOSURE_MAX))
             else:
                 break
-
-            exp = int(np.clip(exp, EXPOSURE_MIN, EXPOSURE_MAX))
 
             try:
                 sensor.set_option(rs.option.exposure, exp)
@@ -504,14 +528,14 @@ def main():
                 set_alert("red", "Camera tune failed: cannot apply exposure")
                 return False
 
-            time.sleep(0.12)
-            frame, _ = capture_average_frame(min_frames=6, timeout_s=1.2)
+            time.sleep(0.10)
+            frame, _ = capture_average_frame(min_frames=6, timeout_s=1.0)
             if frame is None:
                 frame = get_latest_camera_frame()
                 if frame is None:
                     break
 
-        # Stage 2: gain-only fine tune (never brighten if highlights are clipping)
+        # Stage 3: gain-only fine tune (never brighten if highlights are clipping)
         for _ in range(max(2, TUNE_MAX_ITERS // 2)):
             mean_l, sat = _compute_button_luma_stats(frame)
 
@@ -546,7 +570,7 @@ def main():
         _, final_sat = _compute_button_luma_stats(frame)
         camera_settings_locked = True
         camera_tuned_once = True
-        set_alert("green", f"Camera tuned+locked exp={exp} gain={gain} wb={camera_white_balance} sat={final_sat:.2f}%")
+        set_alert("green", f"Camera tuned+locked exp={exp} gain={gain} sat={final_sat:.2f}%")
         return True
 
     def _manifest_write(row):
@@ -825,23 +849,16 @@ def main():
             return {
                 "roi": roi_norm,
                 "white_px": 0,
-                "color_px": 0,
-                "non_white_px": 0,
-                "white_to_color": 0.0,
                 "adaptive_white_thr": 1.0,
                 "luma_mean": 0.0,
                 "sat_pct": 0.0,
             }
         roi_bool = (local_mask > 0)
-        white_px, non_white_px, adaptive_thr = detect_white_pixels(crop, roi_mask=roi_bool, percentile=95)
-        ratio = float(white_px / max(non_white_px, 1))
+        white_px, adaptive_thr = detect_white_pixels(crop, roi_mask=roi_bool, percentile=95)
         luma_mean, sat_pct = compute_luma_stats(cv2.bitwise_and(crop, crop, mask=local_mask))
         return {
             "roi": roi_norm,
             "white_px": int(white_px),
-            "color_px": int(non_white_px),
-            "non_white_px": int(non_white_px),
-            "white_to_color": ratio,
             "adaptive_white_thr": float(adaptive_thr),
             "luma_mean": luma_mean,
             "sat_pct": sat_pct,
@@ -1193,13 +1210,13 @@ def main():
 
         verdict = "FAIL" if defect_found else "PASS"
         decision_logic = (
-            f"Enabled detectors -> contour={'ON' if contour_enabled else 'OFF'}, white_ratio={'ON' if white_enabled else 'OFF'}; "
+            f"Enabled detectors -> contour={'ON' if contour_enabled else 'OFF'}, white_px={'ON' if white_enabled else 'OFF'}; "
             f"contour gate: diff>{INSPECTION_DIFF_THRESHOLD}, area>{INSPECTION_MIN_DEFECT_AREA}, "
             f"bbox>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}; "
-            f"white gate: white_px_drop>{coating_gate_pct:.1f}%"
+            f"white gate: white_px_drop>{coating_gate_pct:.1f}% (white-count only)"
         )
         if contour_fail and white_fail:
-            failed_metric = f"contour+white_ratio:{','.join(ratio_fail_buttons)}"
+            failed_metric = f"contour+white_px_drop:{','.join(ratio_fail_buttons)}"
         elif white_fail:
             failed_metric = f"white_px_drop:{','.join(ratio_fail_buttons)}"
         elif contour_fail:
