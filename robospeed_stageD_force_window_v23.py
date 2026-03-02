@@ -1591,7 +1591,8 @@ def main():
     # Bottom-right logo (same anchor style as gui_test), enlarged 1.5x and nudged left/up
     if app_logo_path:
         try:
-            force_ax_x, force_ax_y, force_ax_w, _force_ax_h = 0.30, 0.25, 0.67, 0.65
+            force_ax_x, force_ax_y, force_ax_w = 0.30, 0.25, 0.67
+            _force_ax_h = force_ax_w * 9.0 / 16.0
             logo_w, logo_h = 0.297, 0.0432  # 1.5x current size while preserving aspect ratio
             logo_x = (force_ax_x + force_ax_w) - logo_w + (1.0 / 14.0) - ((3.0 / 25.4) / 14.0)
             logo_y = 0.01 + ((1.0 / 25.4) / 8.0)
