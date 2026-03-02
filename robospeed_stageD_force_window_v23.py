@@ -1215,7 +1215,7 @@ def main():
                 stabilized.append(btn)
         return stabilized
 
-    def run_basic_inspection(golden, cyc, run_id, cycle_num):
+    def run_basic_inspection(golden, cyc, run_id, cycle_num, use_temporal_gate=True):
         nonlocal locked_roi, button_rois, button_color_baselines, button_roi_locked
         g_src = golden
         c_src = cyc
@@ -1308,7 +1308,8 @@ def main():
                 gate_btn = float(button_coating_thresholds.get(btn, coating_gate_pct))
                 if ratio_drop_pct > gate_btn:
                     ratio_fail_buttons.append(btn)
-            ratio_fail_buttons = _apply_temporal_white_fail(ratio_fail_buttons)
+            if use_temporal_gate:
+                ratio_fail_buttons = _apply_temporal_white_fail(ratio_fail_buttons)
             white_fail = len(ratio_fail_buttons) > 0
 
         defect_found = contour_fail or white_fail
@@ -1318,7 +1319,7 @@ def main():
             f"Enabled detectors -> contour={'ON' if contour_enabled else 'OFF'}, white_px={'ON' if white_enabled else 'OFF'}; "
             f"contour gate: diff>{INSPECTION_DIFF_THRESHOLD}, area>{INSPECTION_MIN_DEFECT_AREA}, "
             f"bbox>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}; "
-            f"white gate: white_px_drop>per-button threshold + temporal {BUTTON_TEMPORAL_FAILS_REQUIRED}/{BUTTON_TEMPORAL_WINDOW}"
+            f"white gate: white_px_drop>per-button threshold; temporal={'ON' if use_temporal_gate else 'OFF'} ({BUTTON_TEMPORAL_FAILS_REQUIRED}/{BUTTON_TEMPORAL_WINDOW})"
         )
         if contour_fail and white_fail:
             failed_metric = f"contour+white_px_drop:{','.join(ratio_fail_buttons)}"
@@ -1474,7 +1475,7 @@ def main():
             _ensure_cycle_video(golden_frame, run_id)
             reason_code = "golden_initialized"
         elif golden_frame is not None:
-            verdict, score, _mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, frame, run_id, cycle_num)
+            verdict, score, _mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, frame, run_id, cycle_num, use_temporal_gate=True)
             _ensure_cycle_video(golden_frame, run_id)
             _append_cycle_video_frame(disp, cycle_num)
             msg = "inspection_done"
@@ -1638,7 +1639,7 @@ def main():
     manual_btn_gap = 0.004
 
     # Two-row manual/camera controls above camera pane
-    camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.176, 0.32, 0.65
+    camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.1205, 0.32, 0.65
     # Keep control rows aligned near the top edge of the force/camera panes
     force_ax_top = force_ax_y + force_ax_h
     row_step = (manual_btn_h + manual_btn_gap)
@@ -1678,7 +1679,7 @@ def main():
     panel_pad_y = 3.0 * px_y
 
     auto_panel_bottom = 0.25
-    auto_panel_top = camera_ax_y - 0.004
+    auto_panel_top = camera_ax_y - 0.004 + (8 * row_step)
     content_x = camera_ax_x + content_shift_x + panel_pad_x
 
     auto_msg_font = 8.8
@@ -2397,7 +2398,7 @@ def main():
             print(f"[GUI] Run Inspection skipped: {q_msg}")
             return
 
-        verdict, score, mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num)
+        verdict, score, mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num, use_temporal_gate=False)
         _ensure_cycle_video(golden_frame, run_id)
         _append_cycle_video_frame(disp, cyc_num)
         _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", "")})
