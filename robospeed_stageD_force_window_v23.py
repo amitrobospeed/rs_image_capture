@@ -397,6 +397,8 @@ def main():
         _try_set_sensor_option(sensor, rs.option.enable_auto_exposure, 0)
         _try_set_sensor_option(sensor, rs.option.exposure, int(camera_exposure))
         _try_set_sensor_option(sensor, rs.option.gain, int(camera_gain))
+        _try_set_sensor_option(sensor, rs.option.enable_auto_white_balance, 0)
+        _try_set_sensor_option(sensor, rs.option.white_balance, int(camera_white_balance))
         # D415 safety: force all active IR emitters off when the option is available.
         _try_set_sensor_option(sensor, rs.option.emitter_enabled, 0)
         _try_set_sensor_option(sensor, rs.option.laser_power, 0)
@@ -510,6 +512,41 @@ def main():
 
         exp = int(camera_exposure)
         gain = int(camera_gain)
+        wb = int(camera_white_balance)
+
+        # Stage 0: use RealSense auto controls to discover scene settings, then lock.
+        try:
+            sensor.set_option(rs.option.enable_auto_exposure, 1)
+        except Exception:
+            pass
+        try:
+            sensor.set_option(rs.option.enable_auto_white_balance, 1)
+        except Exception:
+            pass
+
+        for _ in range(8):
+            time.sleep(0.05)
+            _f, _n = capture_average_frame(min_frames=2, timeout_s=0.4)
+            if _f is not None:
+                frame = _f
+
+        try:
+            exp = int(np.clip(sensor.get_option(rs.option.exposure), EXPOSURE_MIN, EXPOSURE_MAX))
+        except Exception:
+            exp = int(np.clip(exp, EXPOSURE_MIN, EXPOSURE_MAX))
+        try:
+            gain = int(np.clip(sensor.get_option(rs.option.gain), GAIN_MIN, GAIN_MAX))
+        except Exception:
+            gain = int(np.clip(gain, GAIN_MIN, GAIN_MAX))
+        try:
+            wb = int(sensor.get_option(rs.option.white_balance))
+        except Exception:
+            wb = int(camera_white_balance)
+
+        camera_exposure = exp
+        camera_gain = gain
+        camera_white_balance = wb
+        _apply_locked_camera_settings(sensor)
 
         # Stage 1: hard specular rejection first (reduce exposure until clipping is controlled)
         for _ in range(TUNE_MAX_ITERS):
@@ -589,11 +626,12 @@ def main():
 
         camera_exposure = exp
         camera_gain = gain
+        camera_white_balance = wb
         _apply_locked_camera_settings(sensor)
         _, final_sat = _compute_button_luma_stats(frame)
         camera_settings_locked = True
         camera_tuned_once = True
-        set_alert("green", f"Camera tuned+locked exp={exp} gain={gain} sat={final_sat:.2f}%")
+        set_alert("green", f"Camera tuned+locked exp={exp} gain={gain} wb={wb} sat={final_sat:.2f}%")
         return True
 
     def _manifest_write(row):
@@ -1504,8 +1542,7 @@ def main():
                                  facecolor=COLOR_PANEL, edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-1))
 
     # Plot area (force + camera in same matplotlib window)
-    force_ax_x, force_ax_y, force_ax_w = 0.30, 0.25, 0.32
-    force_ax_h = force_ax_w * 9.0 / 16.0
+    force_ax_x, force_ax_y, force_ax_w, force_ax_h = 0.30, 0.25, 0.32, 0.65
     ax = fig.add_axes([force_ax_x, force_ax_y, force_ax_w, force_ax_h])
     ax.set_ylim(-0.2, max(2.0, state.force_max + 1.5))
     ax.set_ylabel("Force (lbs)", fontsize=22, color="white")
@@ -1597,11 +1634,11 @@ def main():
     manual_btn_gap = 0.004
 
     # Two-row manual/camera controls above camera pane
-    camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.40, 0.32, 0.50
-    # Keep control rows above force/camera top edge
+    camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.25, 0.32, 0.65
+    # Keep control rows aligned near the top edge of the force/camera panes
     force_ax_top = force_ax_y + force_ax_h
-    row2_y = force_ax_top + 0.004
-    row1_y = row2_y + manual_btn_h + manual_btn_gap
+    row1_y = force_ax_top - manual_btn_h
+    row2_y = row1_y - (manual_btn_h + manual_btn_gap)
     manual_btn_w = (camera_ax_w - (4 * manual_btn_gap)) / 5
 
     fig.text(camera_ax_x, row1_y + manual_btn_h + 0.006, "Manual IC / Camera", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
