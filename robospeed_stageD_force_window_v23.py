@@ -1557,7 +1557,7 @@ def main():
     (line,) = ax.plot([], [], linewidth=2.5, color="#0ea5e9")
 
     # Camera pane (same window as force graph)
-    ax_cam = fig.add_axes([0.65, 0.25, 0.32, 0.65])
+    ax_cam = fig.add_axes([0.65, 0.40, 0.32, 0.50])
     ax_cam.set_title("IC Camera", fontsize=20, color=COLOR_TEXT)
     ax_cam.set_xticks([])
     ax_cam.set_yticks([])
@@ -1586,7 +1586,8 @@ def main():
     # Bottom-right logo (same anchor style as gui_test), enlarged 1.5x and nudged left/up
     if app_logo_path:
         try:
-            force_ax_x, force_ax_y, force_ax_w, _force_ax_h = 0.30, 0.25, 0.67, 0.65
+            force_ax_x, force_ax_y, force_ax_w = 0.30, 0.25, 0.67
+            _force_ax_h = force_ax_w * 9.0 / 16.0
             logo_w, logo_h = 0.297, 0.0432  # 1.5x current size while preserving aspect ratio
             logo_x = (force_ax_x + force_ax_w) - logo_w + (1.0 / 14.0) - ((3.0 / 25.4) / 14.0)
             logo_y = 0.01 + ((1.0 / 25.4) / 8.0)
