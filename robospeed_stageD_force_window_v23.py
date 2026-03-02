@@ -1552,7 +1552,6 @@ def main():
     ax.set_ylim(-0.2, max(2.0, state.force_max + 1.5))
     ax.set_ylabel("Force (lbs)", fontsize=22, color="white")
     ax.set_xlabel("Time (s)", fontsize=16, color="white")
-    ax.set_title("Live Force (Last 10s)", fontsize=26, color=COLOR_TEXT)
     ax.set_facecolor("#f8fafc")
     ax.tick_params(axis='x', colors='white')
     ax.tick_params(axis='y', colors='white')
@@ -1562,8 +1561,7 @@ def main():
     (line,) = ax.plot([], [], linewidth=2.5, color="#0ea5e9")
 
     # Camera pane (same window as force graph)
-    ax_cam = fig.add_axes([0.65, 0.40, 0.32, 0.50])
-    ax_cam.set_title("IC Camera", fontsize=20, color=COLOR_TEXT)
+    ax_cam = fig.add_axes([0.65, 0.25, 0.32, 0.65])
     ax_cam.set_xticks([])
     ax_cam.set_yticks([])
     ax_cam.set_facecolor("#0b1220")
@@ -1571,10 +1569,12 @@ def main():
     camera_im = ax_cam.imshow(cam_placeholder)
 
     # Messages (no bbox), keep two-line spacing at ~1.5 lines
+    mm_to_fig_x = (1.0 / 25.4) / fig.get_figwidth()
+    mm_to_fig_y = (1.0 / 25.4) / fig.get_figheight()
     status_line_y = 0.095
     line_spacing_y = ((1.5 * 13.0) / 72.0) / 8.0  # 1.5 lines at 13pt on 8in figure
     fail_line_y = status_line_y - line_spacing_y
-    msg_text_x = 0.31
+    msg_text_x = 0.31 - (3.0 * mm_to_fig_x)
     status_line = fig.text(msg_text_x, status_line_y, "", fontsize=13, color=COLOR_TEXT)
     param_line  = fig.text(msg_text_x, fail_line_y, "", fontsize=13, color=COLOR_TEXT)
     fail_line_1 = fig.text(msg_text_x, fail_line_y, "", fontsize=11, color="#fbbf24")
@@ -1582,7 +1582,7 @@ def main():
 
     # status indicator: dedicated square axes keeps a true circle and aligns with status text line
     status_diameter = 0.03  # 1.5x previous 0.02 diameter
-    status_ax = fig.add_axes([0.282, status_line_y - 0.0063, status_diameter, status_diameter])
+    status_ax = fig.add_axes([0.282 - (3.0 * mm_to_fig_x), status_line_y - 0.0063, status_diameter, status_diameter])
     status_ax.set_aspect('equal')
     status_ax.axis('off')
     status_dot = Circle((0.5, 0.5), 0.45, transform=status_ax.transAxes, facecolor="gray", edgecolor="black")
@@ -1608,7 +1608,6 @@ def main():
     y_top = 0.875
     dy = 0.062
 
-    fig.text(0.0594, y_top + 0.063, "Run Controls", color="#e2e8f0", fontsize=12, weight="bold", zorder=5)
     fig.text(0.0594, y_top - 7.09*dy + 0.02, "Settings", color="#e2e8f0", fontsize=12, weight="bold", zorder=5)
 
     btn_start = Button(fig.add_axes([0.0594, y_top, 0.14, 0.05]), "Start", color="#22c55e", hovercolor="#16a34a")
@@ -1634,7 +1633,6 @@ def main():
     fmax_x = tb_x + force_box_w + force_box_gap
     tb_fmin = TextBox(fig.add_axes([fmin_x, force_row_y, force_box_w, 0.05]), "Force", initial=str(state.force_min))
     tb_fmax = TextBox(fig.add_axes([fmax_x, force_row_y, force_box_w, 0.05]), "", initial=str(state.force_max))
-    mm_to_fig_y = (1.0 / 25.4) / 8.0
     manual_btn_h = 0.033
     manual_btn_gap = 0.004
 
@@ -1679,7 +1677,7 @@ def main():
     panel_pad_y = 3.0 * px_y
 
     auto_panel_bottom = 0.25
-    auto_panel_top = camera_ax_y - 0.004 + (8 * row_step)
+    auto_panel_top = camera_ax_y - 0.004 + (8 * row_step) + (3.0 * mm_to_fig_y)
     content_x = camera_ax_x + content_shift_x + panel_pad_x
 
     auto_msg_font = 8.8
@@ -3105,7 +3103,6 @@ def main():
                 frame = get_latest_camera_frame()
                 if frame is not None:
                     camera_im.set_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                ax_cam.set_title(f"IC Camera ({camera_txt})", fontsize=20, color=COLOR_TEXT)
 
                 cam_lock_txt = "LOCKED" if camera_settings_locked else "UNLOCKED"
                 tare_txt = "Tare@Start:ON" if state.tare_on_start else "Tare@Start:OFF"
