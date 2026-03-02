@@ -79,6 +79,13 @@ INSPECTION_MIN_DEFECT_W = 3
 INSPECTION_MIN_DEFECT_H = 3
 INSPECTION_EDGE_IGNORE_PX = 2
 BUTTON_COATING_DEGRADATION_PCT_DEFAULT = 10.0
+BUTTON_TEMPORAL_WINDOW = 3
+BUTTON_TEMPORAL_FAILS_REQUIRED = 2
+SPECULAR_V_THRESH = 220
+SPECULAR_S_THRESH = 40
+SPECULAR_MAX_PCT_BASELINE = 12.0
+BASELINE_MIN_WHITE_PX = 50
+PER_BUTTON_COATING_THRESHOLDS_DEFAULT = {"A": BUTTON_COATING_DEGRADATION_PCT_DEFAULT, "B": BUTTON_COATING_DEGRADATION_PCT_DEFAULT, "C": BUTTON_COATING_DEGRADATION_PCT_DEFAULT, "D": BUTTON_COATING_DEGRADATION_PCT_DEFAULT}
 
 BUTTON_COLOR_RULES = {
     "A": {"name": "green",  "hsv": [((35, 40, 40), (90, 255, 255))]},
@@ -288,6 +295,7 @@ def main():
     golden_path = None
     last_capture_frame = None
     last_capture_path = None
+    last_capture_frames_used = 0
     inspection_records = []
     anomaly_stats = {
         "total_scored": 0,
@@ -303,6 +311,8 @@ def main():
     button_rois = {}
     button_color_baselines = {}
     button_roi_locked = False
+    button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
+    button_coating_thresholds = dict(PER_BUTTON_COATING_THRESHOLDS_DEFAULT)
 
     manifest_path = os.path.join(CAMERA_OUTPUT_DIR, "manifest.csv")
     reports_dir = os.path.join(CAMERA_OUTPUT_DIR, "reports")
@@ -334,34 +344,47 @@ def main():
         sat_pct = float(np.mean(gray >= 250) * 100.0)
         return mean_luma, sat_pct
 
-    def detect_white_pixels(image, roi_mask=None, percentile=95):
+    def detect_white_pixels(image, roi_mask=None, percentile=95, threshold_ref=None):
         """
-        image: RGB image as numpy array (H x W x 3)
+        image: RGB/BGR image as numpy array (H x W x 3)
         roi_mask: optional boolean mask (H x W)
         percentile: brightness percentile for adaptive threshold
-        Returns: (white_pixels, threshold)
+        threshold_ref: optional frozen threshold [0..1] from baseline
+        Returns: (white_pixels, threshold, specular_pct)
         """
-        image = image.astype(np.float32) / 255.0
-        gray = np.mean(image, axis=2)
+        image_u8 = image.astype(np.uint8, copy=False)
+        image_f = image_u8.astype(np.float32) / 255.0
+        gray = np.mean(image_f, axis=2)
+        hsv = cv2.cvtColor(image_u8, cv2.COLOR_BGR2HSV)
+        _, s_ch, v_ch = cv2.split(hsv)
+        spec_mask = (v_ch > SPECULAR_V_THRESH) & (s_ch < SPECULAR_S_THRESH)
 
         if roi_mask is not None:
             roi_mask = roi_mask.astype(bool)
-            roi_pixels = gray[roi_mask]
         else:
-            roi_pixels = gray.flatten()
+            roi_mask = np.ones(gray.shape, dtype=bool)
+
+        valid_mask = roi_mask & (~spec_mask)
+        roi_pixels = gray[valid_mask]
+        specular_roi_px = int(np.count_nonzero(roi_mask & spec_mask))
+        roi_total_px = int(np.count_nonzero(roi_mask))
+        specular_pct = float((specular_roi_px / max(roi_total_px, 1)) * 100.0)
 
         if roi_pixels.size == 0:
-            return 0, 1.0
+            return 0, 1.0, specular_pct
 
         roi_max = float(np.max(roi_pixels))
         if roi_max <= 1e-6:
-            return 0, 1.0
+            return 0, 1.0, specular_pct
 
         roi_pixels = roi_pixels / roi_max
-        threshold = float(np.percentile(roi_pixels, percentile))
+        if threshold_ref is None:
+            threshold = float(np.percentile(roi_pixels, percentile))
+        else:
+            threshold = float(np.clip(float(threshold_ref), 0.0, 1.0))
         white_pixels = int(np.sum(roi_pixels > threshold))
 
-        return white_pixels, threshold
+        return white_pixels, threshold, specular_pct
 
     def _try_set_sensor_option(sensor, option_name, value):
         try:
@@ -840,7 +863,7 @@ def main():
         x, y, w, h = _roi_bounds(_sanitize_roi(roi, frame.shape), frame.shape)
         return frame[y:y+h, x:x+w], (x, y, w, h)
 
-    def _compute_button_color_stats(frame, roi, button_name):
+    def _compute_button_color_stats(frame, roi, button_name, threshold_ref=None):
         roi_norm = _sanitize_roi(roi, frame.shape)
         mask_full, (x, y, w, h) = _roi_mask_from_spec(frame.shape, roi_norm)
         crop = frame[y:y+h, x:x+w]
@@ -852,9 +875,10 @@ def main():
                 "adaptive_white_thr": 1.0,
                 "luma_mean": 0.0,
                 "sat_pct": 0.0,
+                "specular_pct": 100.0,
             }
         roi_bool = (local_mask > 0)
-        white_px, adaptive_thr = detect_white_pixels(crop, roi_mask=roi_bool, percentile=95)
+        white_px, adaptive_thr, specular_pct = detect_white_pixels(crop, roi_mask=roi_bool, percentile=95, threshold_ref=threshold_ref)
         luma_mean, sat_pct = compute_luma_stats(cv2.bitwise_and(crop, crop, mask=local_mask))
         return {
             "roi": roi_norm,
@@ -862,6 +886,7 @@ def main():
             "adaptive_white_thr": float(adaptive_thr),
             "luma_mean": luma_mean,
             "sat_pct": sat_pct,
+            "specular_pct": specular_pct,
         }
 
     def _compute_button_luma_stats(frame):
@@ -878,7 +903,7 @@ def main():
         return float(np.mean(means)), float(max(sats))
 
     def _select_button_rois_and_calibrate(frame):
-        nonlocal button_rois, button_color_baselines, button_roi_locked, locked_roi, roi_locked
+        nonlocal button_rois, button_color_baselines, button_roi_locked, locked_roi, roi_locked, button_fail_history
         selected = dict(button_rois) if (button_roi_locked and button_rois) else {}
         shape_mode = "rect"
         start_pt = None
@@ -1050,6 +1075,19 @@ def main():
 
         button_rois = {b: _sanitize_roi(selected[b], frame.shape) for b in BUTTON_ORDER}
         button_color_baselines = {b: _compute_button_color_stats(frame, button_rois[b], b) for b in BUTTON_ORDER}
+        bad_baseline = []
+        for b, st in button_color_baselines.items():
+            if float(st.get("sat_pct", 100.0)) > MAX_SAT_PCT:
+                bad_baseline.append(f"{b}:clip")
+            if float(st.get("specular_pct", 100.0)) > SPECULAR_MAX_PCT_BASELINE:
+                bad_baseline.append(f"{b}:spec")
+            if int(st.get("white_px", 0)) < BASELINE_MIN_WHITE_PX:
+                bad_baseline.append(f"{b}:white")
+        if bad_baseline:
+            set_alert("orange", "Baseline quality low: recapture Golden")
+            print(f"[GUI] Baseline quality gate failed -> {bad_baseline}")
+            return False
+        button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
         button_roi_locked = True
 
         bounds = [_roi_bounds(r, frame.shape) for r in button_rois.values()]
@@ -1112,6 +1150,28 @@ def main():
             out_path = os.path.join(CAMERA_OUTPUT_DIR, out_name)
         ok = cv2.imwrite(out_path, frame)
         return ok, out_name, out_path
+
+    def _capture_quality_gate(frame, frames_used):
+        if frame is None:
+            return False, "frame_missing", "avg_no_camera_frame"
+        if int(frames_used) < int(CAPTURE_AVG_MIN_FRAMES):
+            return False, f"avg_frames_low:{frames_used}/{CAPTURE_AVG_MIN_FRAMES}", "avg_frames_low"
+        if not camera_settings_locked:
+            return False, "camera_not_locked", "camera_not_locked"
+        _mean_l, sat = _compute_button_luma_stats(frame)
+        if sat > MAX_SAT_PCT:
+            return False, f"clip_high:{sat:.2f}%>{MAX_SAT_PCT:.2f}%", "clipping_high"
+        return True, "ok", "ok"
+
+    def _apply_temporal_white_fail(raw_fail_buttons):
+        stabilized = []
+        raw_set = set(raw_fail_buttons)
+        for btn in BUTTON_ORDER:
+            hist = button_fail_history.setdefault(btn, deque(maxlen=BUTTON_TEMPORAL_WINDOW))
+            hist.append(btn in raw_set)
+            if sum(1 for v in hist if v) >= BUTTON_TEMPORAL_FAILS_REQUIRED:
+                stabilized.append(btn)
+        return stabilized
 
     def run_basic_inspection(golden, cyc, run_id, cycle_num):
         nonlocal locked_roi, button_rois, button_color_baselines, button_roi_locked
@@ -1192,7 +1252,8 @@ def main():
                 base = button_color_baselines.get(btn)
                 if not base:
                     continue
-                cur = _compute_button_color_stats(cyc, roi, btn)
+                thr_ref = float(base.get("adaptive_white_thr", 1.0))
+                cur = _compute_button_color_stats(cyc, roi, btn, threshold_ref=thr_ref)
                 base_white = float(base.get("white_px", 0.0))
                 cur_white = float(cur.get("white_px", 0.0))
                 white_drop = (base_white - cur_white) / max(base_white, 1e-6) if base_white > 0 else 0.0
@@ -1201,9 +1262,11 @@ def main():
                 if ratio_drop_pct >= worst_ratio_drop_pct:
                     worst_ratio_drop_pct = ratio_drop_pct
                     worst_ratio_btn = btn
-                ratio_detail[btn] = f"white_px {int(base_white)}->{int(cur_white)} drop={ratio_drop_pct:.1f}%"
-                if ratio_drop_pct > coating_gate_pct:
+                ratio_detail[btn] = f"white_px {int(base_white)}->{int(cur_white)} drop={ratio_drop_pct:.1f}% thr={button_coating_thresholds.get(btn, coating_gate_pct):.1f}"
+                gate_btn = float(button_coating_thresholds.get(btn, coating_gate_pct))
+                if ratio_drop_pct > gate_btn:
                     ratio_fail_buttons.append(btn)
+            ratio_fail_buttons = _apply_temporal_white_fail(ratio_fail_buttons)
             white_fail = len(ratio_fail_buttons) > 0
 
         defect_found = contour_fail or white_fail
@@ -1213,7 +1276,7 @@ def main():
             f"Enabled detectors -> contour={'ON' if contour_enabled else 'OFF'}, white_px={'ON' if white_enabled else 'OFF'}; "
             f"contour gate: diff>{INSPECTION_DIFF_THRESHOLD}, area>{INSPECTION_MIN_DEFECT_AREA}, "
             f"bbox>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}; "
-            f"white gate: white_px_drop>{coating_gate_pct:.1f}% (white-count only)"
+            f"white gate: white_px_drop>per-button threshold + temporal {BUTTON_TEMPORAL_FAILS_REQUIRED}/{BUTTON_TEMPORAL_WINDOW}"
         )
         if contour_fail and white_fail:
             failed_metric = f"contour+white_px_drop:{','.join(ratio_fail_buttons)}"
@@ -1281,7 +1344,7 @@ def main():
         return verdict, score_out, mask_path, anomaly_path, disp, decision_trace
 
     def _auto_capture_cycle(cycle_num):
-        nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path
+        nonlocal last_capture_frame, last_capture_path, last_capture_frames_used, golden_frame, golden_path
         run_id = state.test_name.strip() or "test_report"
         with state_lock:
             retries = max(0, int(state.auto_capture_retries))
@@ -1323,16 +1386,21 @@ def main():
 
         frame = None
         frames_used = 0
+        last_q_msg = ""
+        last_q_reason = "avg_no_camera_frame"
         for _ in range(retries + 1):
             frame, frames_used = capture_average_frame()
-            if frame is not None:
+            ok_q, q_msg, q_reason = _capture_quality_gate(frame, frames_used)
+            last_q_msg, last_q_reason = q_msg, q_reason
+            if ok_q:
                 break
             _recover_camera_preview()
             time.sleep(0.1)
+            frame = None
         if frame is None:
             with state_lock:
-                state.last_capture_result = f"cycle {cycle_num}: avg no frame ({frames_used}/{CAPTURE_AVG_MIN_FRAMES})"
-            _log_fail("no_camera_frame", "avg_no_camera_frame")
+                state.last_capture_result = f"cycle {cycle_num}: {last_q_msg}"
+            _log_fail(last_q_msg, last_q_reason)
             return False
 
         capture_type = "cyc"
@@ -1346,6 +1414,7 @@ def main():
 
         last_capture_frame = frame.copy()
         last_capture_path = out_path
+        last_capture_frames_used = int(frames_used)
 
         verdict = "WARN"
         score = ""
@@ -1811,7 +1880,7 @@ def main():
             print("[GUI] Start blocked: robot disconnected (visual inspection mode)")
             return
         nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
-        nonlocal button_rois, button_color_baselines, button_roi_locked
+        nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
         nonlocal auto_report_written_cycle
         with state_lock:
             state.running = False
@@ -1839,6 +1908,7 @@ def main():
         roi_locked = False
         button_rois = {}
         button_color_baselines = {}
+        button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
         button_roi_locked = False
         auto_report_written_cycle = -1
 
@@ -2132,7 +2202,7 @@ def main():
             set_alert("red", "IC checkpoint move failed. Check robot state")
 
     def on_image_capture(_evt):
-        nonlocal last_capture_frame, last_capture_path
+        nonlocal last_capture_frame, last_capture_path, last_capture_frames_used
         with state_lock:
             state.image_capture_count += 1
             capture_num = state.image_capture_count
@@ -2188,6 +2258,7 @@ def main():
 
         last_capture_frame = frame.copy()
         last_capture_path = out_path
+        last_capture_frames_used = int(frames_used)
         _manifest_write({
             "run_id": run_id,
             "cycle": capture_num,
@@ -2215,7 +2286,7 @@ def main():
             print(f"[GUI] Camera tuned and locked exp={camera_exposure} gain={camera_gain} wb={camera_white_balance}")
 
     def on_golden_capture(_evt):
-        nonlocal golden_frame, golden_path, locked_roi, roi_locked, button_rois, button_color_baselines, button_roi_locked
+        nonlocal golden_frame, golden_path, locked_roi, roi_locked, button_rois, button_color_baselines, button_roi_locked, button_fail_history
         frame, frames_used = capture_average_frame()
         if frame is None:
             set_alert("red", f"Golden Capture failed: averaged frame unavailable ({frames_used}/{CAPTURE_AVG_MIN_FRAMES})")
@@ -2241,12 +2312,13 @@ def main():
             roi_locked = False
             button_rois = {}
             button_color_baselines = {}
+            button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
             button_roi_locked = False
             set_alert("orange", "Golden saved but button ROIs not fully selected")
         print(f"[GUI] Golden saved -> {out_path}")
 
     def on_run_inspection(_evt):
-        nonlocal last_capture_frame
+        nonlocal last_capture_frame, last_capture_frames_used
         if golden_frame is None:
             set_alert("#7c3aed", "Run Inspection blocked: capture Golden first")
             print("[GUI] Run Inspection blocked: golden missing")
@@ -2261,6 +2333,12 @@ def main():
         if (not button_roi_locked and (not roi_locked or locked_roi is None)):
             set_alert("#7c3aed", "Run Inspection blocked: capture Golden + select ROI first")
             print("[GUI] Run Inspection blocked: ROI missing")
+            return
+
+        ok_q, q_msg, _q_reason = _capture_quality_gate(last_capture_frame, last_capture_frames_used)
+        if not ok_q:
+            set_alert("orange", f"Run Inspection skipped: {q_msg}. Recapture Image.")
+            print(f"[GUI] Run Inspection skipped: {q_msg}")
             return
 
         verdict, score, mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num)
@@ -2311,7 +2389,7 @@ def main():
 
     def on_reset(_evt):
         nonlocal golden_frame, golden_path, last_capture_frame, last_capture_path, locked_roi, roi_locked
-        nonlocal button_rois, button_color_baselines, button_roi_locked
+        nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
         nonlocal cycle_video_writer, cycle_video_path, cycle_video_started, auto_report_written_cycle
         with state_lock:
             state.force_out_of_range = {"A": 0, "B": 0, "C": 0, "D": 0}
