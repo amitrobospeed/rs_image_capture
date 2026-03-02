@@ -286,6 +286,7 @@ def main():
     # session-level camera settings lock
     camera_exposure = 4500
     camera_gain = 8
+    camera_white_balance = 4600
     camera_settings_locked = False
     camera_tuned_once = False
 
@@ -495,7 +496,7 @@ def main():
         return np.clip(avg, 0, 255).astype(np.uint8), len(frames)
 
     def run_camera_auto_tune():
-        nonlocal camera_exposure, camera_gain, camera_settings_locked, camera_tuned_once
+        nonlocal camera_exposure, camera_gain, camera_white_balance, camera_settings_locked, camera_tuned_once
         with camera_hw_lock:
             sensor = camera_sensor
         if sensor is None:
@@ -2282,7 +2283,7 @@ def main():
     def on_camera_tune(_evt):
         ok = run_camera_auto_tune()
         if ok:
-            print(f"[GUI] Camera tuned and locked exp={camera_exposure} gain={camera_gain}")
+            print(f"[GUI] Camera tuned and locked exp={camera_exposure} gain={camera_gain} wb={camera_white_balance}")
 
     def on_golden_capture(_evt):
         nonlocal golden_frame, golden_path, locked_roi, roi_locked, button_rois, button_color_baselines, button_roi_locked, button_fail_history
