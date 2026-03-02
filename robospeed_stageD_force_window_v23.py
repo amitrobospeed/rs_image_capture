@@ -2596,10 +2596,9 @@ def main():
             anomaly_fig.text(0.06, y, stats_txt, fontsize=9)
             y -= 0.06
             if inspection_records:
-                head = "Cycle | Type | Verdict | Metric | FailedBtn | A% | B% | C% | D% | Reason"
-                anomaly_fig.text(0.06, y, head, fontsize=10.5, weight="bold")
-                y -= 0.03
-                for rec in inspection_records[-28:]:
+                table_cols = ["Cycle", "Type", "Verdict", "Metric", "FailedBtn", "A%", "B%", "C%", "D%", "Reason"]
+                table_rows = []
+                for rec in inspection_records[-20:]:
                     try:
                         score_txt = f"{float(rec.get('score', '')):.2f}"
                     except Exception:
@@ -2616,25 +2615,58 @@ def main():
                                 drops[k] = f"{float(v):.2f}"
                             except Exception:
                                 drops[k] = v.strip()
-                    failed_btn = str(rec.get("white_ratio_button", "") or "")
-                    if not failed_btn:
-                        fm = str(rec.get("failed_metric", "") or "")
-                        if ":" in fm:
-                            failed_btn = fm.split(":", 1)[1]
+                    verdict_txt = str(rec.get("verdict", "") or "")
+                    failed_btn = "-"
+                    if verdict_txt.upper() == "FAIL":
+                        failed_btn = str(rec.get("white_ratio_button", "") or "")
+                        if not failed_btn:
+                            fm = str(rec.get("failed_metric", "") or "")
+                            if ":" in fm:
+                                failed_btn = fm.split(":", 1)[1].strip()
+                        failed_btn = failed_btn or "-"
                     metric_name = rec.get("score_role", "inspection_metric")
-                    line_txt = (
-                        f"{rec.get('cycle','')} | {rec.get('capture_type','')} | {rec.get('verdict','')} | "
-                        f"{metric_name}:{score_txt} | {failed_btn or '-'} | "
-                        f"{drops['A']} | {drops['B']} | {drops['C']} | {drops['D']} | "
-                        f"{rec.get('reason_code', rec.get('message',''))}"
-                    )
-                    anomaly_fig.text(0.06, y, line_txt, fontsize=8.3)
-                    y -= 0.024
-                    if y < 0.08:
-                        break
+                    table_rows.append([
+                        str(rec.get("cycle", "")),
+                        str(rec.get("capture_type", "")),
+                        verdict_txt,
+                        f"{metric_name}:{score_txt}",
+                        failed_btn,
+                        drops["A"],
+                        drops["B"],
+                        drops["C"],
+                        drops["D"],
+                        str(rec.get("reason_code", rec.get("message", "")) or ""),
+                    ])
+
+                anomaly_fig.text(0.06, y, "Inspection Snapshot (latest 20)", fontsize=11, weight="bold")
+                table_top = y - 0.01
+                table_height = 0.44
+                table_bottom = table_top - table_height
+                table_ax = anomaly_fig.add_axes([0.05, table_bottom, 0.90, table_height])
+                table_ax.axis("off")
+                col_widths = [0.06, 0.07, 0.08, 0.15, 0.08, 0.05, 0.05, 0.05, 0.05, 0.22]
+                inspection_table = table_ax.table(
+                    cellText=table_rows,
+                    colLabels=table_cols,
+                    colWidths=col_widths,
+                    cellLoc="center",
+                    loc="upper left",
+                )
+                inspection_table.auto_set_font_size(False)
+                inspection_table.set_fontsize(7.2)
+                inspection_table.scale(1, 1.20)
+
+                for (row_idx, col_idx), cell in inspection_table.get_celld().items():
+                    if row_idx == 0:
+                        cell.set_facecolor("#e2e8f0")
+                        cell.set_text_props(weight="bold", color="#0f172a")
+                    elif row_idx % 2 == 0:
+                        cell.set_facecolor("#f8fafc")
+
+                y = table_bottom - 0.03
                 fail_rows = [r for r in inspection_records if str(r.get("verdict", "")).upper() == "FAIL"]
                 if fail_rows:
-                    y = max(0.30, y - 0.01)
+                    y = max(0.18, y)
                     anomaly_fig.text(0.06, y, "FAIL Explainability (per inspection decision)", fontsize=11, weight="bold")
                     y -= 0.03
                     anomaly_fig.text(0.06, y, "Legend: Red = metric that triggered FAIL", fontsize=9, color="red")
