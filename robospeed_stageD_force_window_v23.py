@@ -243,6 +243,7 @@ class SystemState:
     detect_contour_enabled: bool = False
     detect_white_ratio_enabled: bool = True
     coating_degradation_pct: float = BUTTON_COATING_DEGRADATION_PCT_DEFAULT
+    baseline_quality_enabled: bool = True
 
 
 def main():
@@ -1113,14 +1114,17 @@ def main():
 
         button_rois = {b: _sanitize_roi(selected[b], frame.shape) for b in BUTTON_ORDER}
         button_color_baselines = {b: _compute_button_color_stats(frame, button_rois[b], b) for b in BUTTON_ORDER}
+        with state_lock:
+            baseline_gate_on = bool(state.baseline_quality_enabled)
         bad_baseline = []
-        for b, st in button_color_baselines.items():
-            if float(st.get("sat_pct", 100.0)) > MAX_SAT_PCT:
-                bad_baseline.append(f"{b}:clip")
-            if float(st.get("specular_pct", 100.0)) > SPECULAR_MAX_PCT_BASELINE:
-                bad_baseline.append(f"{b}:spec")
-            if int(st.get("white_px", 0)) < BASELINE_MIN_WHITE_PX:
-                bad_baseline.append(f"{b}:white")
+        if baseline_gate_on:
+            for b, st in button_color_baselines.items():
+                if float(st.get("sat_pct", 100.0)) > MAX_SAT_PCT:
+                    bad_baseline.append(f"{b}:clip")
+                if float(st.get("specular_pct", 100.0)) > SPECULAR_MAX_PCT_BASELINE:
+                    bad_baseline.append(f"{b}:spec")
+                if int(st.get("white_px", 0)) < BASELINE_MIN_WHITE_PX:
+                    bad_baseline.append(f"{b}:white")
         if bad_baseline:
             set_alert("orange", "Baseline quality low: recapture Golden")
             print(f"[GUI] Baseline quality gate failed -> {bad_baseline}")
@@ -1634,11 +1638,12 @@ def main():
     manual_btn_gap = 0.004
 
     # Two-row manual/camera controls above camera pane
-    camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.25, 0.32, 0.65
+    camera_ax_x, camera_ax_y, camera_ax_w, camera_ax_h = 0.65, 0.176, 0.32, 0.65
     # Keep control rows aligned near the top edge of the force/camera panes
     force_ax_top = force_ax_y + force_ax_h
-    row1_y = force_ax_top - manual_btn_h
-    row2_y = row1_y - (manual_btn_h + manual_btn_gap)
+    row_step = (manual_btn_h + manual_btn_gap)
+    row1_y = force_ax_top - manual_btn_h + row_step
+    row2_y = row1_y - row_step
     manual_btn_w = (camera_ax_w - (4 * manual_btn_gap)) / 5
 
     fig.text(camera_ax_x, row1_y + manual_btn_h + 0.006, "Manual IC / Camera", color="#e2e8f0", fontsize=11, weight="bold", zorder=5)
@@ -1663,6 +1668,7 @@ def main():
     btn_detect_white = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "WhiteRatio: ON", color="#166534", hovercolor="#15803d")
     btn_lock_roi = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "Lock ROI", color="#0f766e", hovercolor="#115e59")
     btn_coating_gate = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "Coating degr%:10", color="#334155", hovercolor="#1f2937")
+    btn_baseline_q = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "BaselineQ: ON", color="#166534", hovercolor="#15803d")
 
     # Auto-capture settings/status panel
     px_x = 1.0 / (fig.get_figwidth() * fig.dpi)
@@ -1672,7 +1678,7 @@ def main():
     panel_pad_y = 3.0 * px_y
 
     auto_panel_bottom = 0.25
-    auto_panel_top = camera_ax_y - 0.01
+    auto_panel_top = camera_ax_y - 0.004
     content_x = camera_ax_x + content_shift_x + panel_pad_x
 
     auto_msg_font = 8.8
@@ -1708,9 +1714,9 @@ def main():
                                  transform=fig.transFigure, facecolor="#0b1220", edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-0.5))
 
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap, btn_fail_policy,
-                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate]:
+                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
@@ -1856,6 +1862,13 @@ def main():
         return True
 
     # ✅ KEY FIX: apply current TextBox values on Start (even if on_submit didn't fire)
+
+    def update_baseline_quality_button():
+        with state_lock:
+            on = bool(state.baseline_quality_enabled)
+        btn_baseline_q.label.set_text("BaselineQ: ON" if on else "BaselineQ: OFF")
+        btn_baseline_q.ax.set_facecolor("#166534" if on else "#7f1d1d")
+
     def apply_textbox_values():
         def _parse_int(text, fallback):
             try:
@@ -2187,6 +2200,12 @@ def main():
             gate = state.coating_degradation_pct
         update_coating_gate_button()
         set_alert("#334155", f"Coating degradation gate set to {gate:.0f}%")
+
+
+    def on_toggle_baseline_quality(_evt):
+        with state_lock:
+            state.baseline_quality_enabled = not bool(state.baseline_quality_enabled)
+        update_baseline_quality_button()
 
     def on_lock_roi(_evt):
         nonlocal golden_frame, button_rois, button_color_baselines, button_roi_locked
@@ -2719,6 +2738,7 @@ def main():
     btn_detect_white.on_clicked(on_toggle_detect_white)
     btn_lock_roi.on_clicked(on_lock_roi)
     btn_coating_gate.on_clicked(on_toggle_coating_gate)
+    btn_baseline_q.on_clicked(on_toggle_baseline_quality)
     btn_ic_home.on_clicked(on_ic_home)
     btn_return_test.on_clicked(on_return_to_test)
     btn_camera_tune.on_clicked(on_camera_tune)
@@ -2734,6 +2754,7 @@ def main():
     update_fail_policy_button()
     update_detector_buttons()
     update_coating_gate_button()
+    update_baseline_quality_button()
 
     # TextBox callbacks (kept, but now also locked)
     def on_vel_submit(text):
@@ -3098,7 +3119,8 @@ def main():
                 auto_status_1.set_text(f"Camera: {camera_txt} / {cam_lock_txt}")
                 auto_status_2.set_text(f"AutoCap: {sched_txt} every={state.capture_every_x_cycles} next={next_cap} retries={state.auto_capture_retries}")
                 auto_status_3.set_text(f"Golden ready: {gold_txt}")
-                auto_status_4.set_text(f"{roi_txt} | FailPolicy: {fail_pol} | CoatGate:{state.coating_degradation_pct:.0f}%")
+                bq = "ON" if state.baseline_quality_enabled else "OFF"
+                auto_status_4.set_text(f"{roi_txt} | FailPolicy: {fail_pol} | CoatGate:{state.coating_degradation_pct:.0f}% | BaseQ:{bq}")
                 auto_status_5.set_text(f"Inspection/Capture: {state.last_capture_result}")
                 param_line.set_text("")
                 fail_line_1.set_text(
