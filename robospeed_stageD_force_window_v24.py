@@ -551,90 +551,10 @@ def main():
         camera_white_balance = wb
         _apply_locked_camera_settings(sensor)
 
-        # Stage 1: hard specular rejection first (reduce exposure until clipping is controlled)
-        for _ in range(TUNE_MAX_ITERS):
-            mean_l, sat = _compute_button_luma_stats(frame)
-            if sat <= MAX_SAT_PCT:
-                break
-            exp = int(np.clip(exp * 0.75, EXPOSURE_MIN, EXPOSURE_MAX))
-            try:
-                sensor.set_option(rs.option.exposure, exp)
-                sensor.set_option(rs.option.gain, gain)
-                sensor.set_option(rs.option.enable_auto_exposure, 0)
-            except Exception:
-                set_alert("red", "Camera tune failed: cannot apply exposure")
-                return False
-            time.sleep(0.12)
-            frame, _ = capture_average_frame(min_frames=6, timeout_s=1.2)
-            if frame is None:
-                frame = get_latest_camera_frame()
-                if frame is None:
-                    break
-
-        # Stage 2: exposure alignment around target mean, but never if clipping returns
-        for _ in range(max(2, TUNE_MAX_ITERS // 2)):
-            mean_l, sat = _compute_button_luma_stats(frame)
-            if sat > MAX_SAT_PCT:
-                exp = int(np.clip(exp * 0.8, EXPOSURE_MIN, EXPOSURE_MAX))
-            elif mean_l > TARGET_LUMA_MEAN + 5:
-                exp = int(np.clip(exp * 0.9, EXPOSURE_MIN, EXPOSURE_MAX))
-            elif mean_l < TARGET_LUMA_MEAN - 5 and sat <= (MAX_SAT_PCT * 0.5):
-                exp = int(np.clip(exp * 1.05, EXPOSURE_MIN, EXPOSURE_MAX))
-            else:
-                break
-
-            try:
-                sensor.set_option(rs.option.exposure, exp)
-                sensor.set_option(rs.option.gain, gain)
-                sensor.set_option(rs.option.enable_auto_exposure, 0)
-            except Exception:
-                set_alert("red", "Camera tune failed: cannot apply exposure")
-                return False
-
-            time.sleep(0.10)
-            frame, _ = capture_average_frame(min_frames=6, timeout_s=1.0)
-            if frame is None:
-                frame = get_latest_camera_frame()
-                if frame is None:
-                    break
-
-        # Stage 3: gain-only fine tune (never brighten if highlights are clipping)
-        for _ in range(max(2, TUNE_MAX_ITERS // 2)):
-            mean_l, sat = _compute_button_luma_stats(frame)
-
-            if sat > MAX_SAT_PCT:
-                gain = int(gain * 0.85)
-            elif mean_l > TARGET_LUMA_MEAN + 3:
-                gain = int(gain * 0.9)
-            elif mean_l < TARGET_LUMA_MEAN - 3 and sat <= (MAX_SAT_PCT * 0.5):
-                gain = int(gain * 1.08)
-            else:
-                break
-
-            gain = int(np.clip(gain, GAIN_MIN, GAIN_MAX))
-
-            try:
-                sensor.set_option(rs.option.gain, gain)
-                sensor.set_option(rs.option.enable_auto_exposure, 0)
-            except Exception:
-                set_alert("red", "Camera tune failed: cannot apply gain")
-                return False
-
-            time.sleep(0.10)
-            frame, _ = capture_average_frame(min_frames=6, timeout_s=1.0)
-            if frame is None:
-                frame = get_latest_camera_frame()
-                if frame is None:
-                    break
-
-        camera_exposure = exp
-        camera_gain = gain
-        camera_white_balance = wb
-        _apply_locked_camera_settings(sensor)
         _, final_sat = _compute_button_luma_stats(frame)
         camera_settings_locked = True
         camera_tuned_once = True
-        set_alert("green", f"Camera tuned+locked exp={exp} gain={gain} wb={wb} sat={final_sat:.2f}%")
+        set_alert("green", f"Camera tuned+locked (Stage0 only) exp={exp} gain={gain} wb={wb} sat={final_sat:.2f}%")
         return True
 
     def _manifest_write(row):
@@ -1720,10 +1640,25 @@ def main():
     fig.patches.append(Rectangle((panel_x, panel_y), panel_w, panel_h,
                                  transform=fig.transFigure, facecolor="#0b1220", edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-0.5))
 
+    # Golden reuse popup (hidden by default)
+    popup_active = False
+    popup_bg = Rectangle((0.37, 0.40), 0.28, 0.20, transform=fig.transFigure,
+                         facecolor="#111827", edgecolor="#94a3b8", linewidth=1.2, zorder=20)
+    popup_bg.set_visible(False)
+    fig.patches.append(popup_bg)
+    popup_title = fig.text(0.385, 0.565, "Golden/ROI already ready", fontsize=11, color="#e5e7eb", zorder=21)
+    popup_title.set_visible(False)
+    popup_msg = fig.text(0.385, 0.525, "Capture Golden again for this test?", fontsize=10, color="#cbd5e1", zorder=21)
+    popup_msg.set_visible(False)
+    btn_popup_recapture = Button(fig.add_axes([0.39, 0.445, 0.12, 0.05]), "Re-capture", color="#d97706", hovercolor="#b45309")
+    btn_popup_reuse = Button(fig.add_axes([0.52, 0.445, 0.11, 0.05]), "Reuse", color="#166534", hovercolor="#15803d")
+    btn_popup_recapture.ax.set_visible(False)
+    btn_popup_reuse.ax.set_visible(False)
+
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap, btn_fail_policy,
-                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q]:
+                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_popup_recapture, btn_popup_reuse]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_popup_recapture, btn_popup_reuse, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
@@ -1743,6 +1678,26 @@ def main():
             state.alert_color = color
             state.alert_msg = msg
             state.alert_until_wall = time.time() + ALERT_FLASH_S
+
+    def show_golden_reuse_popup():
+        nonlocal popup_active
+        popup_active = True
+        popup_bg.set_visible(True)
+        popup_title.set_visible(True)
+        popup_msg.set_visible(True)
+        btn_popup_recapture.ax.set_visible(True)
+        btn_popup_reuse.ax.set_visible(True)
+        fig.canvas.draw_idle()
+
+    def hide_golden_reuse_popup():
+        nonlocal popup_active
+        popup_active = False
+        popup_bg.set_visible(False)
+        popup_title.set_visible(False)
+        popup_msg.set_visible(False)
+        btn_popup_recapture.ax.set_visible(False)
+        btn_popup_reuse.ax.set_visible(False)
+        fig.canvas.draw_idle()
 
     def update_tare_toggle_button():
         with state_lock:
@@ -1953,38 +1908,24 @@ def main():
 
 
     def on_start(_evt):
-        nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
-        nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
-        nonlocal auto_report_written_cycle
-
+        if popup_active:
+            return
         apply_textbox_values()
 
-        reuse_existing_golden = False
         has_prev_golden = False
         with state_lock:
             has_prev_golden = bool(state.stopped and state.golden_ready)
         has_prev_golden = has_prev_golden and (golden_frame is not None) and (button_roi_locked or (roi_locked and locked_roi is not None))
         if has_prev_golden:
-            try:
-                ans = input("[Operator Prompt] Golden/ROI already ready from previous test. Capture new golden? [y/N]: ").strip().lower()
-            except Exception:
-                ans = "n"
-            if ans in ("y", "yes"):
-                with state_lock:
-                    state.running = False
-                    state.paused = True
-                    state.stopped = False
-                    state.manual_mode_active = True
-                    state.manual_intervention_requested = False
-                    state.last_capture_result = "awaiting_new_golden"
-                ok_ckpt = go_ic_home_checkpoint()
-                if ok_ckpt:
-                    set_alert("#d97706", "Capture new Golden now (manual mode at IC checkpoint)")
-                else:
-                    set_alert("red", "Could not reach IC checkpoint for new Golden capture")
-                print("[GUI] Start paused for operator golden recapture decision")
-                return
-            reuse_existing_golden = True
+            show_golden_reuse_popup()
+            set_alert("#0ea5e9", "Golden prompt: choose Re-capture or Reuse")
+            return
+        _start_test_sequence(reuse_existing_golden=False)
+
+    def _start_test_sequence(reuse_existing_golden=False):
+        nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
+        nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
+        nonlocal auto_report_written_cycle
 
         if not robot_connected:
             with state_lock:
@@ -1995,6 +1936,7 @@ def main():
             set_alert("#d97706", "Robot disconnected: visual inspection mode only")
             print("[GUI] Start blocked: robot disconnected (visual inspection mode)")
             return
+
         with state_lock:
             state.running = False
             state.paused = True
@@ -2152,6 +2094,26 @@ def main():
             if state.capture_every_x_cycles > 0:
                 state.next_auto_capture_cycle = state.capture_every_x_cycles
         set_alert("green", "At Home. Starting cycle test")
+
+    def on_popup_recapture(_evt):
+        hide_golden_reuse_popup()
+        with state_lock:
+            state.running = False
+            state.paused = True
+            state.stopped = False
+            state.manual_mode_active = True
+            state.manual_intervention_requested = False
+            state.last_capture_result = "awaiting_new_golden"
+        ok_ckpt = go_ic_home_checkpoint()
+        if ok_ckpt:
+            set_alert("#d97706", "Capture new Golden now (manual mode at IC checkpoint)")
+        else:
+            set_alert("red", "Could not reach IC checkpoint for new Golden capture")
+        print("[GUI] Start paused for operator golden recapture decision")
+
+    def on_popup_reuse(_evt):
+        hide_golden_reuse_popup()
+        _start_test_sequence(reuse_existing_golden=True)
 
     def on_pause(_evt):
         with state_lock:
@@ -2870,6 +2832,8 @@ def main():
     btn_reset.on_clicked(on_reset)
     btn_report.on_clicked(on_download_report)
     btn_exit.on_clicked(on_exit)
+    btn_popup_recapture.on_clicked(on_popup_recapture)
+    btn_popup_reuse.on_clicked(on_popup_reuse)
 
     update_tare_toggle_button()
     update_auto_cap_button()
