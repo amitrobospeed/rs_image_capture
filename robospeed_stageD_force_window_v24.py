@@ -335,6 +335,7 @@ def main():
     vi_capture_idx = 0
     vi_results = []
     vi_report_path = None
+    vi_status_text = ""
 
     for _d in [
         os.path.join(CAMERA_OUTPUT_DIR, "golden"),
@@ -1955,7 +1956,7 @@ def main():
         nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
         nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
         nonlocal auto_report_written_cycle
-        nonlocal vi_running, vi_results, vi_capture_idx, vi_report_path, vi_next_capture_wall, vi_end_wall
+        nonlocal vi_running, vi_results, vi_capture_idx, vi_report_path, vi_next_capture_wall, vi_end_wall, vi_status_text
 
         if not robot_connected:
             with state_lock:
@@ -2004,6 +2005,7 @@ def main():
         vi_report_path = None
         vi_next_capture_wall = 0.0
         vi_end_wall = 0.0
+        vi_status_text = ""
 
         print("[GUI] Start pressed -> Going Home before cycle start")
         go_home()
@@ -2615,7 +2617,7 @@ def main():
         return True
 
     def _begin_vi_session():
-        nonlocal vi_running, vi_next_capture_wall, vi_end_wall, vi_capture_idx, vi_results, vi_report_path, vi_interval_min, vi_total_min
+        nonlocal vi_running, vi_next_capture_wall, vi_end_wall, vi_capture_idx, vi_results, vi_report_path, vi_interval_min, vi_total_min, vi_status_text
         now = time.time()
         vi_running = True
         vi_capture_idx = 0
@@ -2629,6 +2631,7 @@ def main():
             build_vi_report_pdf(vi_report_path)
         except Exception as exc:
             print(f"[VI] initial report build failed: {exc}")
+        vi_status_text = f"VI in progress | next capture in {vi_interval_min:.2f} min"
         set_alert("#0ea5e9", f"VI started: every {vi_interval_min:g} min for {vi_total_min:g} min")
 
     def on_start_vi(_evt):
@@ -2664,11 +2667,12 @@ def main():
         _begin_vi_session()
 
     def on_stop_vi(_evt):
-        nonlocal vi_running
+        nonlocal vi_running, vi_status_text
         if not vi_running:
             set_alert("#475569", "VI is not running")
             return
         vi_running = False
+        vi_status_text = "VI stopped"
         set_alert("#475569", "VI stopped")
 
     def on_return_to_test(_evt):
@@ -2721,7 +2725,7 @@ def main():
         nonlocal golden_frame, golden_path, last_capture_frame, last_capture_path, locked_roi, roi_locked
         nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
         nonlocal cycle_video_writer, cycle_video_path, cycle_video_started, auto_report_written_cycle
-        nonlocal vi_running, vi_results, vi_capture_idx, vi_report_path, vi_next_capture_wall, vi_end_wall
+        nonlocal vi_running, vi_results, vi_capture_idx, vi_report_path, vi_next_capture_wall, vi_end_wall, vi_status_text
         with state_lock:
             state.force_out_of_range = {"A": 0, "B": 0, "C": 0, "D": 0}
             state.button_did_not_retract = {"A": 0, "B": 0, "C": 0, "D": 0}
@@ -2760,6 +2764,7 @@ def main():
         vi_report_path = None
         vi_next_capture_wall = 0.0
         vi_end_wall = 0.0
+        vi_status_text = ""
         _recover_camera_preview()
         with state_lock:
             state.golden_ready = False
@@ -3395,15 +3400,20 @@ def main():
             # VI scheduler (independent of robot connection)
             if vi_running:
                 now_wall = time.time()
+                next_min = max(0.0, (vi_next_capture_wall - now_wall) / 60.0)
+                rem_min = max(0.0, (vi_end_wall - now_wall) / 60.0)
+                vi_status_text = f"VI in progress | next capture in {next_min:.2f} min | remaining {rem_min:.2f} min"
                 if now_wall >= vi_end_wall:
                     vi_running = False
-                    set_alert("#475569", "VI completed")
+                    vi_status_text = "VI done"
+                    set_alert("#475569", "VI done")
                 elif now_wall >= vi_next_capture_wall:
                     vi_capture_idx += 1
                     ok_vi = _vi_capture_and_inspect(vi_capture_idx)
                     vi_next_capture_wall = now_wall + max(1e-6, vi_interval_min * 60.0)
                     if not ok_vi:
                         vi_running = False
+                        vi_status_text = "VI stopped: capture/inspection failure"
                         set_alert("red", "VI stopped due to capture/inspection failure")
 
             # UI text / alerts
@@ -3454,7 +3464,10 @@ def main():
                 auto_status_3.set_text(f"Golden ready: {gold_txt}")
                 bq = "ON" if state.baseline_quality_enabled else "OFF"
                 auto_status_4.set_text(f"{roi_txt} | FailPolicy: {fail_pol} | CoatGate:{state.coating_degradation_pct:.0f}% | BaseQ:{bq}")
-                auto_status_5.set_text(f"Inspection/Capture: {state.last_capture_result}")
+                vi_line = vi_status_text.strip()
+                if vi_running and vi_line == "":
+                    vi_line = "VI in progress"
+                auto_status_5.set_text(f"Inspection/Capture: {state.last_capture_result}" + (f" | {vi_line}" if vi_line else ""))
                 param_line.set_text("")
                 fail_line_1.set_text(
                     f"Force out of range  A:{state.force_out_of_range['A']}  B:{state.force_out_of_range['B']}  C:{state.force_out_of_range['C']}  D:{state.force_out_of_range['D']} | "
