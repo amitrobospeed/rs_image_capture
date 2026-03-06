@@ -312,6 +312,7 @@ def main():
     locked_roi = None
     roi_locked = False
     button_rois = {}
+    area_l_roi = None
     button_color_baselines = {}
     button_roi_locked = False
     button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
@@ -875,7 +876,7 @@ def main():
         return float(np.mean(means)), float(max(sats))
 
     def _select_button_rois_and_calibrate(frame):
-        nonlocal button_rois, button_color_baselines, button_roi_locked, locked_roi, roi_locked, button_fail_history
+        nonlocal button_rois, area_l_roi, button_color_baselines, button_roi_locked, locked_roi, roi_locked, button_fail_history
         selected = dict(button_rois) if (button_roi_locked and button_rois) else {}
         shape_mode = "rect"
         start_pt = None
@@ -884,7 +885,8 @@ def main():
         working_roi = None
         actions = {}
         current_idx = 0
-        status_msg = "Draw ROI then Next; Draw all four then Lock All"
+        roi_targets = BUTTON_ORDER + ["L"]
+        status_msg = "Draw ROI then Next; Draw A,B,C,D and L then Lock All"
 
         def _is_valid_roi(roi):
             if not roi:
@@ -900,7 +902,7 @@ def main():
             return False
 
         def _target_btn():
-            return BUTTON_ORDER[current_idx]
+            return roi_targets[current_idx]
 
         def _draw_buttons(canvas):
             nonlocal actions
@@ -955,7 +957,7 @@ def main():
             nonlocal status_msg
             if _is_valid_roi(working_roi):
                 _commit_current_btn()
-            missing = [b for b in BUTTON_ORDER if b not in selected]
+            missing = [b for b in roi_targets if b not in selected]
             if missing:
                 status_msg = f"Missing ROI: {','.join(missing)}"
                 return False
@@ -976,7 +978,7 @@ def main():
                     return
                 if k == "next":
                     if _commit_current_btn():
-                        current_idx = (current_idx + 1) % len(BUTTON_ORDER)
+                        current_idx = (current_idx + 1) % len(roi_targets)
                         start_pt = None
                         drag_pt = None
                         poly_pts = []
@@ -1011,12 +1013,12 @@ def main():
         cv2.setMouseCallback(window_name, _mouse_cb)
         while True:
             canvas = frame.copy()
-            cv2.putText(canvas, "Draw all button ROIs in one window, then Lock All", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+            cv2.putText(canvas, "Draw ROIs for A,B,C,D and Area L, then Lock All", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
             cv2.putText(canvas, f"Current button: {_target_btn()}  |  Enter=Lock All  Esc=Cancel  Backspace=Undo poly point", (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1)
             cv2.putText(canvas, status_msg, (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 255, 180), 1)
             _draw_buttons(canvas)
 
-            for b in BUTTON_ORDER:
+            for b in roi_targets:
                 if b in selected:
                     _draw_roi(canvas, selected[b], color=(255, 0, 0), label=b)
 
@@ -1046,6 +1048,7 @@ def main():
                 status_msg = f"{_target_btn()} polygon points: {len(poly_pts)}"
 
         button_rois = {b: _sanitize_roi(selected[b], frame.shape) for b in BUTTON_ORDER}
+        area_l_roi = _sanitize_roi(selected["L"], frame.shape)
         button_color_baselines = {b: _compute_button_color_stats(frame, button_rois[b], b) for b in BUTTON_ORDER}
         with state_lock:
             baseline_gate_on = bool(state.baseline_quality_enabled)
@@ -1066,6 +1069,7 @@ def main():
         button_roi_locked = True
 
         bounds = [_roi_bounds(r, frame.shape) for r in button_rois.values()]
+        bounds.append(_roi_bounds(area_l_roi, frame.shape))
         xs = [r[0] for r in bounds]
         ys = [r[1] for r in bounds]
         x2 = [r[0] + r[2] for r in bounds]
@@ -1307,6 +1311,8 @@ def main():
         if button_roi_locked and button_rois:
             for _btn, _roi in button_rois.items():
                 _draw_roi(disp, _roi, color=(255, 0, 0), label=_btn)
+            if area_l_roi is not None:
+                _draw_roi(disp, area_l_roi, color=(0, 255, 255), label="L")
         elif roi_locked and locked_roi is not None:
             x, y, w, h = locked_roi
             cv2.rectangle(disp, (x, y), (x + w, y + h), (255, 0, 0), 2)
@@ -1954,7 +1960,7 @@ def main():
 
     def _start_test_sequence(reuse_existing_golden=False):
         nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
-        nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
+        nonlocal button_rois, area_l_roi, button_color_baselines, button_roi_locked, button_fail_history
         nonlocal auto_report_written_cycle
         nonlocal vi_running, vi_results, vi_capture_idx, vi_report_path, vi_next_capture_wall, vi_end_wall, vi_status_text
 
@@ -1995,6 +2001,7 @@ def main():
             locked_roi = None
             roi_locked = False
             button_rois = {}
+            area_l_roi = None
             button_color_baselines = {}
             button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
             button_roi_locked = False
@@ -2439,7 +2446,7 @@ def main():
             set_alert("#f59e0b", "Camera tune disabled (inspection still allowed)")
 
     def on_golden_capture(_evt):
-        nonlocal golden_frame, golden_path, locked_roi, roi_locked, button_rois, button_color_baselines, button_roi_locked, button_fail_history
+        nonlocal golden_frame, golden_path, locked_roi, roi_locked, button_rois, area_l_roi, button_color_baselines, button_roi_locked, button_fail_history
         frame, frames_used = capture_average_frame()
         if frame is None:
             set_alert("red", f"Golden Capture failed: averaged frame unavailable ({frames_used}/{CAPTURE_AVG_MIN_FRAMES})")
@@ -2464,6 +2471,7 @@ def main():
             locked_roi = None
             roi_locked = False
             button_rois = {}
+            area_l_roi = None
             button_color_baselines = {}
             button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
             button_roi_locked = False
@@ -2507,7 +2515,7 @@ def main():
         print(f"[GUI] Run Inspection -> {verdict} {metric_label}={score:.2f} mask={mask_path} anomaly={anomaly_path}")
 
     def _vi_has_locked_golden():
-        return (golden_frame is not None) and (button_roi_locked or (roi_locked and locked_roi is not None))
+        return (golden_frame is not None) and bool(button_roi_locked and button_rois and (area_l_roi is not None))
 
     def build_vi_report_pdf(path):
         target_dir = os.path.dirname(path) or "."
@@ -2519,6 +2527,8 @@ def main():
             rows = list(vi_results)
             total_min = float(vi_total_min)
             interval_min = float(vi_interval_min)
+            contour_on = bool(state.detect_contour_enabled)
+            white_on = bool(state.detect_white_ratio_enabled)
 
         pdf = PdfPages(path)
         try:
@@ -2526,37 +2536,108 @@ def main():
             fig_vi.text(0.06, 0.95, "Visual Inspection Report", fontsize=16, weight="bold")
             fig_vi.text(0.06, 0.92, f"Run: {run_id}", fontsize=10)
             fig_vi.text(0.06, 0.90, f"VI total={total_min:.2f} min | interval={interval_min:.2f} min", fontsize=10)
+            score_meaning = "mean pixel diff (contour)" if contour_on else ("white pixel drop %" if white_on else "n/a")
+            fig_vi.text(0.06, 0.88, f"Score meaning: {score_meaning}", fontsize=9, color="#334155")
 
-            headers = ["#", "Timestamp", "Elapsed(min)", "Verdict", "Score", "Image", "Anomaly"]
-            y = 0.86
-            col_x = [0.06, 0.11, 0.36, 0.50, 0.60, 0.69, 0.84]
-            for x, h in zip(col_x, headers):
-                fig_vi.text(x, y, h, fontsize=9, weight="bold")
-            y -= 0.02
-
-            max_rows = 34
+            headers = ["#", "Timestamp", "Elapsed(min)", "A", "B", "C", "D", "L", "Overall", "Reason"]
+            max_rows = 26
             show_rows = rows[-max_rows:]
+            cell_rows = []
             for r in show_rows:
-                vals = [
+                cell_rows.append([
                     str(r.get("idx", "")),
                     str(r.get("timestamp", ""))[:19],
                     f"{float(r.get('elapsed_min', 0.0)):.2f}",
-                    str(r.get("verdict", "")),
-                    str(r.get("score", "")),
-                    os.path.basename(str(r.get("image_path", ""))),
-                    os.path.basename(str(r.get("anomaly_path", ""))),
-                ]
-                for x, v in zip(col_x, vals):
-                    fig_vi.text(x, y, v, fontsize=8)
-                y -= 0.021
-                if y < 0.08:
-                    break
+                    str(r.get("A", "")),
+                    str(r.get("B", "")),
+                    str(r.get("C", "")),
+                    str(r.get("D", "")),
+                    str(r.get("L", "")),
+                    str(r.get("overall", "")),
+                    str(r.get("reason", ""))[:34],
+                ])
+
+            ax_tbl = fig_vi.add_axes([0.05, 0.10, 0.90, 0.74])
+            ax_tbl.axis("off")
+            col_widths = [0.04, 0.16, 0.09, 0.06, 0.06, 0.06, 0.06, 0.06, 0.09, 0.28]
+            table = ax_tbl.table(cellText=cell_rows if cell_rows else [["", "", "", "", "", "", "", "", "", "No rows"]],
+                                 colLabels=headers,
+                                 colLoc='center', cellLoc='center',
+                                 colWidths=col_widths,
+                                 loc='upper left')
+            table.auto_set_font_size(False)
+            table.set_fontsize(8)
+            table.scale(1, 1.25)
+            for (r, c), cell in table.get_celld().items():
+                cell.set_edgecolor("#475569")
+                if r == 0:
+                    cell.set_facecolor("#e2e8f0")
+                    cell.set_text_props(weight='bold')
 
             fig_vi.text(0.06, 0.05, f"Rows stored: {len(rows)}", fontsize=9)
             pdf.savefig(fig_vi)
             plt.close(fig_vi)
         finally:
             pdf.close()
+
+    def _vi_eval_region(golden_img, cyc_img, label, roi_like):
+        with state_lock:
+            contour_enabled = state.detect_contour_enabled
+            white_enabled = state.detect_white_ratio_enabled
+        roi = _sanitize_roi(roi_like, golden_img.shape)
+        gx, gy, gw, gh = _roi_bounds(roi, golden_img.shape)
+        g_src = golden_img[gy:gy + gh, gx:gx + gw]
+        c_src = cyc_img[gy:gy + gh, gx:gx + gw]
+
+        g_gray = cv2.cvtColor(g_src, cv2.COLOR_BGR2GRAY)
+        c_gray = cv2.cvtColor(c_src, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        g_norm = clahe.apply(g_gray)
+        c_norm = clahe.apply(c_gray)
+        g_blur = cv2.GaussianBlur(g_norm, (5, 5), 0)
+        c_blur = cv2.GaussianBlur(c_norm, (5, 5), 0)
+        diff = cv2.absdiff(g_blur, c_blur)
+        mean_diff = float(np.mean(diff))
+        _, mask = cv2.threshold(diff, INSPECTION_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        contour_fail = False
+        max_area = 0.0
+        if contour_enabled:
+            for cnt in contours:
+                area = float(cv2.contourArea(cnt))
+                if area <= INSPECTION_MIN_DEFECT_AREA:
+                    continue
+                rx, ry, rw, rh = cv2.boundingRect(cnt)
+                if rw < INSPECTION_MIN_DEFECT_W or rh < INSPECTION_MIN_DEFECT_H:
+                    continue
+                max_area = max(max_area, area)
+                contour_fail = True
+
+        white_fail = False
+        white_drop = 0.0
+        if white_enabled and label in BUTTON_ORDER and button_rois and button_color_baselines:
+            base = button_color_baselines.get(label)
+            if base:
+                thr_ref = float(base.get("adaptive_white_thr", 1.0))
+                cur = _compute_button_color_stats(cyc_img, button_rois[label], label, threshold_ref=thr_ref)
+                base_white = float(base.get("white_px", 0.0))
+                cur_white = float(cur.get("white_px", 0.0))
+                if base_white > 0:
+                    white_drop = max(0.0, ((base_white - cur_white) / base_white) * 100.0)
+                with state_lock:
+                    gate = float(button_coating_thresholds.get(label, state.coating_degradation_pct))
+                white_fail = white_drop > gate
+
+        fail = contour_fail or white_fail
+        verdict = "FAIL" if fail else "PASS"
+        reason = "contour" if contour_fail else ("white" if white_fail else "ok")
+        score = mean_diff if contour_enabled else white_drop
+        score_role = "mean_pixel_diff" if contour_enabled else "white_pixel_drop_pct"
+        return {"verdict": verdict, "reason": reason, "score": score, "score_role": score_role, "max_area": max_area}
 
     def _vi_capture_and_inspect(capture_idx):
         nonlocal last_capture_frame, last_capture_path, last_capture_frames_used
@@ -2568,16 +2649,13 @@ def main():
         ok_q, q_msg, q_reason = _capture_quality_gate(frame, frames_used)
         if not ok_q:
             set_alert("orange", f"VI capture skipped: {q_msg}")
-            with state_lock:
-                elapsed_min = max(0.0, (time.time() - (vi_end_wall - vi_total_min * 60.0)) / 60.0) if vi_total_min > 0 else 0.0
+            elapsed_min = max(0.0, (time.time() - (vi_end_wall - vi_total_min * 60.0)) / 60.0) if vi_total_min > 0 else 0.0
             vi_results.append({
                 "idx": capture_idx,
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "elapsed_min": elapsed_min,
-                "verdict": "WARN",
-                "score": "",
-                "image_path": "",
-                "anomaly_path": "",
+                "A": "WARN", "B": "WARN", "C": "WARN", "D": "WARN", "L": "WARN",
+                "overall": "WARN",
                 "reason": q_reason,
             })
             return True
@@ -2589,7 +2667,16 @@ def main():
             set_alert("red", "VI capture save failed")
             return False
 
-        verdict, score, _mask_path, anomaly_path, _disp, _trace = run_basic_inspection(golden_frame, frame, run_id, cyc_num, use_temporal_gate=False)
+        # per-region VI evaluation: A/B/C/D + Large area L
+        region_results = {}
+        for btn in BUTTON_ORDER:
+            region_results[btn] = _vi_eval_region(golden_frame, frame, btn, button_rois[btn])
+        region_results["L"] = _vi_eval_region(golden_frame, frame, "L", area_l_roi)
+
+        overall_pass = all(region_results[k]["verdict"] == "PASS" for k in ["A", "B", "C", "D", "L"])
+        overall_verdict = "PASS" if overall_pass else "FAIL"
+        failed_regions = [k for k in ["A", "B", "C", "D", "L"] if region_results[k]["verdict"] != "PASS"]
+
         last_capture_frame = frame.copy()
         last_capture_path = out_path
         last_capture_frames_used = int(frames_used)
@@ -2598,11 +2685,13 @@ def main():
             "idx": capture_idx,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "elapsed_min": elapsed_min,
-            "verdict": verdict,
-            "score": f"{score:.2f}" if score not in ("", None) else "",
-            "image_path": out_path,
-            "anomaly_path": anomaly_path or "",
-            "reason": "inspection_scored",
+            "A": region_results["A"]["verdict"],
+            "B": region_results["B"]["verdict"],
+            "C": region_results["C"]["verdict"],
+            "D": region_results["D"]["verdict"],
+            "L": region_results["L"]["verdict"],
+            "overall": overall_verdict,
+            "reason": "ok" if overall_pass else f"failed:{','.join(failed_regions)}",
         })
 
         try:
@@ -2612,8 +2701,8 @@ def main():
             print(f"[VI] report update failed: {exc}")
 
         with state_lock:
-            state.last_capture_result = f"vi/{verdict}"
-        set_alert("green" if verdict == "PASS" else "orange", f"VI {capture_idx}: {verdict}")
+            state.last_capture_result = f"vi/{overall_verdict}"
+        set_alert("green" if overall_verdict == "PASS" else "orange", f"VI {capture_idx}: {overall_verdict}")
         return True
 
     def _begin_vi_session():
@@ -2723,7 +2812,7 @@ def main():
 
     def on_reset(_evt):
         nonlocal golden_frame, golden_path, last_capture_frame, last_capture_path, locked_roi, roi_locked
-        nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
+        nonlocal button_rois, area_l_roi, button_color_baselines, button_roi_locked, button_fail_history
         nonlocal cycle_video_writer, cycle_video_path, cycle_video_started, auto_report_written_cycle
         nonlocal vi_running, vi_results, vi_capture_idx, vi_report_path, vi_next_capture_wall, vi_end_wall, vi_status_text
         with state_lock:
