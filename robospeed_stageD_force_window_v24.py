@@ -326,6 +326,16 @@ def main():
     last_saved_report_path = None
     auto_report_written_cycle = -1
 
+    # Visual Inspection (VI) stability run state
+    vi_running = False
+    vi_interval_min = 5.0
+    vi_total_min = 20.0
+    vi_next_capture_wall = 0.0
+    vi_end_wall = 0.0
+    vi_capture_idx = 0
+    vi_results = []
+    vi_report_path = None
+
     for _d in [
         os.path.join(CAMERA_OUTPUT_DIR, "golden"),
         os.path.join(CAMERA_OUTPUT_DIR, "cyc"),
@@ -1597,6 +1607,17 @@ def main():
     btn_coating_gate = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "Coating degr%:10", color="#334155", hovercolor="#1f2937")
     btn_baseline_q = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "BaselineQ: ON", color="#166534", hovercolor="#15803d")
 
+    # Row 4: Visual inspection stability controls
+    row4_y = row3_y - (manual_btn_h + manual_btn_gap)
+    btn_vi_start = Button(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), row4_y, manual_btn_w, manual_btn_h]), "Start VI", color="#0ea5e9", hovercolor="#0284c7")
+    btn_vi_stop = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row4_y, manual_btn_w, manual_btn_h]), "Stop VI", color="#475569", hovercolor="#334155")
+
+    vi_tb_w = manual_btn_w
+    tb_vi_interval = TextBox(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row4_y, vi_tb_w, manual_btn_h]), "", initial="5")
+    tb_vi_total = TextBox(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row4_y, vi_tb_w, manual_btn_h]), "", initial="20")
+    fig.text(x0 + 2 * (manual_btn_w + manual_btn_gap), row4_y + manual_btn_h + 0.002, "VI interval (min)", color="#e2e8f0", fontsize=8)
+    fig.text(x0 + 3 * (manual_btn_w + manual_btn_gap), row4_y + manual_btn_h + 0.002, "VI total (min)", color="#e2e8f0", fontsize=8)
+
     # Auto-capture settings/status panel
     px_x = 1.0 / (fig.get_figwidth() * fig.dpi)
     px_y = 1.0 / (fig.get_figheight() * fig.dpi)
@@ -1642,6 +1663,7 @@ def main():
 
     # Golden reuse popup (hidden by default)
     popup_active = False
+    popup_context = "start"
     popup_bg = Rectangle((0.37, 0.40), 0.28, 0.20, transform=fig.transFigure,
                          facecolor="#111827", edgecolor="#94a3b8", linewidth=1.2, zorder=20)
     popup_bg.set_visible(False)
@@ -1656,15 +1678,15 @@ def main():
     btn_popup_reuse.ax.set_visible(False)
 
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap, btn_fail_policy,
-                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_popup_recapture, btn_popup_reuse]:
+                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_vi_start, btn_vi_stop, btn_popup_recapture, btn_popup_reuse]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_popup_recapture, btn_popup_reuse, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_vi_start, btn_vi_stop, btn_popup_recapture, btn_popup_reuse, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
         _tb.label.set_horizontalalignment("left")
         _tb.label.set_position((-1.27, 0.5))
-    for _tb in [tb_fmin, tb_fmax, tb_cap_every, tb_cap_retry]:
+    for _tb in [tb_fmin, tb_fmax, tb_cap_every, tb_cap_retry, tb_vi_interval, tb_vi_total]:
         _tb.label.set_color("white")
     tb_fmin.label.set_horizontalalignment("left")
     force_label_x = -1.27 * (tb_w / force_box_w)
@@ -1679,8 +1701,15 @@ def main():
             state.alert_msg = msg
             state.alert_until_wall = time.time() + ALERT_FLASH_S
 
-    def show_golden_reuse_popup():
-        nonlocal popup_active
+    def show_golden_reuse_popup(context="start"):
+        nonlocal popup_active, popup_context
+        popup_context = context
+        if context == "vi":
+            popup_title.set_text("VI: Golden/ROI already ready")
+            popup_msg.set_text("Re-capture Golden for VI run?")
+        else:
+            popup_title.set_text("Golden/ROI already ready")
+            popup_msg.set_text("Capture Golden again for this test?")
         popup_active = True
         popup_bg.set_visible(True)
         popup_title.set_visible(True)
@@ -1917,7 +1946,7 @@ def main():
             has_prev_golden = bool(state.stopped and state.golden_ready)
         has_prev_golden = has_prev_golden and (golden_frame is not None) and (button_roi_locked or (roi_locked and locked_roi is not None))
         if has_prev_golden:
-            show_golden_reuse_popup()
+            show_golden_reuse_popup("start")
             set_alert("#0ea5e9", "Golden prompt: choose Re-capture or Reuse")
             return
         _start_test_sequence(reuse_existing_golden=False)
@@ -1926,6 +1955,7 @@ def main():
         nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
         nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
         nonlocal auto_report_written_cycle
+        nonlocal vi_running, vi_results, vi_capture_idx, vi_report_path, vi_next_capture_wall, vi_end_wall
 
         if not robot_connected:
             with state_lock:
@@ -1968,6 +1998,12 @@ def main():
             button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
             button_roi_locked = False
         auto_report_written_cycle = -1
+        vi_running = False
+        vi_results = []
+        vi_capture_idx = 0
+        vi_report_path = None
+        vi_next_capture_wall = 0.0
+        vi_end_wall = 0.0
 
         print("[GUI] Start pressed -> Going Home before cycle start")
         go_home()
@@ -2097,6 +2133,23 @@ def main():
 
     def on_popup_recapture(_evt):
         hide_golden_reuse_popup()
+        if popup_context == "vi":
+            if robot_connected:
+                ok_ckpt = go_ic_home_checkpoint()
+                if ok_ckpt:
+                    set_alert("#d97706", "VI: capture new Golden now (manual mode at IC checkpoint)")
+                else:
+                    set_alert("red", "VI: could not reach IC checkpoint for Golden capture")
+                    return
+            else:
+                set_alert("#d97706", "VI: capture new Golden now")
+            on_golden_capture(None)
+            if _vi_has_locked_golden():
+                _begin_vi_session()
+            else:
+                set_alert("red", "VI start blocked: Golden/ROI not ready")
+            return
+
         with state_lock:
             state.running = False
             state.paused = True
@@ -2113,6 +2166,9 @@ def main():
 
     def on_popup_reuse(_evt):
         hide_golden_reuse_popup()
+        if popup_context == "vi":
+            _begin_vi_session()
+            return
         _start_test_sequence(reuse_existing_golden=True)
 
     def on_pause(_evt):
@@ -2448,6 +2504,173 @@ def main():
         set_alert("green" if verdict == "PASS" else "orange", f"Inspection {verdict} {metric_label}={score:.2f}")
         print(f"[GUI] Run Inspection -> {verdict} {metric_label}={score:.2f} mask={mask_path} anomaly={anomaly_path}")
 
+    def _vi_has_locked_golden():
+        return (golden_frame is not None) and (button_roi_locked or (roi_locked and locked_roi is not None))
+
+    def build_vi_report_pdf(path):
+        target_dir = os.path.dirname(path) or "."
+        if not os.access(target_dir, os.W_OK):
+            raise PermissionError(f"No write permission to directory: {target_dir}")
+
+        with state_lock:
+            run_id = state.test_name.strip() or "test_report"
+            rows = list(vi_results)
+            total_min = float(vi_total_min)
+            interval_min = float(vi_interval_min)
+
+        pdf = PdfPages(path)
+        try:
+            fig_vi = plt.figure(figsize=(11, 8.5), facecolor="white")
+            fig_vi.text(0.06, 0.95, "Visual Inspection Report", fontsize=16, weight="bold")
+            fig_vi.text(0.06, 0.92, f"Run: {run_id}", fontsize=10)
+            fig_vi.text(0.06, 0.90, f"VI total={total_min:.2f} min | interval={interval_min:.2f} min", fontsize=10)
+
+            headers = ["#", "Timestamp", "Elapsed(min)", "Verdict", "Score", "Image", "Anomaly"]
+            y = 0.86
+            col_x = [0.06, 0.11, 0.36, 0.50, 0.60, 0.69, 0.84]
+            for x, h in zip(col_x, headers):
+                fig_vi.text(x, y, h, fontsize=9, weight="bold")
+            y -= 0.02
+
+            max_rows = 34
+            show_rows = rows[-max_rows:]
+            for r in show_rows:
+                vals = [
+                    str(r.get("idx", "")),
+                    str(r.get("timestamp", ""))[:19],
+                    f"{float(r.get('elapsed_min', 0.0)):.2f}",
+                    str(r.get("verdict", "")),
+                    str(r.get("score", "")),
+                    os.path.basename(str(r.get("image_path", ""))),
+                    os.path.basename(str(r.get("anomaly_path", ""))),
+                ]
+                for x, v in zip(col_x, vals):
+                    fig_vi.text(x, y, v, fontsize=8)
+                y -= 0.021
+                if y < 0.08:
+                    break
+
+            fig_vi.text(0.06, 0.05, f"Rows stored: {len(rows)}", fontsize=9)
+            pdf.savefig(fig_vi)
+            plt.close(fig_vi)
+        finally:
+            pdf.close()
+
+    def _vi_capture_and_inspect(capture_idx):
+        nonlocal last_capture_frame, last_capture_path, last_capture_frames_used
+        if golden_frame is None or not _vi_has_locked_golden():
+            set_alert("orange", "VI stopped: Golden/ROI not ready")
+            return False
+
+        frame, frames_used = capture_average_frame()
+        ok_q, q_msg, q_reason = _capture_quality_gate(frame, frames_used)
+        if not ok_q:
+            set_alert("orange", f"VI capture skipped: {q_msg}")
+            with state_lock:
+                elapsed_min = max(0.0, (time.time() - (vi_end_wall - vi_total_min * 60.0)) / 60.0) if vi_total_min > 0 else 0.0
+            vi_results.append({
+                "idx": capture_idx,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "elapsed_min": elapsed_min,
+                "verdict": "WARN",
+                "score": "",
+                "image_path": "",
+                "anomaly_path": "",
+                "reason": q_reason,
+            })
+            return True
+
+        run_id = state.test_name.strip() or "test_report"
+        cyc_num = max(1, state.cycle_count)
+        ok_save, _name, out_path = save_capture_frame(frame, "cyc", run_id, cyc_num)
+        if not ok_save:
+            set_alert("red", "VI capture save failed")
+            return False
+
+        verdict, score, _mask_path, anomaly_path, _disp, _trace = run_basic_inspection(golden_frame, frame, run_id, cyc_num, use_temporal_gate=False)
+        last_capture_frame = frame.copy()
+        last_capture_path = out_path
+        last_capture_frames_used = int(frames_used)
+        elapsed_min = max(0.0, (time.time() - (vi_end_wall - vi_total_min * 60.0)) / 60.0) if vi_total_min > 0 else 0.0
+        vi_results.append({
+            "idx": capture_idx,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "elapsed_min": elapsed_min,
+            "verdict": verdict,
+            "score": f"{score:.2f}" if score not in ("", None) else "",
+            "image_path": out_path,
+            "anomaly_path": anomaly_path or "",
+            "reason": "inspection_scored",
+        })
+
+        try:
+            if vi_report_path:
+                build_vi_report_pdf(vi_report_path)
+        except Exception as exc:
+            print(f"[VI] report update failed: {exc}")
+
+        with state_lock:
+            state.last_capture_result = f"vi/{verdict}"
+        set_alert("green" if verdict == "PASS" else "orange", f"VI {capture_idx}: {verdict}")
+        return True
+
+    def _begin_vi_session():
+        nonlocal vi_running, vi_next_capture_wall, vi_end_wall, vi_capture_idx, vi_results, vi_report_path, vi_interval_min, vi_total_min
+        now = time.time()
+        vi_running = True
+        vi_capture_idx = 0
+        vi_results = []
+        vi_next_capture_wall = now + vi_interval_min * 60.0
+        vi_end_wall = now + vi_total_min * 60.0
+        run_id = state.test_name.strip() or "test_report"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        vi_report_path = os.path.join(reports_dir, f"visual_inspection_report_{run_id}_{ts}.pdf")
+        try:
+            build_vi_report_pdf(vi_report_path)
+        except Exception as exc:
+            print(f"[VI] initial report build failed: {exc}")
+        set_alert("#0ea5e9", f"VI started: every {vi_interval_min:g} min for {vi_total_min:g} min")
+
+    def on_start_vi(_evt):
+        nonlocal vi_interval_min, vi_total_min
+        if popup_active:
+            return
+        try:
+            vi_interval_min = float(tb_vi_interval.text)
+            vi_total_min = float(tb_vi_total.text)
+        except Exception:
+            set_alert("red", "VI settings invalid")
+            return
+        if vi_interval_min <= 0 or vi_total_min <= 0:
+            set_alert("red", "VI interval/total must be > 0")
+            return
+        if vi_total_min < vi_interval_min:
+            set_alert("red", "VI total time must be >= VI interval")
+            return
+        if vi_running:
+            set_alert("#475569", "VI already running")
+            return
+
+        if _vi_has_locked_golden():
+            show_golden_reuse_popup("vi")
+            set_alert("#0ea5e9", "VI prompt: choose Re-capture or Reuse")
+            return
+
+        set_alert("#d97706", "VI: capturing Golden first")
+        on_golden_capture(None)
+        if not _vi_has_locked_golden():
+            set_alert("red", "VI start blocked: Golden/ROI not ready")
+            return
+        _begin_vi_session()
+
+    def on_stop_vi(_evt):
+        nonlocal vi_running
+        if not vi_running:
+            set_alert("#475569", "VI is not running")
+            return
+        vi_running = False
+        set_alert("#475569", "VI stopped")
+
     def on_return_to_test(_evt):
         with state_lock:
             state.manual_intervention_requested = False
@@ -2498,6 +2721,7 @@ def main():
         nonlocal golden_frame, golden_path, last_capture_frame, last_capture_path, locked_roi, roi_locked
         nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
         nonlocal cycle_video_writer, cycle_video_path, cycle_video_started, auto_report_written_cycle
+        nonlocal vi_running, vi_results, vi_capture_idx, vi_report_path, vi_next_capture_wall, vi_end_wall
         with state_lock:
             state.force_out_of_range = {"A": 0, "B": 0, "C": 0, "D": 0}
             state.button_did_not_retract = {"A": 0, "B": 0, "C": 0, "D": 0}
@@ -2530,6 +2754,12 @@ def main():
         cycle_video_path = None
         cycle_video_started = False
         auto_report_written_cycle = -1
+        vi_running = False
+        vi_results = []
+        vi_capture_idx = 0
+        vi_report_path = None
+        vi_next_capture_wall = 0.0
+        vi_end_wall = 0.0
         _recover_camera_preview()
         with state_lock:
             state.golden_ready = False
@@ -2823,6 +3053,8 @@ def main():
     btn_lock_roi.on_clicked(on_lock_roi)
     btn_coating_gate.on_clicked(on_toggle_coating_gate)
     btn_baseline_q.on_clicked(on_toggle_baseline_quality)
+    btn_vi_start.on_clicked(on_start_vi)
+    btn_vi_stop.on_clicked(on_stop_vi)
     btn_ic_home.on_clicked(on_ic_home)
     btn_return_test.on_clicked(on_return_to_test)
     btn_camera_tune.on_clicked(on_camera_tune)
@@ -3159,6 +3391,20 @@ def main():
                 except Exception as exc:
                     set_alert("red", f"Auto report failed: {exc}")
                     print(f"[Report] Auto-save failed: {exc}")
+
+            # VI scheduler (independent of robot connection)
+            if vi_running:
+                now_wall = time.time()
+                if now_wall >= vi_end_wall:
+                    vi_running = False
+                    set_alert("#475569", "VI completed")
+                elif now_wall >= vi_next_capture_wall:
+                    vi_capture_idx += 1
+                    ok_vi = _vi_capture_and_inspect(vi_capture_idx)
+                    vi_next_capture_wall = now_wall + max(1e-6, vi_interval_min * 60.0)
+                    if not ok_vi:
+                        vi_running = False
+                        set_alert("red", "VI stopped due to capture/inspection failure")
 
             # UI text / alerts
             with state_lock:
