@@ -192,9 +192,16 @@ Add explicit operator-visible fields in status line/panel:
    - Update button text/color immediately for operator clarity.
    - Raise a status message (`set_alert`) showing the new state.
 4. Gate all auto-invocations of tuning with the flag:
-   - If OFF, skip calling `run_camera_auto_tune()` and continue with existing locked settings.
-   - If no valid locked settings exist yet, block auto-start with a clear message (`Tune disabled and no locked baseline`).
-5. Keep manual override path: when toggle is OFF, operator can still explicitly press `Camera Tune` if desired (or decide to hard-disable manual tune too; choose one policy and document it).
+   - If OFF, skip calling `run_camera_auto_tune()` and continue using whatever current camera settings are active.
+   - Do **not** block run start or inspection when tune is OFF or when no prior tune exists.
+5. Keep manual override path: when toggle is OFF, operator can still explicitly press `Camera Tune` if desired.
+
+### A1) Inspection policy update (remove tune requirement)
+1. Manual inspection path must run even when camera has never been tuned in the session.
+2. Auto inspection path must also run without camera tune; tune is optional quality optimization, not a hard gate.
+3. If camera was not tuned, tag manifest/status with a non-blocking warning (`camera_tune_state=untuned`) for traceability.
+4. Use existing capture quality checks (frame availability, averaging, saturation/quality gates) as the true blockers instead of tune state.
+5. Ensure both modes follow the same pass/fail logic so tune state does not change inspection eligibility.
 
 ### B) Steps to remove brightening after exposure/gain are tuned
 1. Enforce lock after tune:
@@ -206,9 +213,10 @@ Add explicit operator-visible fields in status line/panel:
 4. Clamp post-tune writes:
    - Any later camera setting apply should be bounded to `[EXPOSURE_MIN..EXPOSURE_MAX]`, `[GAIN_MIN..GAIN_MAX]`, and never increase gain when saturation exceeds `MAX_SAT_PCT`.
 5. Make retune explicit instead of implicit:
-   - If image gets too dark/bright over time, require operator action via `Camera Tune` (or scheduled retune point), rather than background adaptation.
+   - If image gets too dark/bright over time, allow inspections to continue and raise operator warning; retune remains optional corrective action.
 6. Validate with repeatable checks:
    - Run capture sequence across multiple cycles and confirm exposure/gain values remain constant in logs unless retune is invoked.
+   - Verify manual and auto inspections both execute successfully in untuned and tuned states.
    - Compare baseline and post-cycle histograms; accept only if mean/saturation remain within defined tolerance band.
 
 ### C) Suggested implementation order
