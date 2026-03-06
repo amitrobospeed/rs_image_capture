@@ -41,6 +41,7 @@ deviation_threshold = 0.50
 ALERT_FLASH_S = 1.0
 TARE_WARMUP_S = 3.0
 TARE_SAMPLES = 200
+FORCE_DRIFT_RE_TARE_PCT = 5.0
 
 # ================================
 # UI SETTINGS
@@ -240,10 +241,10 @@ class SystemState:
     last_capture_result: str = "none"
     auto_capture_retries: int = DEFAULT_AUTO_CAPTURE_RETRIES
     auto_fail_policy: str = "safe_stop"
-    detect_contour_enabled: bool = False
-    detect_white_ratio_enabled: bool = True
+    detect_contour_enabled: bool = True
+    detect_white_ratio_enabled: bool = False
     coating_degradation_pct: float = BUTTON_COATING_DEGRADATION_PCT_DEFAULT
-    baseline_quality_enabled: bool = True
+    baseline_quality_enabled: bool = False
 
 
 def main():
@@ -290,7 +291,7 @@ def main():
     camera_white_balance = 4600
     camera_settings_locked = False
     camera_tuned_once = False
-    camera_tune_enabled = True
+    camera_tune_enabled = False
 
     # capture/inspection session artifacts
     golden_frame = None
@@ -1520,6 +1521,13 @@ def main():
         go_home()
         if not wait_until_idle():
             return False
+
+        need_tare, drift_force, drift_thr = should_re_tare_for_drift("post_auto_capture")
+        if need_tare:
+            set_alert("#f59e0b", f"Force drift {drift_force:.2f}lbs>{drift_thr:.2f}lbs. Re-tare...")
+            if not perform_tare("post_auto_capture_drift"):
+                return False
+
         with state_lock:
             state.running = True
             state.paused = False
@@ -1824,6 +1832,25 @@ def main():
             with state_lock:
                 state.tare_in_progress = False
 
+    def should_re_tare_for_drift(tag="post_capture"):
+        nonlocal zero_offset
+        try:
+            samples = [bridge.getVoltageRatio() for _ in range(60)]
+        except Exception as exc:
+            print(f"[Force] Drift sample failed ({tag}): {exc}")
+            return False, 0.0, 0.0
+
+        raw_mean = float(np.mean(samples))
+        drift_force = float((raw_mean - zero_offset) * calibration_factor)
+        with state_lock:
+            ref_force = max(abs(float(state.force_min)), abs(float(state.force_max)), 1.0)
+        threshold = float(ref_force * (FORCE_DRIFT_RE_TARE_PCT / 100.0))
+        drift_abs = abs(drift_force)
+        if drift_abs > threshold:
+            print(f"[Force] Drift detected ({tag}): {drift_force:.3f}lbs > {threshold:.3f}lbs ({FORCE_DRIFT_RE_TARE_PCT:.1f}%)")
+            return True, drift_force, threshold
+        return False, drift_force, threshold
+
     def go_home():
         if not robot_connected:
             return False
@@ -1926,7 +1953,39 @@ def main():
 
 
     def on_start(_evt):
+        nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
+        nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
+        nonlocal auto_report_written_cycle
+
         apply_textbox_values()
+
+        reuse_existing_golden = False
+        has_prev_golden = False
+        with state_lock:
+            has_prev_golden = bool(state.stopped and state.golden_ready)
+        has_prev_golden = has_prev_golden and (golden_frame is not None) and (button_roi_locked or (roi_locked and locked_roi is not None))
+        if has_prev_golden:
+            try:
+                ans = input("[Operator Prompt] Golden/ROI already ready from previous test. Capture new golden? [y/N]: ").strip().lower()
+            except Exception:
+                ans = "n"
+            if ans in ("y", "yes"):
+                with state_lock:
+                    state.running = False
+                    state.paused = True
+                    state.stopped = False
+                    state.manual_mode_active = True
+                    state.manual_intervention_requested = False
+                    state.last_capture_result = "awaiting_new_golden"
+                ok_ckpt = go_ic_home_checkpoint()
+                if ok_ckpt:
+                    set_alert("#d97706", "Capture new Golden now (manual mode at IC checkpoint)")
+                else:
+                    set_alert("red", "Could not reach IC checkpoint for new Golden capture")
+                print("[GUI] Start paused for operator golden recapture decision")
+                return
+            reuse_existing_golden = True
+
         if not robot_connected:
             with state_lock:
                 state.running = False
@@ -1936,9 +1995,6 @@ def main():
             set_alert("#d97706", "Robot disconnected: visual inspection mode only")
             print("[GUI] Start blocked: robot disconnected (visual inspection mode)")
             return
-        nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
-        nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
-        nonlocal auto_report_written_cycle
         with state_lock:
             state.running = False
             state.paused = True
@@ -1953,20 +2009,22 @@ def main():
             state.manual_intervention_requested = False
             state.manual_mode_active = False
             state.image_capture_count = 0
-            state.golden_ready = False
+            if not reuse_existing_golden:
+                state.golden_ready = False
             state.last_capture_result = "none"
             state.next_auto_capture_cycle = state.capture_every_x_cycles if state.capture_every_x_cycles > 0 else 0
 
         last_capture_frame = None
         last_capture_path = None
-        golden_frame = None
-        golden_path = None
-        locked_roi = None
-        roi_locked = False
-        button_rois = {}
-        button_color_baselines = {}
-        button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
-        button_roi_locked = False
+        if not reuse_existing_golden:
+            golden_frame = None
+            golden_path = None
+            locked_roi = None
+            roi_locked = False
+            button_rois = {}
+            button_color_baselines = {}
+            button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
+            button_roi_locked = False
         auto_report_written_cycle = -1
 
         print("[GUI] Start pressed -> Going Home before cycle start")
@@ -2001,7 +2059,7 @@ def main():
                 return
 
         with state_lock:
-            auto_mode = state.auto_capture_enabled and state.capture_every_x_cycles > 0
+            auto_mode = state.auto_capture_enabled and state.capture_every_x_cycles > 0 and (not reuse_existing_golden)
 
         if auto_mode:
             print("[GUI] Auto mode start: preparing golden at IC checkpoint")
@@ -2460,6 +2518,18 @@ def main():
             state.paused = False
             state.stopped = False
         set_alert("#0891b2", "At Home. Restarting cycle test")
+        need_tare, drift_force, drift_thr = should_re_tare_for_drift("return_to_test")
+        if need_tare:
+            set_alert("#f59e0b", f"Force drift {drift_force:.2f}lbs>{drift_thr:.2f}lbs. Re-tare...")
+            if not perform_tare("return_to_test_drift"):
+                with state_lock:
+                    state.running = False
+                    state.paused = True
+                    state.stopped = True
+                set_alert("red", "Return to Test failed: drift re-tare failed")
+                print("[GUI] Return to Test aborted: drift re-tare failed")
+                return
+
         print("[GUI] Return to Test: automatic cycle resumed")
 
     def on_reset(_evt):
