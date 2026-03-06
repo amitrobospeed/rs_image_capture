@@ -176,6 +176,56 @@ Add explicit operator-visible fields in status line/panel:
 
 ---
 
+
+## v24 focused plan — Camera tune ON/OFF button + post-tune anti-brightening
+
+### What is already in `robospeed_stageD_force_window_v24.py`
+- Manual **Camera Tune** button exists (`btn_camera_tune`) and calls `run_camera_auto_tune()`.
+- Tuning currently locks exposure/gain/white-balance through `_apply_locked_camera_settings()` once tuning succeeds.
+- Brightness guardrails already exist (`TARGET_LUMA_MEAN`, `MAX_SAT_PCT`, staged exposure/gain tuning).
+
+### A) Plan to add a camera tune ON/OFF control (no coding in this step)
+1. Add a run-state boolean flag, e.g. `camera_tune_enabled`, default **ON** for current behavior compatibility.
+2. Add a dedicated toggle button in the manual camera control row (label states: `CamTune: ON` / `CamTune: OFF`).
+3. Button callback behavior:
+   - Flip the state flag.
+   - Update button text/color immediately for operator clarity.
+   - Raise a status message (`set_alert`) showing the new state.
+4. Gate all auto-invocations of tuning with the flag:
+   - If OFF, skip calling `run_camera_auto_tune()` and continue using whatever current camera settings are active.
+   - Do **not** block run start or inspection when tune is OFF or when no prior tune exists.
+5. Keep manual override path: when toggle is OFF, operator can still explicitly press `Camera Tune` if desired.
+
+### A1) Inspection policy update (remove tune requirement)
+1. Manual inspection path must run even when camera has never been tuned in the session.
+2. Auto inspection path must also run without camera tune; tune is optional quality optimization, not a hard gate.
+3. If camera was not tuned, tag manifest/status with a non-blocking warning (`camera_tune_state=untuned`) for traceability.
+4. Use existing capture quality checks (frame availability, averaging, saturation/quality gates) as the true blockers instead of tune state.
+5. Ensure both modes follow the same pass/fail logic so tune state does not change inspection eligibility.
+
+### B) Steps to remove brightening after exposure/gain are tuned
+1. Enforce lock after tune:
+   - Ensure `enable_auto_exposure=0` and `enable_auto_white_balance=0` remain forced after tuning and on every preview restart/recovery path.
+2. Freeze the tuned tuple (`exposure`, `gain`, `white_balance`) as the only applied runtime values until operator retunes.
+3. Add drift detection telemetry only (not auto-correction):
+   - Track rolling luma/saturation in preview.
+   - If luma drifts high while saturation rises, raise warning but do not auto-brighten.
+4. Clamp post-tune writes:
+   - Any later camera setting apply should be bounded to `[EXPOSURE_MIN..EXPOSURE_MAX]`, `[GAIN_MIN..GAIN_MAX]`, and never increase gain when saturation exceeds `MAX_SAT_PCT`.
+5. Make retune explicit instead of implicit:
+   - If image gets too dark/bright over time, allow inspections to continue and raise operator warning; retune remains optional corrective action.
+6. Validate with repeatable checks:
+   - Run capture sequence across multiple cycles and confirm exposure/gain values remain constant in logs unless retune is invoked.
+   - Verify manual and auto inspections both execute successfully in untuned and tuned states.
+   - Compare baseline and post-cycle histograms; accept only if mean/saturation remain within defined tolerance band.
+
+### C) Suggested implementation order
+1. Add state flag + toggle button UI wiring.
+2. Gate auto-start tune call with the flag.
+3. Harden lock re-apply in all camera restart/recovery entry points.
+4. Add drift-warning status line and logging fields.
+5. Run validation matrix (stable light, reflective part, low light) and finalize thresholds.
+
 ## Done criteria (project completion)
 - [ ] Phase 3A, 3B, 3C, 3D, 3E, 3F, and 3G acceptance criteria all complete.
 - [ ] Phase 4 acceptance criteria complete.
