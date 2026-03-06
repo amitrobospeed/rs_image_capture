@@ -58,6 +58,10 @@ COLOR_TEXT = "#e5e7eb"
 
 CAMERA_WINDOW_NAME = "IC Camera"
 CAMERA_OUTPUT_DIR = "inspection_output"
+OUTPUT_MODE_DURABILITY = "cycle_durability"
+OUTPUT_MODE_VISUAL = "cycle_visual"
+OUTPUT_MODE_MANUAL = "manual_inspection"
+OUTPUT_MODES = (OUTPUT_MODE_DURABILITY, OUTPUT_MODE_VISUAL, OUTPUT_MODE_MANUAL)
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 15
@@ -318,12 +322,22 @@ def main():
     button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
     button_coating_thresholds = dict(PER_BUTTON_COATING_THRESHOLDS_DEFAULT)
 
-    manifest_path = os.path.join(CAMERA_OUTPUT_DIR, "manifest.csv")
-    reports_dir = os.path.join(CAMERA_OUTPUT_DIR, "reports")
-    masks_dir = os.path.join(CAMERA_OUTPUT_DIR, "masks")
+    mode_dirs = {}
+    for _mode in OUTPUT_MODES:
+        _root = os.path.join(CAMERA_OUTPUT_DIR, _mode)
+        mode_dirs[_mode] = {
+            "root": _root,
+            "golden": os.path.join(_root, "golden"),
+            "cycle_data": os.path.join(_root, "cycle_data"),
+            "anomaly": os.path.join(_root, "anomaly"),
+            "masks": os.path.join(_root, "masks"),
+            "videos": os.path.join(_root, "videos"),
+            "reports": os.path.join(_root, "reports"),
+            "manifest": os.path.join(_root, "manifest.csv"),
+        }
+
+    cycle_video_state = {m: {"path": None, "writer": None, "started": False} for m in OUTPUT_MODES}
     cycle_video_path = None
-    cycle_video_writer = None
-    cycle_video_started = False
     last_saved_report_path = None
     auto_report_written_cycle = -1
 
@@ -338,15 +352,24 @@ def main():
     vi_report_path = None
     vi_status_text = ""
 
-    for _d in [
-        os.path.join(CAMERA_OUTPUT_DIR, "golden"),
-        os.path.join(CAMERA_OUTPUT_DIR, "cyc"),
-        os.path.join(CAMERA_OUTPUT_DIR, "anomaly"),
-        masks_dir,
-        os.path.join(CAMERA_OUTPUT_DIR, "video"),
-        reports_dir,
-    ]:
-        os.makedirs(_d, exist_ok=True)
+    for _mode in OUTPUT_MODES:
+        for _k in ("root", "golden", "cycle_data", "anomaly", "masks", "videos", "reports"):
+            os.makedirs(mode_dirs[_mode][_k], exist_ok=True)
+
+    def _mode_dir(mode, key):
+        return mode_dirs.get(mode, mode_dirs[OUTPUT_MODE_DURABILITY])[key]
+
+    def _mode_manifest_path(mode):
+        return _mode_dir(mode, "manifest")
+
+    def _mode_report_dir(mode):
+        return _mode_dir(mode, "reports")
+
+    def _video_state(mode):
+        return cycle_video_state.get(mode, cycle_video_state[OUTPUT_MODE_DURABILITY])
+
+    def _cycle_video_path_for_mode(mode):
+        return _video_state(mode).get("path") or ""
 
     def _set_camera_status(msg):
         nonlocal camera_status
@@ -569,7 +592,8 @@ def main():
         set_alert("green", f"Camera tuned+locked (Stage0 only) exp={exp} gain={gain} wb={wb} sat={final_sat:.2f}%")
         return True
 
-    def _manifest_write(row):
+    def _manifest_write(row, mode=OUTPUT_MODE_DURABILITY):
+        manifest_path = _mode_manifest_path(mode)
         file_exists = os.path.exists(manifest_path)
         fields = [
             "run_id", "cycle", "capture_type", "timestamp", "camera_status", "result",
@@ -1078,17 +1102,19 @@ def main():
         roi_locked = True
         return True
 
-    def _ensure_cycle_video(golden_img, run_id):
-        nonlocal cycle_video_path, cycle_video_writer, cycle_video_started
-        if cycle_video_writer is not None:
+    def _ensure_cycle_video(golden_img, run_id, mode=OUTPUT_MODE_DURABILITY):
+        nonlocal cycle_video_path
+        st = _video_state(mode)
+        if st["writer"] is not None:
+            cycle_video_path = st.get("path")
             return True
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        cycle_video_path = os.path.join(CAMERA_OUTPUT_DIR, "video", f"cycle_inspection_{run_id}_{ts}.mp4")
+        st["path"] = os.path.join(_mode_dir(mode, "videos"), f"cycle_inspection_{run_id}_{ts}.mp4")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        cycle_video_writer = cv2.VideoWriter(cycle_video_path, fourcc, max(1, CAMERA_FPS), (CAMERA_WIDTH, CAMERA_HEIGHT))
-        if not cycle_video_writer.isOpened():
-            cycle_video_writer = None
-            cycle_video_path = None
+        st["writer"] = cv2.VideoWriter(st["path"], fourcc, max(1, CAMERA_FPS), (CAMERA_WIDTH, CAMERA_HEIGHT))
+        if not st["writer"].isOpened():
+            st["writer"] = None
+            st["path"] = None
             return False
         golden_tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         intro_src = golden_img.copy()
@@ -1099,34 +1125,38 @@ def main():
             x, y, w, h = locked_roi
             cv2.rectangle(intro_src, (x, y), (x + w, y + h), (255, 0, 0), 2)
         intro = _stamp(intro_src, f"GOLDEN | run={run_id} | {golden_tag}")
-        cycle_video_writer.write(intro)
-        cycle_video_started = True
+        st["writer"].write(intro)
+        st["started"] = True
+        cycle_video_path = st.get("path")
         return True
 
-    def _append_cycle_video_frame(frame, cycle_num):
-        if cycle_video_writer is None:
+    def _append_cycle_video_frame(frame, cycle_num, mode=OUTPUT_MODE_DURABILITY):
+        nonlocal cycle_video_path
+        st = _video_state(mode)
+        if st["writer"] is None:
             return
         tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         stamped = _stamp(frame, f"CYCLE {cycle_num} | {tag}", color=(0, 255, 0))
-        cycle_video_writer.write(stamped)
+        st["writer"].write(stamped)
+        cycle_video_path = st.get("path")
 
-    def save_capture_frame(frame, capture_type, run_id, cycle_num=0):
+    def save_capture_frame(frame, capture_type, run_id, cycle_num=0, mode=OUTPUT_MODE_DURABILITY):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         if capture_type == "golden":
             out_name = f"golden_{run_id}.png"
-            out_path = os.path.join(CAMERA_OUTPUT_DIR, "golden", out_name)
+            out_path = os.path.join(_mode_dir(mode, "golden"), out_name)
             if os.path.exists(out_path):
                 out_name = f"golden_{run_id}_{ts}.png"
-                out_path = os.path.join(CAMERA_OUTPUT_DIR, "golden", out_name)
+                out_path = os.path.join(_mode_dir(mode, "golden"), out_name)
         elif capture_type == "cyc":
             out_name = f"cycle_{cycle_num}_{ts}.png"
-            out_path = os.path.join(CAMERA_OUTPUT_DIR, "cyc", out_name)
+            out_path = os.path.join(_mode_dir(mode, "cycle_data"), out_name)
         elif capture_type == "anomaly":
             out_name = f"frame_anamoly_{cycle_num}_{ts}.png"
-            out_path = os.path.join(CAMERA_OUTPUT_DIR, "anomaly", out_name)
+            out_path = os.path.join(_mode_dir(mode, "anomaly"), out_name)
         else:
             out_name = f"{capture_type}_{cycle_num}_{ts}.png"
-            out_path = os.path.join(CAMERA_OUTPUT_DIR, out_name)
+            out_path = os.path.join(_mode_dir(mode, "root"), out_name)
         ok = cv2.imwrite(out_path, frame)
         return ok, out_name, out_path
 
@@ -1150,7 +1180,7 @@ def main():
                 stabilized.append(btn)
         return stabilized
 
-    def run_basic_inspection(golden, cyc, run_id, cycle_num, use_temporal_gate=True):
+    def run_basic_inspection(golden, cyc, run_id, cycle_num, use_temporal_gate=True, mode=OUTPUT_MODE_DURABILITY):
         nonlocal locked_roi, button_rois, button_color_baselines, button_roi_locked
         g_src = golden
         c_src = cyc
@@ -1281,8 +1311,8 @@ def main():
         }
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        mask_path = os.path.join(masks_dir, f"inspection_mask_{cycle_num}_{ts}.png")
-        diff_path = os.path.join(masks_dir, f"inspection_diff_{cycle_num}_{ts}.png")
+        mask_path = os.path.join(_mode_dir(mode, "masks"), f"inspection_mask_{cycle_num}_{ts}.png")
+        diff_path = os.path.join(_mode_dir(mode, "masks"), f"inspection_diff_{cycle_num}_{ts}.png")
         cv2.imwrite(mask_path, mask)
         cv2.imwrite(diff_path, diff)
 
@@ -1316,7 +1346,7 @@ def main():
         elif roi_locked and locked_roi is not None:
             x, y, w, h = locked_roi
             cv2.rectangle(disp, (x, y), (x + w, y + h), (255, 0, 0), 2)
-        ok_a, _, anomaly_path = save_capture_frame(disp, "anomaly", run_id, cycle_num)
+        ok_a, _, anomaly_path = save_capture_frame(disp, "anomaly", run_id, cycle_num, mode=mode)
         if not ok_a:
             anomaly_path = ""
 
@@ -1385,7 +1415,7 @@ def main():
 
         capture_type = "cyc"
 
-        ok, out_name, out_path = save_capture_frame(frame, capture_type, run_id, cycle_num)
+        ok, out_name, out_path = save_capture_frame(frame, capture_type, run_id, cycle_num, mode=OUTPUT_MODE_DURABILITY)
         if not ok:
             with state_lock:
                 state.last_capture_result = f"cycle {cycle_num}: save failed"
@@ -1409,12 +1439,12 @@ def main():
                 state.golden_ready = True
             verdict = "GOLDEN"
             msg = "golden_ready"
-            _ensure_cycle_video(golden_frame, run_id)
+            _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_DURABILITY)
             reason_code = "golden_initialized"
         elif golden_frame is not None:
-            verdict, score, _mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, frame, run_id, cycle_num, use_temporal_gate=True)
-            _ensure_cycle_video(golden_frame, run_id)
-            _append_cycle_video_frame(disp, cycle_num)
+            verdict, score, _mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, frame, run_id, cycle_num, use_temporal_gate=True, mode=OUTPUT_MODE_DURABILITY)
+            _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_DURABILITY)
+            _append_cycle_video_frame(disp, cycle_num, mode=OUTPUT_MODE_DURABILITY)
             msg = "inspection_done"
             reason_code = "inspection_scored"
         else:
@@ -1448,7 +1478,7 @@ def main():
             "white_ratio_button": decision_trace.get("white_ratio_button", ""),
             "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""),
         }
-        _manifest_write(rec)
+        _manifest_write(rec, mode=OUTPUT_MODE_DURABILITY)
         inspection_records.append(dict(rec, anomaly_path=anomaly_path))
         _record_anomaly_stats(cycle_num, verdict, score)
         with state_lock:
@@ -2081,7 +2111,7 @@ def main():
                 return
 
             run_id = state.test_name.strip() or "test_report"
-            ok, out_name, out_path = save_capture_frame(frame, "golden", run_id, 0)
+            ok, out_name, out_path = save_capture_frame(frame, "golden", run_id, 0, mode=OUTPUT_MODE_DURABILITY)
             if not ok:
                 with state_lock:
                     state.running = False
@@ -2100,7 +2130,7 @@ def main():
 
             golden_frame = frame.copy()
             golden_path = out_path
-            _ensure_cycle_video(golden_frame, run_id)
+            _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_DURABILITY)
             with state_lock:
                 state.golden_ready = True
 
@@ -2121,7 +2151,7 @@ def main():
                 "video_path": cycle_video_path or "",
                 "anomaly_path": "",
                 "policy": state.auto_fail_policy,
-            })
+            }, mode=OUTPUT_MODE_DURABILITY)
 
             go_home()
             if not wait_until_idle():
@@ -2379,11 +2409,11 @@ def main():
                 "video_path": cycle_video_path or "",
                 "anomaly_path": "",
                 "policy": state.auto_fail_policy,
-            })
+            }, mode=OUTPUT_MODE_MANUAL)
             return
 
         run_id = state.test_name.strip() or "test_report"
-        ok, out_name, out_path = save_capture_frame(frame, "cyc", run_id, capture_num)
+        ok, out_name, out_path = save_capture_frame(frame, "cyc", run_id, capture_num, mode=OUTPUT_MODE_MANUAL)
         if not ok:
             set_alert("red", "Image Capture failed: save error")
             print(f"[GUI] Image Capture failed: could not save {out_path}")
@@ -2404,7 +2434,7 @@ def main():
                 "video_path": cycle_video_path or "",
                 "anomaly_path": "",
                 "policy": state.auto_fail_policy,
-            })
+            }, mode=OUTPUT_MODE_MANUAL)
             return
 
         last_capture_frame = frame.copy()
@@ -2427,7 +2457,7 @@ def main():
             "video_path": cycle_video_path or "",
             "anomaly_path": "",
             "policy": state.auto_fail_policy,
-        })
+        }, mode=OUTPUT_MODE_MANUAL)
         set_alert("#2563eb", f"Image Capture saved: {out_name}")
         print(f"[GUI] Image Capture saved -> {out_path}")
 
@@ -2454,7 +2484,7 @@ def main():
             return
 
         run_id = state.test_name.strip() or "test_report"
-        ok, out_name, out_path = save_capture_frame(frame, "golden", run_id, 0)
+        ok, out_name, out_path = save_capture_frame(frame, "golden", run_id, 0, mode=OUTPUT_MODE_MANUAL)
         if not ok:
             set_alert("red", "Golden Capture failed: save error")
             print(f"[GUI] Golden Capture failed: could not save {out_path}")
@@ -2490,7 +2520,7 @@ def main():
             return
 
         run_id = state.test_name.strip() or "test_report"
-        cyc_num = max(1, state.cycle_count)
+        cyc_num = max(1, int(state.image_capture_count) if int(state.image_capture_count) > 0 else int(state.cycle_count))
         if (not button_roi_locked and (not roi_locked or locked_roi is None)):
             set_alert("#7c3aed", "Run Inspection blocked: capture Golden + select ROI first")
             print("[GUI] Run Inspection blocked: ROI missing")
@@ -2502,11 +2532,11 @@ def main():
             print(f"[GUI] Run Inspection skipped: {q_msg}")
             return
 
-        verdict, score, mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num, use_temporal_gate=False)
-        _ensure_cycle_video(golden_frame, run_id)
-        _append_cycle_video_frame(disp, cyc_num)
-        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", "")})
-        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", "")})
+        verdict, score, mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num, use_temporal_gate=False, mode=OUTPUT_MODE_MANUAL)
+        _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_MANUAL)
+        _append_cycle_video_frame(disp, cyc_num, mode=OUTPUT_MODE_MANUAL)
+        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", "")}, mode=OUTPUT_MODE_MANUAL)
+        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", "")})
         _record_anomaly_stats(cyc_num, verdict, score)
         with state_lock:
             state.last_capture_result = f"manual/{verdict}"
@@ -2661,11 +2691,17 @@ def main():
             return True
 
         run_id = state.test_name.strip() or "test_report"
-        cyc_num = max(1, state.cycle_count)
-        ok_save, _name, out_path = save_capture_frame(frame, "cyc", run_id, cyc_num)
+        cyc_num = max(1, int(capture_idx))
+        ok_save, _name, out_path = save_capture_frame(frame, "cyc", run_id, cyc_num, mode=OUTPUT_MODE_VISUAL)
         if not ok_save:
             set_alert("red", "VI capture save failed")
             return False
+
+        _vi_overall_verdict, _vi_score, _vi_mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(
+            golden_frame, frame, run_id, cyc_num, use_temporal_gate=False, mode=OUTPUT_MODE_VISUAL
+        )
+        _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_VISUAL)
+        _append_cycle_video_frame(disp, cyc_num, mode=OUTPUT_MODE_VISUAL)
 
         # per-region VI evaluation: A/B/C/D + Large area L
         region_results = {}
@@ -2694,6 +2730,33 @@ def main():
             "reason": "ok" if overall_pass else f"failed:{','.join(failed_regions)}",
         })
 
+        _manifest_write({
+            "run_id": run_id,
+            "cycle": cyc_num,
+            "capture_type": "vi",
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "camera_status": camera_status,
+            "result": "OK",
+            "message": "vi_inspection",
+            "reason_code": "inspection_scored",
+            "file_path": out_path,
+            "score": "",
+            "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
+            "verdict": overall_verdict,
+            "golden_path": golden_path or "",
+            "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_VISUAL),
+            "anomaly_path": anomaly_path,
+            "policy": state.auto_fail_policy,
+            "decision_logic": decision_trace.get("decision_logic", ""),
+            "failed_metric": decision_trace.get("failed_metric", ""),
+            "max_contour_area": decision_trace.get("max_contour_area", ""),
+            "max_bbox": decision_trace.get("max_bbox", ""),
+            "score_role": decision_trace.get("score_role", ""),
+            "button_drop_pct": decision_trace.get("button_drop_pct", ""),
+            "white_ratio_button": decision_trace.get("white_ratio_button", ""),
+            "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""),
+        }, mode=OUTPUT_MODE_VISUAL)
+
         try:
             if vi_report_path:
                 build_vi_report_pdf(vi_report_path)
@@ -2715,7 +2778,7 @@ def main():
         vi_end_wall = now + vi_total_min * 60.0
         run_id = state.test_name.strip() or "test_report"
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        vi_report_path = os.path.join(reports_dir, f"visual_inspection_report_{run_id}_{ts}.pdf")
+        vi_report_path = os.path.join(_mode_report_dir(OUTPUT_MODE_VISUAL), f"visual_inspection_report_{run_id}_{ts}.pdf")
         try:
             build_vi_report_pdf(vi_report_path)
         except Exception as exc:
@@ -2813,7 +2876,7 @@ def main():
     def on_reset(_evt):
         nonlocal golden_frame, golden_path, last_capture_frame, last_capture_path, locked_roi, roi_locked
         nonlocal button_rois, area_l_roi, button_color_baselines, button_roi_locked, button_fail_history
-        nonlocal cycle_video_writer, cycle_video_path, cycle_video_started, auto_report_written_cycle
+        nonlocal cycle_video_path, auto_report_written_cycle
         nonlocal vi_running, vi_results, vi_capture_idx, vi_report_path, vi_next_capture_wall, vi_end_wall, vi_status_text
         with state_lock:
             state.force_out_of_range = {"A": 0, "B": 0, "C": 0, "D": 0}
@@ -2838,14 +2901,17 @@ def main():
             "worst_score": -1.0,
             "worst_cycle": "",
         })
-        if cycle_video_writer is not None:
-            try:
-                cycle_video_writer.release()
-            except Exception:
-                pass
-        cycle_video_writer = None
+        for _mode in OUTPUT_MODES:
+            _st = _video_state(_mode)
+            if _st["writer"] is not None:
+                try:
+                    _st["writer"].release()
+                except Exception:
+                    pass
+            _st["writer"] = None
+            _st["path"] = None
+            _st["started"] = False
         cycle_video_path = None
-        cycle_video_started = False
         auto_report_written_cycle = -1
         vi_running = False
         vi_results = []
@@ -3078,7 +3144,7 @@ def main():
     def _auto_report_path():
         run_id = state.test_name.strip() or "test_report"
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return os.path.join(reports_dir, f"report_{run_id}_{ts}.pdf")
+        return os.path.join(_mode_report_dir(OUTPUT_MODE_DURABILITY), f"report_{run_id}_{ts}.pdf")
 
     def _open_file(path):
         if sys.platform.startswith("win"):
@@ -3089,7 +3155,8 @@ def main():
             subprocess.run(["xdg-open", path], check=False)
 
     def _latest_report_path():
-        files = [os.path.join(reports_dir, f) for f in os.listdir(reports_dir) if f.lower().endswith(".pdf")]
+        report_dir = _mode_report_dir(OUTPUT_MODE_DURABILITY)
+        files = [os.path.join(report_dir, f) for f in os.listdir(report_dir) if f.lower().endswith(".pdf")]
         if not files:
             return None
         files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
@@ -3598,8 +3665,11 @@ def main():
         pass
     finally:
         try:
-            if cycle_video_writer is not None:
-                cycle_video_writer.release()
+            for _mode in OUTPUT_MODES:
+                _st = _video_state(_mode)
+                if _st["writer"] is not None:
+                    _st["writer"].release()
+                    _st["writer"] = None
         except Exception:
             pass
         try:
