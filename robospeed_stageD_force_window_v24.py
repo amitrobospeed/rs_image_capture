@@ -600,7 +600,8 @@ def main():
             "message", "reason_code", "file_path", "score", "threshold", "verdict",
             "golden_path", "video_path", "anomaly_path", "policy",
             "decision_logic", "failed_metric", "max_contour_area", "max_bbox", "score_role",
-            "button_drop_pct", "white_ratio_button", "white_ratio_change_pct"
+            "button_drop_pct", "white_ratio_button", "white_ratio_change_pct",
+            "A", "B", "C", "D", "L", "overall", "reason"
         ]
         with open(manifest_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
@@ -1277,7 +1278,18 @@ def main():
                 ratio_fail_buttons = _apply_temporal_white_fail(ratio_fail_buttons)
             white_fail = len(ratio_fail_buttons) > 0
 
-        defect_found = contour_fail or white_fail
+        region_results = {}
+        if button_roi_locked and button_rois and (area_l_roi is not None):
+            for _btn in BUTTON_ORDER:
+                region_results[_btn] = _vi_eval_region(golden, cyc, _btn, button_rois[_btn])
+            region_results["L"] = _vi_eval_region(golden, cyc, "L", area_l_roi)
+
+        if region_results:
+            failed_regions = [k for k in ["A", "B", "C", "D", "L"] if region_results[k]["verdict"] != "PASS"]
+            defect_found = len(failed_regions) > 0
+        else:
+            failed_regions = []
+            defect_found = contour_fail or white_fail
 
         verdict = "FAIL" if defect_found else "PASS"
         decision_logic = (
@@ -1286,7 +1298,9 @@ def main():
             f"bbox>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}; "
             f"white gate: white_px_drop>per-button threshold; temporal={'ON' if use_temporal_gate else 'OFF'} ({BUTTON_TEMPORAL_FAILS_REQUIRED}/{BUTTON_TEMPORAL_WINDOW})"
         )
-        if contour_fail and white_fail:
+        if region_results and failed_regions:
+            failed_metric = f"roi_failed:{','.join(failed_regions)}"
+        elif contour_fail and white_fail:
             failed_metric = f"contour+white_px_drop:{','.join(ratio_fail_buttons)}"
         elif white_fail:
             failed_metric = f"white_px_drop:{','.join(ratio_fail_buttons)}"
@@ -1308,6 +1322,14 @@ def main():
             "coating_gate_pct": f"{coating_gate_pct:.1f}",
             "white_ratio_button": worst_ratio_btn,
             "display_score": f"{score_value:.2f}",
+            "roi_A": region_results.get("A", {}).get("verdict", ""),
+            "roi_B": region_results.get("B", {}).get("verdict", ""),
+            "roi_C": region_results.get("C", {}).get("verdict", ""),
+            "roi_D": region_results.get("D", {}).get("verdict", ""),
+            "roi_L": region_results.get("L", {}).get("verdict", ""),
+            "roi_overall": verdict if region_results else "",
+            "roi_reason": "ok" if (region_results and not failed_regions) else ((f"failed:{','.join(failed_regions)}") if region_results else ""),
+            "roi_verdicts_map": {k: v.get("verdict", "") for k, v in region_results.items()} if region_results else {},
         }
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1477,6 +1499,13 @@ def main():
             "button_drop_pct": decision_trace.get("button_drop_pct", ""),
             "white_ratio_button": decision_trace.get("white_ratio_button", ""),
             "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""),
+            "A": decision_trace.get("roi_A", ""),
+            "B": decision_trace.get("roi_B", ""),
+            "C": decision_trace.get("roi_C", ""),
+            "D": decision_trace.get("roi_D", ""),
+            "L": decision_trace.get("roi_L", ""),
+            "overall": decision_trace.get("roi_overall", verdict),
+            "reason": decision_trace.get("roi_reason", ""),
         }
         _manifest_write(rec, mode=OUTPUT_MODE_DURABILITY)
         inspection_records.append(dict(rec, anomaly_path=anomaly_path))
@@ -2535,8 +2564,8 @@ def main():
         verdict, score, mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num, use_temporal_gate=False, mode=OUTPUT_MODE_MANUAL)
         _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_MANUAL)
         _append_cycle_video_frame(disp, cyc_num, mode=OUTPUT_MODE_MANUAL)
-        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", "")}, mode=OUTPUT_MODE_MANUAL)
-        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", "")})
+        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", "")}, mode=OUTPUT_MODE_MANUAL)
+        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", "")})
         _record_anomaly_stats(cyc_num, verdict, score)
         with state_lock:
             state.last_capture_result = f"manual/{verdict}"
@@ -2755,6 +2784,13 @@ def main():
             "button_drop_pct": decision_trace.get("button_drop_pct", ""),
             "white_ratio_button": decision_trace.get("white_ratio_button", ""),
             "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""),
+            "A": region_results["A"]["verdict"],
+            "B": region_results["B"]["verdict"],
+            "C": region_results["C"]["verdict"],
+            "D": region_results["D"]["verdict"],
+            "L": region_results["L"]["verdict"],
+            "overall": overall_verdict,
+            "reason": "ok" if overall_pass else f"failed:{','.join(failed_regions)}",
         }, mode=OUTPUT_MODE_VISUAL)
 
         try:
@@ -3038,46 +3074,20 @@ def main():
             anomaly_fig.text(0.06, y, stats_txt, fontsize=9)
             y -= 0.06
             if inspection_records:
-                table_cols = ["Cycle", "Type", "Verdict", "Metric", "FailedBtn", "A%", "B%", "C%", "D%", "Reason"]
+                table_cols = ["#", "Timestamp", "Elapsed(min)", "A", "B", "C", "D", "L", "Overall", "Reason"]
                 table_rows = []
                 for rec in inspection_records[-20:]:
-                    try:
-                        score_txt = f"{float(rec.get('score', '')):.2f}"
-                    except Exception:
-                        score_txt = str(rec.get('score', ''))
-                    drops = {b: "0.00" for b in BUTTON_ORDER}
-                    drop_raw = str(rec.get("button_drop_pct", "") or "")
-                    for token in drop_raw.split("|"):
-                        if ":" not in token:
-                            continue
-                        k, v = token.split(":", 1)
-                        k = k.strip()
-                        if k in drops:
-                            try:
-                                drops[k] = f"{float(v):.2f}"
-                            except Exception:
-                                drops[k] = v.strip()
-                    verdict_txt = str(rec.get("verdict", "") or "")
-                    failed_btn = "-"
-                    if verdict_txt.upper() == "FAIL":
-                        failed_btn = str(rec.get("white_ratio_button", "") or "")
-                        if not failed_btn:
-                            fm = str(rec.get("failed_metric", "") or "")
-                            if ":" in fm:
-                                failed_btn = fm.split(":", 1)[1].strip()
-                        failed_btn = failed_btn or "-"
-                    metric_name = rec.get("score_role", "inspection_metric")
                     table_rows.append([
                         str(rec.get("cycle", "")),
-                        str(rec.get("capture_type", "")),
-                        verdict_txt,
-                        f"{metric_name}:{score_txt}",
-                        failed_btn,
-                        drops["A"],
-                        drops["B"],
-                        drops["C"],
-                        drops["D"],
-                        str(rec.get("reason_code", rec.get("message", "")) or ""),
+                        str(rec.get("timestamp", ""))[:19],
+                        "",
+                        str(rec.get("A", "")),
+                        str(rec.get("B", "")),
+                        str(rec.get("C", "")),
+                        str(rec.get("D", "")),
+                        str(rec.get("L", "")),
+                        str(rec.get("overall", rec.get("verdict", ""))),
+                        str(rec.get("reason", rec.get("reason_code", rec.get("message", ""))))[:34],
                     ])
 
                 anomaly_fig.text(0.06, y, "Inspection Snapshot (latest 20)", fontsize=11, weight="bold")
@@ -3086,7 +3096,7 @@ def main():
                 table_bottom = table_top - table_height
                 table_ax = anomaly_fig.add_axes([0.05, table_bottom, 0.90, table_height])
                 table_ax.axis("off")
-                col_widths = [0.06, 0.07, 0.08, 0.15, 0.08, 0.05, 0.05, 0.05, 0.05, 0.22]
+                col_widths = [0.06, 0.15, 0.09, 0.06, 0.06, 0.06, 0.06, 0.06, 0.09, 0.25]
                 inspection_table = table_ax.table(
                     cellText=table_rows,
                     colLabels=table_cols,
