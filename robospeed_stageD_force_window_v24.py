@@ -41,6 +41,7 @@ deviation_threshold = 0.50
 ALERT_FLASH_S = 1.0
 TARE_WARMUP_S = 3.0
 TARE_SAMPLES = 200
+FORCE_DRIFT_RE_TARE_PCT = 5.0
 
 # ================================
 # UI SETTINGS
@@ -57,6 +58,10 @@ COLOR_TEXT = "#e5e7eb"
 
 CAMERA_WINDOW_NAME = "IC Camera"
 CAMERA_OUTPUT_DIR = "inspection_output"
+OUTPUT_MODE_DURABILITY = "cycle_durability"
+OUTPUT_MODE_VISUAL = "cycle_visual"
+OUTPUT_MODE_MANUAL = "manual_inspection"
+OUTPUT_MODES = (OUTPUT_MODE_DURABILITY, OUTPUT_MODE_VISUAL, OUTPUT_MODE_MANUAL)
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 15
@@ -240,10 +245,10 @@ class SystemState:
     last_capture_result: str = "none"
     auto_capture_retries: int = DEFAULT_AUTO_CAPTURE_RETRIES
     auto_fail_policy: str = "safe_stop"
-    detect_contour_enabled: bool = False
-    detect_white_ratio_enabled: bool = True
+    detect_contour_enabled: bool = True
+    detect_white_ratio_enabled: bool = False
     coating_degradation_pct: float = BUTTON_COATING_DEGRADATION_PCT_DEFAULT
-    baseline_quality_enabled: bool = True
+    baseline_quality_enabled: bool = False
 
 
 def main():
@@ -290,6 +295,7 @@ def main():
     camera_white_balance = 4600
     camera_settings_locked = False
     camera_tuned_once = False
+    camera_tune_enabled = False
 
     # capture/inspection session artifacts
     golden_frame = None
@@ -310,29 +316,60 @@ def main():
     locked_roi = None
     roi_locked = False
     button_rois = {}
+    area_l_roi = None
     button_color_baselines = {}
     button_roi_locked = False
     button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
     button_coating_thresholds = dict(PER_BUTTON_COATING_THRESHOLDS_DEFAULT)
 
-    manifest_path = os.path.join(CAMERA_OUTPUT_DIR, "manifest.csv")
-    reports_dir = os.path.join(CAMERA_OUTPUT_DIR, "reports")
-    masks_dir = os.path.join(CAMERA_OUTPUT_DIR, "masks")
+    mode_dirs = {}
+    for _mode in OUTPUT_MODES:
+        _root = os.path.join(CAMERA_OUTPUT_DIR, _mode)
+        mode_dirs[_mode] = {
+            "root": _root,
+            "golden": os.path.join(_root, "golden"),
+            "cycle_data": os.path.join(_root, "cycle_data"),
+            "anomaly": os.path.join(_root, "anomaly"),
+            "masks": os.path.join(_root, "masks"),
+            "videos": os.path.join(_root, "videos"),
+            "reports": os.path.join(_root, "reports"),
+            "manifest": os.path.join(_root, "manifest.csv"),
+        }
+
+    cycle_video_state = {m: {"path": None, "writer": None, "started": False} for m in OUTPUT_MODES}
     cycle_video_path = None
-    cycle_video_writer = None
-    cycle_video_started = False
     last_saved_report_path = None
     auto_report_written_cycle = -1
 
-    for _d in [
-        os.path.join(CAMERA_OUTPUT_DIR, "golden"),
-        os.path.join(CAMERA_OUTPUT_DIR, "cyc"),
-        os.path.join(CAMERA_OUTPUT_DIR, "anomaly"),
-        masks_dir,
-        os.path.join(CAMERA_OUTPUT_DIR, "video"),
-        reports_dir,
-    ]:
-        os.makedirs(_d, exist_ok=True)
+    # Visual Inspection (VI) stability run state
+    vi_running = False
+    vi_interval_min = 5.0
+    vi_total_min = 20.0
+    vi_next_capture_wall = 0.0
+    vi_end_wall = 0.0
+    vi_capture_idx = 0
+    vi_results = []
+    vi_report_path = None
+    vi_status_text = ""
+
+    for _mode in OUTPUT_MODES:
+        for _k in ("root", "golden", "cycle_data", "anomaly", "masks", "videos", "reports"):
+            os.makedirs(mode_dirs[_mode][_k], exist_ok=True)
+
+    def _mode_dir(mode, key):
+        return mode_dirs.get(mode, mode_dirs[OUTPUT_MODE_DURABILITY])[key]
+
+    def _mode_manifest_path(mode):
+        return _mode_dir(mode, "manifest")
+
+    def _mode_report_dir(mode):
+        return _mode_dir(mode, "reports")
+
+    def _video_state(mode):
+        return cycle_video_state.get(mode, cycle_video_state[OUTPUT_MODE_DURABILITY])
+
+    def _cycle_video_path_for_mode(mode):
+        return _video_state(mode).get("path") or ""
 
     def _set_camera_status(msg):
         nonlocal camera_status
@@ -549,100 +586,22 @@ def main():
         camera_white_balance = wb
         _apply_locked_camera_settings(sensor)
 
-        # Stage 1: hard specular rejection first (reduce exposure until clipping is controlled)
-        for _ in range(TUNE_MAX_ITERS):
-            mean_l, sat = _compute_button_luma_stats(frame)
-            if sat <= MAX_SAT_PCT:
-                break
-            exp = int(np.clip(exp * 0.75, EXPOSURE_MIN, EXPOSURE_MAX))
-            try:
-                sensor.set_option(rs.option.exposure, exp)
-                sensor.set_option(rs.option.gain, gain)
-                sensor.set_option(rs.option.enable_auto_exposure, 0)
-            except Exception:
-                set_alert("red", "Camera tune failed: cannot apply exposure")
-                return False
-            time.sleep(0.12)
-            frame, _ = capture_average_frame(min_frames=6, timeout_s=1.2)
-            if frame is None:
-                frame = get_latest_camera_frame()
-                if frame is None:
-                    break
-
-        # Stage 2: exposure alignment around target mean, but never if clipping returns
-        for _ in range(max(2, TUNE_MAX_ITERS // 2)):
-            mean_l, sat = _compute_button_luma_stats(frame)
-            if sat > MAX_SAT_PCT:
-                exp = int(np.clip(exp * 0.8, EXPOSURE_MIN, EXPOSURE_MAX))
-            elif mean_l > TARGET_LUMA_MEAN + 5:
-                exp = int(np.clip(exp * 0.9, EXPOSURE_MIN, EXPOSURE_MAX))
-            elif mean_l < TARGET_LUMA_MEAN - 5 and sat <= (MAX_SAT_PCT * 0.5):
-                exp = int(np.clip(exp * 1.05, EXPOSURE_MIN, EXPOSURE_MAX))
-            else:
-                break
-
-            try:
-                sensor.set_option(rs.option.exposure, exp)
-                sensor.set_option(rs.option.gain, gain)
-                sensor.set_option(rs.option.enable_auto_exposure, 0)
-            except Exception:
-                set_alert("red", "Camera tune failed: cannot apply exposure")
-                return False
-
-            time.sleep(0.10)
-            frame, _ = capture_average_frame(min_frames=6, timeout_s=1.0)
-            if frame is None:
-                frame = get_latest_camera_frame()
-                if frame is None:
-                    break
-
-        # Stage 3: gain-only fine tune (never brighten if highlights are clipping)
-        for _ in range(max(2, TUNE_MAX_ITERS // 2)):
-            mean_l, sat = _compute_button_luma_stats(frame)
-
-            if sat > MAX_SAT_PCT:
-                gain = int(gain * 0.85)
-            elif mean_l > TARGET_LUMA_MEAN + 3:
-                gain = int(gain * 0.9)
-            elif mean_l < TARGET_LUMA_MEAN - 3 and sat <= (MAX_SAT_PCT * 0.5):
-                gain = int(gain * 1.08)
-            else:
-                break
-
-            gain = int(np.clip(gain, GAIN_MIN, GAIN_MAX))
-
-            try:
-                sensor.set_option(rs.option.gain, gain)
-                sensor.set_option(rs.option.enable_auto_exposure, 0)
-            except Exception:
-                set_alert("red", "Camera tune failed: cannot apply gain")
-                return False
-
-            time.sleep(0.10)
-            frame, _ = capture_average_frame(min_frames=6, timeout_s=1.0)
-            if frame is None:
-                frame = get_latest_camera_frame()
-                if frame is None:
-                    break
-
-        camera_exposure = exp
-        camera_gain = gain
-        camera_white_balance = wb
-        _apply_locked_camera_settings(sensor)
         _, final_sat = _compute_button_luma_stats(frame)
         camera_settings_locked = True
         camera_tuned_once = True
-        set_alert("green", f"Camera tuned+locked exp={exp} gain={gain} wb={wb} sat={final_sat:.2f}%")
+        set_alert("green", f"Camera tuned+locked (Stage0 only) exp={exp} gain={gain} wb={wb} sat={final_sat:.2f}%")
         return True
 
-    def _manifest_write(row):
+    def _manifest_write(row, mode=OUTPUT_MODE_DURABILITY):
+        manifest_path = _mode_manifest_path(mode)
         file_exists = os.path.exists(manifest_path)
         fields = [
             "run_id", "cycle", "capture_type", "timestamp", "camera_status", "result",
             "message", "reason_code", "file_path", "score", "threshold", "verdict",
             "golden_path", "video_path", "anomaly_path", "policy",
             "decision_logic", "failed_metric", "max_contour_area", "max_bbox", "score_role",
-            "button_drop_pct", "white_ratio_button", "white_ratio_change_pct"
+            "button_drop_pct", "white_ratio_button", "white_ratio_change_pct",
+            "A", "B", "C", "D", "L", "overall", "reason"
         ]
         with open(manifest_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
@@ -942,7 +901,7 @@ def main():
         return float(np.mean(means)), float(max(sats))
 
     def _select_button_rois_and_calibrate(frame):
-        nonlocal button_rois, button_color_baselines, button_roi_locked, locked_roi, roi_locked, button_fail_history
+        nonlocal button_rois, area_l_roi, button_color_baselines, button_roi_locked, locked_roi, roi_locked, button_fail_history
         selected = dict(button_rois) if (button_roi_locked and button_rois) else {}
         shape_mode = "rect"
         start_pt = None
@@ -951,7 +910,8 @@ def main():
         working_roi = None
         actions = {}
         current_idx = 0
-        status_msg = "Draw ROI then Next; Draw all four then Lock All"
+        roi_targets = BUTTON_ORDER + ["L"]
+        status_msg = "Draw ROI then Next; Draw A,B,C,D and L then Lock All"
 
         def _is_valid_roi(roi):
             if not roi:
@@ -967,7 +927,7 @@ def main():
             return False
 
         def _target_btn():
-            return BUTTON_ORDER[current_idx]
+            return roi_targets[current_idx]
 
         def _draw_buttons(canvas):
             nonlocal actions
@@ -1022,7 +982,7 @@ def main():
             nonlocal status_msg
             if _is_valid_roi(working_roi):
                 _commit_current_btn()
-            missing = [b for b in BUTTON_ORDER if b not in selected]
+            missing = [b for b in roi_targets if b not in selected]
             if missing:
                 status_msg = f"Missing ROI: {','.join(missing)}"
                 return False
@@ -1043,7 +1003,7 @@ def main():
                     return
                 if k == "next":
                     if _commit_current_btn():
-                        current_idx = (current_idx + 1) % len(BUTTON_ORDER)
+                        current_idx = (current_idx + 1) % len(roi_targets)
                         start_pt = None
                         drag_pt = None
                         poly_pts = []
@@ -1078,12 +1038,12 @@ def main():
         cv2.setMouseCallback(window_name, _mouse_cb)
         while True:
             canvas = frame.copy()
-            cv2.putText(canvas, "Draw all button ROIs in one window, then Lock All", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+            cv2.putText(canvas, "Draw ROIs for A,B,C,D and Area L, then Lock All", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
             cv2.putText(canvas, f"Current button: {_target_btn()}  |  Enter=Lock All  Esc=Cancel  Backspace=Undo poly point", (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1)
             cv2.putText(canvas, status_msg, (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 255, 180), 1)
             _draw_buttons(canvas)
 
-            for b in BUTTON_ORDER:
+            for b in roi_targets:
                 if b in selected:
                     _draw_roi(canvas, selected[b], color=(255, 0, 0), label=b)
 
@@ -1113,6 +1073,7 @@ def main():
                 status_msg = f"{_target_btn()} polygon points: {len(poly_pts)}"
 
         button_rois = {b: _sanitize_roi(selected[b], frame.shape) for b in BUTTON_ORDER}
+        area_l_roi = _sanitize_roi(selected["L"], frame.shape)
         button_color_baselines = {b: _compute_button_color_stats(frame, button_rois[b], b) for b in BUTTON_ORDER}
         with state_lock:
             baseline_gate_on = bool(state.baseline_quality_enabled)
@@ -1133,6 +1094,7 @@ def main():
         button_roi_locked = True
 
         bounds = [_roi_bounds(r, frame.shape) for r in button_rois.values()]
+        bounds.append(_roi_bounds(area_l_roi, frame.shape))
         xs = [r[0] for r in bounds]
         ys = [r[1] for r in bounds]
         x2 = [r[0] + r[2] for r in bounds]
@@ -1141,17 +1103,19 @@ def main():
         roi_locked = True
         return True
 
-    def _ensure_cycle_video(golden_img, run_id):
-        nonlocal cycle_video_path, cycle_video_writer, cycle_video_started
-        if cycle_video_writer is not None:
+    def _ensure_cycle_video(golden_img, run_id, mode=OUTPUT_MODE_DURABILITY):
+        nonlocal cycle_video_path
+        st = _video_state(mode)
+        if st["writer"] is not None:
+            cycle_video_path = st.get("path")
             return True
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        cycle_video_path = os.path.join(CAMERA_OUTPUT_DIR, "video", f"cycle_inspection_{run_id}_{ts}.mp4")
+        st["path"] = os.path.join(_mode_dir(mode, "videos"), f"cycle_inspection_{run_id}_{ts}.mp4")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        cycle_video_writer = cv2.VideoWriter(cycle_video_path, fourcc, max(1, CAMERA_FPS), (CAMERA_WIDTH, CAMERA_HEIGHT))
-        if not cycle_video_writer.isOpened():
-            cycle_video_writer = None
-            cycle_video_path = None
+        st["writer"] = cv2.VideoWriter(st["path"], fourcc, max(1, CAMERA_FPS), (CAMERA_WIDTH, CAMERA_HEIGHT))
+        if not st["writer"].isOpened():
+            st["writer"] = None
+            st["path"] = None
             return False
         golden_tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         intro_src = golden_img.copy()
@@ -1162,34 +1126,41 @@ def main():
             x, y, w, h = locked_roi
             cv2.rectangle(intro_src, (x, y), (x + w, y + h), (255, 0, 0), 2)
         intro = _stamp(intro_src, f"GOLDEN | run={run_id} | {golden_tag}")
-        cycle_video_writer.write(intro)
-        cycle_video_started = True
+        st["writer"].write(intro)
+        st["started"] = True
+        cycle_video_path = st.get("path")
         return True
 
-    def _append_cycle_video_frame(frame, cycle_num):
-        if cycle_video_writer is None:
+    def _append_cycle_video_frame(frame, cycle_num, mode=OUTPUT_MODE_DURABILITY):
+        nonlocal cycle_video_path
+        st = _video_state(mode)
+        if st["writer"] is None:
             return
         tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         stamped = _stamp(frame, f"CYCLE {cycle_num} | {tag}", color=(0, 255, 0))
-        cycle_video_writer.write(stamped)
+        st["writer"].write(stamped)
+        cycle_video_path = st.get("path")
 
-    def save_capture_frame(frame, capture_type, run_id, cycle_num=0):
+    def save_capture_frame(frame, capture_type, run_id, cycle_num=0, mode=OUTPUT_MODE_DURABILITY):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         if capture_type == "golden":
             out_name = f"golden_{run_id}.png"
-            out_path = os.path.join(CAMERA_OUTPUT_DIR, "golden", out_name)
+            out_path = os.path.join(_mode_dir(mode, "golden"), out_name)
             if os.path.exists(out_path):
                 out_name = f"golden_{run_id}_{ts}.png"
-                out_path = os.path.join(CAMERA_OUTPUT_DIR, "golden", out_name)
+                out_path = os.path.join(_mode_dir(mode, "golden"), out_name)
+        elif capture_type == "golden_roi":
+            out_name = f"golden_roi_{run_id}_{ts}.png"
+            out_path = os.path.join(_mode_dir(mode, "golden"), out_name)
         elif capture_type == "cyc":
             out_name = f"cycle_{cycle_num}_{ts}.png"
-            out_path = os.path.join(CAMERA_OUTPUT_DIR, "cyc", out_name)
+            out_path = os.path.join(_mode_dir(mode, "cycle_data"), out_name)
         elif capture_type == "anomaly":
             out_name = f"frame_anamoly_{cycle_num}_{ts}.png"
-            out_path = os.path.join(CAMERA_OUTPUT_DIR, "anomaly", out_name)
+            out_path = os.path.join(_mode_dir(mode, "anomaly"), out_name)
         else:
             out_name = f"{capture_type}_{cycle_num}_{ts}.png"
-            out_path = os.path.join(CAMERA_OUTPUT_DIR, out_name)
+            out_path = os.path.join(_mode_dir(mode, "root"), out_name)
         ok = cv2.imwrite(out_path, frame)
         return ok, out_name, out_path
 
@@ -1198,8 +1169,6 @@ def main():
             return False, "frame_missing", "avg_no_camera_frame"
         if int(frames_used) < int(CAPTURE_AVG_MIN_FRAMES):
             return False, f"avg_frames_low:{frames_used}/{CAPTURE_AVG_MIN_FRAMES}", "avg_frames_low"
-        if not camera_settings_locked:
-            return False, "camera_not_locked", "camera_not_locked"
         _mean_l, sat = _compute_button_luma_stats(frame)
         if sat > MAX_SAT_PCT:
             return False, f"clip_high:{sat:.2f}%>{MAX_SAT_PCT:.2f}%", "clipping_high"
@@ -1215,7 +1184,7 @@ def main():
                 stabilized.append(btn)
         return stabilized
 
-    def run_basic_inspection(golden, cyc, run_id, cycle_num, use_temporal_gate=True):
+    def run_basic_inspection(golden, cyc, run_id, cycle_num, use_temporal_gate=True, mode=OUTPUT_MODE_DURABILITY):
         nonlocal locked_roi, button_rois, button_color_baselines, button_roi_locked
         g_src = golden
         c_src = cyc
@@ -1312,7 +1281,18 @@ def main():
                 ratio_fail_buttons = _apply_temporal_white_fail(ratio_fail_buttons)
             white_fail = len(ratio_fail_buttons) > 0
 
-        defect_found = contour_fail or white_fail
+        region_results = {}
+        if button_roi_locked and button_rois and (area_l_roi is not None):
+            for _btn in BUTTON_ORDER:
+                region_results[_btn] = _vi_eval_region(golden, cyc, _btn, button_rois[_btn])
+            region_results["L"] = _vi_eval_region(golden, cyc, "L", area_l_roi)
+
+        if region_results:
+            failed_regions = [k for k in ["A", "B", "C", "D", "L"] if region_results[k]["verdict"] != "PASS"]
+            defect_found = len(failed_regions) > 0
+        else:
+            failed_regions = []
+            defect_found = contour_fail or white_fail
 
         verdict = "FAIL" if defect_found else "PASS"
         decision_logic = (
@@ -1321,7 +1301,9 @@ def main():
             f"bbox>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}; "
             f"white gate: white_px_drop>per-button threshold; temporal={'ON' if use_temporal_gate else 'OFF'} ({BUTTON_TEMPORAL_FAILS_REQUIRED}/{BUTTON_TEMPORAL_WINDOW})"
         )
-        if contour_fail and white_fail:
+        if region_results and failed_regions:
+            failed_metric = f"roi_failed:{','.join(failed_regions)}"
+        elif contour_fail and white_fail:
             failed_metric = f"contour+white_px_drop:{','.join(ratio_fail_buttons)}"
         elif white_fail:
             failed_metric = f"white_px_drop:{','.join(ratio_fail_buttons)}"
@@ -1343,11 +1325,19 @@ def main():
             "coating_gate_pct": f"{coating_gate_pct:.1f}",
             "white_ratio_button": worst_ratio_btn,
             "display_score": f"{score_value:.2f}",
+            "roi_A": region_results.get("A", {}).get("verdict", ""),
+            "roi_B": region_results.get("B", {}).get("verdict", ""),
+            "roi_C": region_results.get("C", {}).get("verdict", ""),
+            "roi_D": region_results.get("D", {}).get("verdict", ""),
+            "roi_L": region_results.get("L", {}).get("verdict", ""),
+            "roi_overall": verdict if region_results else "",
+            "roi_reason": "ok" if (region_results and not failed_regions) else ((f"failed:{','.join(failed_regions)}") if region_results else ""),
+            "roi_verdicts_map": {k: v.get("verdict", "") for k, v in region_results.items()} if region_results else {},
         }
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        mask_path = os.path.join(masks_dir, f"inspection_mask_{cycle_num}_{ts}.png")
-        diff_path = os.path.join(masks_dir, f"inspection_diff_{cycle_num}_{ts}.png")
+        mask_path = os.path.join(_mode_dir(mode, "masks"), f"inspection_mask_{cycle_num}_{ts}.png")
+        diff_path = os.path.join(_mode_dir(mode, "masks"), f"inspection_diff_{cycle_num}_{ts}.png")
         cv2.imwrite(mask_path, mask)
         cv2.imwrite(diff_path, diff)
 
@@ -1373,13 +1363,22 @@ def main():
             else:
                 cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 2)
 
+        if region_results and failed_regions:
+            for _r in failed_regions:
+                if _r in BUTTON_ORDER and _r in button_rois:
+                    _draw_roi(disp, button_rois[_r], color=(0, 0, 255), label=f"{_r}!")
+                elif _r == "L" and area_l_roi is not None:
+                    _draw_roi(disp, area_l_roi, color=(0, 0, 255), label="L!")
+
         if button_roi_locked and button_rois:
             for _btn, _roi in button_rois.items():
                 _draw_roi(disp, _roi, color=(255, 0, 0), label=_btn)
+            if area_l_roi is not None:
+                _draw_roi(disp, area_l_roi, color=(0, 255, 255), label="L")
         elif roi_locked and locked_roi is not None:
             x, y, w, h = locked_roi
             cv2.rectangle(disp, (x, y), (x + w, y + h), (255, 0, 0), 2)
-        ok_a, _, anomaly_path = save_capture_frame(disp, "anomaly", run_id, cycle_num)
+        ok_a, _, anomaly_path = save_capture_frame(disp, "anomaly", run_id, cycle_num, mode=mode)
         if not ok_a:
             anomaly_path = ""
 
@@ -1448,7 +1447,7 @@ def main():
 
         capture_type = "cyc"
 
-        ok, out_name, out_path = save_capture_frame(frame, capture_type, run_id, cycle_num)
+        ok, out_name, out_path = save_capture_frame(frame, capture_type, run_id, cycle_num, mode=OUTPUT_MODE_DURABILITY)
         if not ok:
             with state_lock:
                 state.last_capture_result = f"cycle {cycle_num}: save failed"
@@ -1472,12 +1471,12 @@ def main():
                 state.golden_ready = True
             verdict = "GOLDEN"
             msg = "golden_ready"
-            _ensure_cycle_video(golden_frame, run_id)
+            _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_DURABILITY)
             reason_code = "golden_initialized"
         elif golden_frame is not None:
-            verdict, score, _mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, frame, run_id, cycle_num, use_temporal_gate=True)
-            _ensure_cycle_video(golden_frame, run_id)
-            _append_cycle_video_frame(disp, cycle_num)
+            verdict, score, _mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, frame, run_id, cycle_num, use_temporal_gate=True, mode=OUTPUT_MODE_DURABILITY)
+            _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_DURABILITY)
+            _append_cycle_video_frame(disp, cycle_num, mode=OUTPUT_MODE_DURABILITY)
             msg = "inspection_done"
             reason_code = "inspection_scored"
         else:
@@ -1510,8 +1509,15 @@ def main():
             "button_drop_pct": decision_trace.get("button_drop_pct", ""),
             "white_ratio_button": decision_trace.get("white_ratio_button", ""),
             "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""),
+            "A": decision_trace.get("roi_A", ""),
+            "B": decision_trace.get("roi_B", ""),
+            "C": decision_trace.get("roi_C", ""),
+            "D": decision_trace.get("roi_D", ""),
+            "L": decision_trace.get("roi_L", ""),
+            "overall": decision_trace.get("roi_overall", verdict),
+            "reason": decision_trace.get("roi_reason", ""),
         }
-        _manifest_write(rec)
+        _manifest_write(rec, mode=OUTPUT_MODE_DURABILITY)
         inspection_records.append(dict(rec, anomaly_path=anomaly_path))
         _record_anomaly_stats(cycle_num, verdict, score)
         with state_lock:
@@ -1521,6 +1527,13 @@ def main():
         go_home()
         if not wait_until_idle():
             return False
+
+        need_tare, drift_force, drift_thr = should_re_tare_for_drift("post_auto_capture")
+        if need_tare:
+            set_alert("#f59e0b", f"Force drift {drift_force:.2f}lbs>{drift_thr:.2f}lbs. Re-tare...")
+            if not perform_tare("post_auto_capture_drift"):
+                return False
+
         with state_lock:
             state.running = True
             state.paused = False
@@ -1655,11 +1668,12 @@ def main():
     btn_image_capture = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row1_y, manual_btn_w, manual_btn_h]), "Image Capture", color="#2563eb", hovercolor="#1d4ed8")
     btn_run_inspection = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), row1_y, manual_btn_w, manual_btn_h]), "Run Inspection", color="#7c3aed", hovercolor="#6d28d9")
 
-    # Row 2: Return to Test, Re-tare, Tare@Start ON/OFF
+    # Row 2: Return to Test, Re-tare, Tare@Start ON/OFF, AutoCap ON/OFF, CamTune ON/OFF
     btn_return_test = Button(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Return to Test", color="#0891b2", hovercolor="#0e7490")
     btn_re_tare = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Re-tare", color="#475569", hovercolor="#334155")
     btn_tare_on_start = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "Tare@Start: ON", color="#0f766e", hovercolor="#115e59")
     btn_auto_cap = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "AutoCap: OFF", color="#1d4ed8", hovercolor="#1e40af")
+    btn_cam_tune_toggle = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), row2_y, manual_btn_w, manual_btn_h]), "CamTune: ON", color="#166534", hovercolor="#15803d")
 
     # Row 3: Anomaly detector toggles
     row3_y = row2_y - (manual_btn_h + manual_btn_gap)
@@ -1668,6 +1682,17 @@ def main():
     btn_lock_roi = Button(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "Lock ROI", color="#0f766e", hovercolor="#115e59")
     btn_coating_gate = Button(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "Coating degr%:10", color="#334155", hovercolor="#1f2937")
     btn_baseline_q = Button(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), row3_y, manual_btn_w, manual_btn_h]), "BaselineQ: ON", color="#166534", hovercolor="#15803d")
+
+    # Row 4: Visual inspection stability controls
+    row4_y = row3_y - (manual_btn_h + manual_btn_gap)
+    btn_vi_start = Button(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), row4_y, manual_btn_w, manual_btn_h]), "Start VI", color="#0ea5e9", hovercolor="#0284c7")
+    btn_vi_stop = Button(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row4_y, manual_btn_w, manual_btn_h]), "Stop VI", color="#475569", hovercolor="#334155")
+
+    vi_tb_w = manual_btn_w
+    tb_vi_interval = TextBox(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row4_y, vi_tb_w, manual_btn_h]), "", initial="5")
+    tb_vi_total = TextBox(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row4_y, vi_tb_w, manual_btn_h]), "", initial="20")
+    fig.text(x0 + 2 * (manual_btn_w + manual_btn_gap), row4_y + manual_btn_h + 0.002, "VI interval (min)", color="#e2e8f0", fontsize=8)
+    fig.text(x0 + 3 * (manual_btn_w + manual_btn_gap), row4_y + manual_btn_h + 0.002, "VI total (min)", color="#e2e8f0", fontsize=8)
 
     # Auto-capture settings/status panel
     px_x = 1.0 / (fig.get_figwidth() * fig.dpi)
@@ -1712,16 +1737,32 @@ def main():
     fig.patches.append(Rectangle((panel_x, panel_y), panel_w, panel_h,
                                  transform=fig.transFigure, facecolor="#0b1220", edgecolor=COLOR_PANEL_BORDER, linewidth=1.0, zorder=-0.5))
 
+    # Golden reuse popup (hidden by default)
+    popup_active = False
+    popup_context = "start"
+    popup_bg = Rectangle((0.37, 0.40), 0.28, 0.20, transform=fig.transFigure,
+                         facecolor="#111827", edgecolor="#94a3b8", linewidth=1.2, zorder=20)
+    popup_bg.set_visible(False)
+    fig.patches.append(popup_bg)
+    popup_title = fig.text(0.385, 0.565, "Golden/ROI already ready", fontsize=11, color="#e5e7eb", zorder=21)
+    popup_title.set_visible(False)
+    popup_msg = fig.text(0.385, 0.525, "Capture Golden again for this test?", fontsize=10, color="#cbd5e1", zorder=21)
+    popup_msg.set_visible(False)
+    btn_popup_recapture = Button(fig.add_axes([0.39, 0.445, 0.12, 0.05]), "Re-capture", color="#d97706", hovercolor="#b45309")
+    btn_popup_reuse = Button(fig.add_axes([0.52, 0.445, 0.11, 0.05]), "Reuse", color="#166534", hovercolor="#15803d")
+    btn_popup_recapture.ax.set_visible(False)
+    btn_popup_reuse.ax.set_visible(False)
+
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap, btn_fail_policy,
-                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q]:
+                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_vi_start, btn_vi_stop, btn_popup_recapture, btn_popup_reuse]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_vi_start, btn_vi_stop, btn_popup_recapture, btn_popup_reuse, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
         _tb.label.set_horizontalalignment("left")
         _tb.label.set_position((-1.27, 0.5))
-    for _tb in [tb_fmin, tb_fmax, tb_cap_every, tb_cap_retry]:
+    for _tb in [tb_fmin, tb_fmax, tb_cap_every, tb_cap_retry, tb_vi_interval, tb_vi_total]:
         _tb.label.set_color("white")
     tb_fmin.label.set_horizontalalignment("left")
     force_label_x = -1.27 * (tb_w / force_box_w)
@@ -1735,6 +1776,33 @@ def main():
             state.alert_color = color
             state.alert_msg = msg
             state.alert_until_wall = time.time() + ALERT_FLASH_S
+
+    def show_golden_reuse_popup(context="start"):
+        nonlocal popup_active, popup_context
+        popup_context = context
+        if context == "vi":
+            popup_title.set_text("VI: Golden/ROI already ready")
+            popup_msg.set_text("Re-capture Golden for VI run?")
+        else:
+            popup_title.set_text("Golden/ROI already ready")
+            popup_msg.set_text("Capture Golden again for this test?")
+        popup_active = True
+        popup_bg.set_visible(True)
+        popup_title.set_visible(True)
+        popup_msg.set_visible(True)
+        btn_popup_recapture.ax.set_visible(True)
+        btn_popup_reuse.ax.set_visible(True)
+        fig.canvas.draw_idle()
+
+    def hide_golden_reuse_popup():
+        nonlocal popup_active
+        popup_active = False
+        popup_bg.set_visible(False)
+        popup_title.set_visible(False)
+        popup_msg.set_visible(False)
+        btn_popup_recapture.ax.set_visible(False)
+        btn_popup_reuse.ax.set_visible(False)
+        fig.canvas.draw_idle()
 
     def update_tare_toggle_button():
         with state_lock:
@@ -1766,6 +1834,14 @@ def main():
         else:
             btn_fail_policy.label.set_text("Fail:STOP")
             btn_fail_policy.ax.set_facecolor("#991b1b")
+
+    def update_cam_tune_toggle_button():
+        if camera_tune_enabled:
+            btn_cam_tune_toggle.label.set_text("CamTune: ON")
+            btn_cam_tune_toggle.ax.set_facecolor("#166534")
+        else:
+            btn_cam_tune_toggle.label.set_text("CamTune: OFF")
+            btn_cam_tune_toggle.ax.set_facecolor("#7f1d1d")
 
     def update_detector_buttons():
         with state_lock:
@@ -1815,6 +1891,25 @@ def main():
         finally:
             with state_lock:
                 state.tare_in_progress = False
+
+    def should_re_tare_for_drift(tag="post_capture"):
+        nonlocal zero_offset
+        try:
+            samples = [bridge.getVoltageRatio() for _ in range(60)]
+        except Exception as exc:
+            print(f"[Force] Drift sample failed ({tag}): {exc}")
+            return False, 0.0, 0.0
+
+        raw_mean = float(np.mean(samples))
+        drift_force = float((raw_mean - zero_offset) * calibration_factor)
+        with state_lock:
+            ref_force = max(abs(float(state.force_min)), abs(float(state.force_max)), 1.0)
+        threshold = float(ref_force * (FORCE_DRIFT_RE_TARE_PCT / 100.0))
+        drift_abs = abs(drift_force)
+        if drift_abs > threshold:
+            print(f"[Force] Drift detected ({tag}): {drift_force:.3f}lbs > {threshold:.3f}lbs ({FORCE_DRIFT_RE_TARE_PCT:.1f}%)")
+            return True, drift_force, threshold
+        return False, drift_force, threshold
 
     def go_home():
         if not robot_connected:
@@ -1918,7 +2013,26 @@ def main():
 
 
     def on_start(_evt):
+        if popup_active:
+            return
         apply_textbox_values()
+
+        has_prev_golden = False
+        with state_lock:
+            has_prev_golden = bool(state.stopped and state.golden_ready)
+        has_prev_golden = has_prev_golden and (golden_frame is not None) and (button_roi_locked or (roi_locked and locked_roi is not None))
+        if has_prev_golden:
+            show_golden_reuse_popup("start")
+            set_alert("#0ea5e9", "Golden prompt: choose Re-capture or Reuse")
+            return
+        _start_test_sequence(reuse_existing_golden=False)
+
+    def _start_test_sequence(reuse_existing_golden=False):
+        nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
+        nonlocal button_rois, area_l_roi, button_color_baselines, button_roi_locked, button_fail_history
+        nonlocal auto_report_written_cycle
+        nonlocal vi_running, vi_results, vi_capture_idx, vi_report_path, vi_next_capture_wall, vi_end_wall, vi_status_text
+
         if not robot_connected:
             with state_lock:
                 state.running = False
@@ -1928,9 +2042,7 @@ def main():
             set_alert("#d97706", "Robot disconnected: visual inspection mode only")
             print("[GUI] Start blocked: robot disconnected (visual inspection mode)")
             return
-        nonlocal last_capture_frame, last_capture_path, golden_frame, golden_path, locked_roi, roi_locked
-        nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
-        nonlocal auto_report_written_cycle
+
         with state_lock:
             state.running = False
             state.paused = True
@@ -1945,21 +2057,31 @@ def main():
             state.manual_intervention_requested = False
             state.manual_mode_active = False
             state.image_capture_count = 0
-            state.golden_ready = False
+            if not reuse_existing_golden:
+                state.golden_ready = False
             state.last_capture_result = "none"
             state.next_auto_capture_cycle = state.capture_every_x_cycles if state.capture_every_x_cycles > 0 else 0
 
         last_capture_frame = None
         last_capture_path = None
-        golden_frame = None
-        golden_path = None
-        locked_roi = None
-        roi_locked = False
-        button_rois = {}
-        button_color_baselines = {}
-        button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
-        button_roi_locked = False
+        if not reuse_existing_golden:
+            golden_frame = None
+            golden_path = None
+            locked_roi = None
+            roi_locked = False
+            button_rois = {}
+            area_l_roi = None
+            button_color_baselines = {}
+            button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
+            button_roi_locked = False
         auto_report_written_cycle = -1
+        vi_running = False
+        vi_results = []
+        vi_capture_idx = 0
+        vi_report_path = None
+        vi_next_capture_wall = 0.0
+        vi_end_wall = 0.0
+        vi_status_text = ""
 
         print("[GUI] Start pressed -> Going Home before cycle start")
         go_home()
@@ -1993,7 +2115,7 @@ def main():
                 return
 
         with state_lock:
-            auto_mode = state.auto_capture_enabled and state.capture_every_x_cycles > 0
+            auto_mode = state.auto_capture_enabled and state.capture_every_x_cycles > 0 and (not reuse_existing_golden)
 
         if auto_mode:
             print("[GUI] Auto mode start: preparing golden at IC checkpoint")
@@ -2007,13 +2129,16 @@ def main():
                 return
 
             time.sleep(IC_CAPTURE_SETTLE_S)
-            if not run_camera_auto_tune():
-                with state_lock:
-                    state.running = False
-                    state.paused = True
-                    state.stopped = True
-                set_alert("red", "Auto start failed: camera tune failed")
-                return
+            if camera_tune_enabled:
+                if not run_camera_auto_tune():
+                    with state_lock:
+                        state.running = False
+                        state.paused = True
+                        state.stopped = True
+                    set_alert("red", "Auto start failed: camera tune failed")
+                    return
+            else:
+                set_alert("#f59e0b", "Auto start: camera tune skipped (CamTune OFF)")
 
             frame, frames_used = capture_average_frame()
             if frame is None:
@@ -2025,7 +2150,7 @@ def main():
                 return
 
             run_id = state.test_name.strip() or "test_report"
-            ok, out_name, out_path = save_capture_frame(frame, "golden", run_id, 0)
+            ok, out_name, out_path = save_capture_frame(frame, "golden", run_id, 0, mode=OUTPUT_MODE_DURABILITY)
             if not ok:
                 with state_lock:
                     state.running = False
@@ -2044,7 +2169,7 @@ def main():
 
             golden_frame = frame.copy()
             golden_path = out_path
-            _ensure_cycle_video(golden_frame, run_id)
+            _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_DURABILITY)
             with state_lock:
                 state.golden_ready = True
 
@@ -2065,7 +2190,7 @@ def main():
                 "video_path": cycle_video_path or "",
                 "anomaly_path": "",
                 "policy": state.auto_fail_policy,
-            })
+            }, mode=OUTPUT_MODE_DURABILITY)
 
             go_home()
             if not wait_until_idle():
@@ -2083,6 +2208,46 @@ def main():
             if state.capture_every_x_cycles > 0:
                 state.next_auto_capture_cycle = state.capture_every_x_cycles
         set_alert("green", "At Home. Starting cycle test")
+
+    def on_popup_recapture(_evt):
+        hide_golden_reuse_popup()
+        if popup_context == "vi":
+            if robot_connected:
+                ok_ckpt = go_ic_home_checkpoint()
+                if ok_ckpt:
+                    set_alert("#d97706", "VI: capture new Golden now (manual mode at IC checkpoint)")
+                else:
+                    set_alert("red", "VI: could not reach IC checkpoint for Golden capture")
+                    return
+            else:
+                set_alert("#d97706", "VI: capture new Golden now")
+            on_golden_capture(None, mode=OUTPUT_MODE_VISUAL)
+            if _vi_has_locked_golden():
+                _begin_vi_session()
+            else:
+                set_alert("red", "VI start blocked: Golden/ROI not ready")
+            return
+
+        with state_lock:
+            state.running = False
+            state.paused = True
+            state.stopped = False
+            state.manual_mode_active = True
+            state.manual_intervention_requested = False
+            state.last_capture_result = "awaiting_new_golden"
+        ok_ckpt = go_ic_home_checkpoint()
+        if ok_ckpt:
+            set_alert("#d97706", "Capture new Golden now (manual mode at IC checkpoint)")
+        else:
+            set_alert("red", "Could not reach IC checkpoint for new Golden capture")
+        print("[GUI] Start paused for operator golden recapture decision")
+
+    def on_popup_reuse(_evt):
+        hide_golden_reuse_popup()
+        if popup_context == "vi":
+            _begin_vi_session()
+            return
+        _start_test_sequence(reuse_existing_golden=True)
 
     def on_pause(_evt):
         with state_lock:
@@ -2283,11 +2448,11 @@ def main():
                 "video_path": cycle_video_path or "",
                 "anomaly_path": "",
                 "policy": state.auto_fail_policy,
-            })
+            }, mode=OUTPUT_MODE_MANUAL)
             return
 
         run_id = state.test_name.strip() or "test_report"
-        ok, out_name, out_path = save_capture_frame(frame, "cyc", run_id, capture_num)
+        ok, out_name, out_path = save_capture_frame(frame, "cyc", run_id, capture_num, mode=OUTPUT_MODE_MANUAL)
         if not ok:
             set_alert("red", "Image Capture failed: save error")
             print(f"[GUI] Image Capture failed: could not save {out_path}")
@@ -2308,7 +2473,7 @@ def main():
                 "video_path": cycle_video_path or "",
                 "anomaly_path": "",
                 "policy": state.auto_fail_policy,
-            })
+            }, mode=OUTPUT_MODE_MANUAL)
             return
 
         last_capture_frame = frame.copy()
@@ -2331,7 +2496,7 @@ def main():
             "video_path": cycle_video_path or "",
             "anomaly_path": "",
             "policy": state.auto_fail_policy,
-        })
+        }, mode=OUTPUT_MODE_MANUAL)
         set_alert("#2563eb", f"Image Capture saved: {out_name}")
         print(f"[GUI] Image Capture saved -> {out_path}")
 
@@ -2340,8 +2505,17 @@ def main():
         if ok:
             print(f"[GUI] Camera tuned and locked exp={camera_exposure} gain={camera_gain} wb={camera_white_balance}")
 
-    def on_golden_capture(_evt):
-        nonlocal golden_frame, golden_path, locked_roi, roi_locked, button_rois, button_color_baselines, button_roi_locked, button_fail_history
+    def on_toggle_cam_tune(_evt):
+        nonlocal camera_tune_enabled
+        camera_tune_enabled = not camera_tune_enabled
+        update_cam_tune_toggle_button()
+        if camera_tune_enabled:
+            set_alert("#166534", "Camera tune enabled")
+        else:
+            set_alert("#f59e0b", "Camera tune disabled (inspection still allowed)")
+
+    def on_golden_capture(_evt, mode=OUTPUT_MODE_MANUAL):
+        nonlocal golden_frame, golden_path, locked_roi, roi_locked, button_rois, area_l_roi, button_color_baselines, button_roi_locked, button_fail_history
         frame, frames_used = capture_average_frame()
         if frame is None:
             set_alert("red", f"Golden Capture failed: averaged frame unavailable ({frames_used}/{CAPTURE_AVG_MIN_FRAMES})")
@@ -2349,7 +2523,7 @@ def main():
             return
 
         run_id = state.test_name.strip() or "test_report"
-        ok, out_name, out_path = save_capture_frame(frame, "golden", run_id, 0)
+        ok, out_name, out_path = save_capture_frame(frame, "golden", run_id, 0, mode=mode)
         if not ok:
             set_alert("red", "Golden Capture failed: save error")
             print(f"[GUI] Golden Capture failed: could not save {out_path}")
@@ -2360,12 +2534,19 @@ def main():
         with state_lock:
             state.golden_ready = True
         if _select_button_rois_and_calibrate(golden_frame):
+            overlay = golden_frame.copy()
+            for _btn, _roi in button_rois.items():
+                _draw_roi(overlay, _roi, color=(255, 0, 0), label=_btn)
+            if area_l_roi is not None:
+                _draw_roi(overlay, area_l_roi, color=(0, 255, 255), label="L")
+            save_capture_frame(overlay, "golden_roi", run_id, 0, mode=mode)
             set_alert("#d97706", f"Golden saved + button ROIs locked: {out_name}")
             print(f"[GUI] Button ROIs locked -> {button_rois}")
         else:
             locked_roi = None
             roi_locked = False
             button_rois = {}
+            area_l_roi = None
             button_color_baselines = {}
             button_fail_history = {b: deque(maxlen=BUTTON_TEMPORAL_WINDOW) for b in BUTTON_ORDER}
             button_roi_locked = False
@@ -2384,7 +2565,7 @@ def main():
             return
 
         run_id = state.test_name.strip() or "test_report"
-        cyc_num = max(1, state.cycle_count)
+        cyc_num = max(1, int(state.image_capture_count) if int(state.image_capture_count) > 0 else int(state.cycle_count))
         if (not button_roi_locked and (not roi_locked or locked_roi is None)):
             set_alert("#7c3aed", "Run Inspection blocked: capture Golden + select ROI first")
             print("[GUI] Run Inspection blocked: ROI missing")
@@ -2396,17 +2577,311 @@ def main():
             print(f"[GUI] Run Inspection skipped: {q_msg}")
             return
 
-        verdict, score, mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num, use_temporal_gate=False)
-        _ensure_cycle_video(golden_frame, run_id)
-        _append_cycle_video_frame(disp, cyc_num)
-        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", "")})
-        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": cycle_video_path or "", "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", "")})
+        verdict, score, mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num, use_temporal_gate=False, mode=OUTPUT_MODE_MANUAL)
+        _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_MANUAL)
+        _append_cycle_video_frame(disp, cyc_num, mode=OUTPUT_MODE_MANUAL)
+        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", "")}, mode=OUTPUT_MODE_MANUAL)
+        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", "")})
         _record_anomaly_stats(cyc_num, verdict, score)
         with state_lock:
             state.last_capture_result = f"manual/{verdict}"
         metric_label = decision_trace.get("score_role", "inspection_metric")
         set_alert("green" if verdict == "PASS" else "orange", f"Inspection {verdict} {metric_label}={score:.2f}")
         print(f"[GUI] Run Inspection -> {verdict} {metric_label}={score:.2f} mask={mask_path} anomaly={anomaly_path}")
+
+    def _vi_has_locked_golden():
+        return (golden_frame is not None) and bool(button_roi_locked and button_rois and (area_l_roi is not None))
+
+    def build_vi_report_pdf(path):
+        target_dir = os.path.dirname(path) or "."
+        if not os.access(target_dir, os.W_OK):
+            raise PermissionError(f"No write permission to directory: {target_dir}")
+
+        with state_lock:
+            run_id = state.test_name.strip() or "test_report"
+            rows = list(vi_results)
+            total_min = float(vi_total_min)
+            interval_min = float(vi_interval_min)
+            contour_on = bool(state.detect_contour_enabled)
+            white_on = bool(state.detect_white_ratio_enabled)
+
+        headers = ["#", "Timestamp", "Elapsed(min)", "A", "B", "C", "D", "L", "Overall", "Reason"]
+        page_size = 26
+        chunks = [rows[i:i + page_size] for i in range(0, max(1, len(rows)), page_size)] if rows else [[]]
+
+        pdf = PdfPages(path)
+        try:
+            total_pages = len(chunks)
+            for page_idx, chunk in enumerate(chunks, start=1):
+                fig_vi = plt.figure(figsize=(11, 8.5), facecolor="white")
+                fig_vi.text(0.06, 0.95, "Visual Inspection Report", fontsize=16, weight="bold")
+                fig_vi.text(0.06, 0.92, f"Run: {run_id}", fontsize=10)
+                fig_vi.text(0.06, 0.90, f"VI total={total_min:.2f} min | interval={interval_min:.2f} min", fontsize=10)
+                score_meaning = "mean pixel diff (contour)" if contour_on else ("white pixel drop %" if white_on else "n/a")
+                fig_vi.text(0.06, 0.88, f"Score meaning: {score_meaning}", fontsize=9, color="#334155")
+                fig_vi.text(0.84, 0.95, f"Page {page_idx}/{total_pages}", fontsize=9, color="#334155")
+
+                cell_rows = []
+                for r in chunk:
+                    cell_rows.append([
+                        str(r.get("idx", "")),
+                        str(r.get("timestamp", ""))[:19],
+                        f"{float(r.get('elapsed_min', 0.0)):.2f}",
+                        str(r.get("A", "")),
+                        str(r.get("B", "")),
+                        str(r.get("C", "")),
+                        str(r.get("D", "")),
+                        str(r.get("L", "")),
+                        str(r.get("overall", "")),
+                        str(r.get("reason", ""))[:34],
+                    ])
+
+                ax_tbl = fig_vi.add_axes([0.05, 0.10, 0.90, 0.74])
+                ax_tbl.axis("off")
+                col_widths = [0.04, 0.16, 0.09, 0.06, 0.06, 0.06, 0.06, 0.06, 0.09, 0.28]
+                table = ax_tbl.table(cellText=cell_rows if cell_rows else [["", "", "", "", "", "", "", "", "", "No rows"]],
+                                     colLabels=headers,
+                                     colLoc='center', cellLoc='center',
+                                     colWidths=col_widths,
+                                     loc='upper left')
+                table.auto_set_font_size(False)
+                table.set_fontsize(8)
+                table.scale(1, 1.25)
+                for (r, c), cell in table.get_celld().items():
+                    cell.set_edgecolor("#475569")
+                    if r == 0:
+                        cell.set_facecolor("#e2e8f0")
+                        cell.set_text_props(weight='bold')
+
+                fig_vi.text(0.06, 0.05, f"Rows stored: {len(rows)}", fontsize=9)
+                pdf.savefig(fig_vi)
+                plt.close(fig_vi)
+        finally:
+            pdf.close()
+
+    def _vi_eval_region(golden_img, cyc_img, label, roi_like):
+        with state_lock:
+            contour_enabled = state.detect_contour_enabled
+            white_enabled = state.detect_white_ratio_enabled
+        roi = _sanitize_roi(roi_like, golden_img.shape)
+        gx, gy, gw, gh = _roi_bounds(roi, golden_img.shape)
+        g_src = golden_img[gy:gy + gh, gx:gx + gw]
+        c_src = cyc_img[gy:gy + gh, gx:gx + gw]
+
+        g_gray = cv2.cvtColor(g_src, cv2.COLOR_BGR2GRAY)
+        c_gray = cv2.cvtColor(c_src, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        g_norm = clahe.apply(g_gray)
+        c_norm = clahe.apply(c_gray)
+        g_blur = cv2.GaussianBlur(g_norm, (5, 5), 0)
+        c_blur = cv2.GaussianBlur(c_norm, (5, 5), 0)
+        diff = cv2.absdiff(g_blur, c_blur)
+        mean_diff = float(np.mean(diff))
+        _, mask = cv2.threshold(diff, INSPECTION_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        contour_fail = False
+        max_area = 0.0
+        if contour_enabled:
+            for cnt in contours:
+                area = float(cv2.contourArea(cnt))
+                if area <= INSPECTION_MIN_DEFECT_AREA:
+                    continue
+                rx, ry, rw, rh = cv2.boundingRect(cnt)
+                if rw < INSPECTION_MIN_DEFECT_W or rh < INSPECTION_MIN_DEFECT_H:
+                    continue
+                max_area = max(max_area, area)
+                contour_fail = True
+
+        white_fail = False
+        white_drop = 0.0
+        if white_enabled and label in BUTTON_ORDER and button_rois and button_color_baselines:
+            base = button_color_baselines.get(label)
+            if base:
+                thr_ref = float(base.get("adaptive_white_thr", 1.0))
+                cur = _compute_button_color_stats(cyc_img, button_rois[label], label, threshold_ref=thr_ref)
+                base_white = float(base.get("white_px", 0.0))
+                cur_white = float(cur.get("white_px", 0.0))
+                if base_white > 0:
+                    white_drop = max(0.0, ((base_white - cur_white) / base_white) * 100.0)
+                with state_lock:
+                    gate = float(button_coating_thresholds.get(label, state.coating_degradation_pct))
+                white_fail = white_drop > gate
+
+        fail = contour_fail or white_fail
+        verdict = "FAIL" if fail else "PASS"
+        reason = "contour" if contour_fail else ("white" if white_fail else "ok")
+        score = mean_diff if contour_enabled else white_drop
+        score_role = "mean_pixel_diff" if contour_enabled else "white_pixel_drop_pct"
+        return {"verdict": verdict, "reason": reason, "score": score, "score_role": score_role, "max_area": max_area}
+
+    def _vi_capture_and_inspect(capture_idx):
+        nonlocal last_capture_frame, last_capture_path, last_capture_frames_used
+        if golden_frame is None or not _vi_has_locked_golden():
+            set_alert("orange", "VI stopped: Golden/ROI not ready")
+            return False
+
+        frame, frames_used = capture_average_frame()
+        ok_q, q_msg, q_reason = _capture_quality_gate(frame, frames_used)
+        if not ok_q:
+            set_alert("orange", f"VI capture skipped: {q_msg}")
+            elapsed_min = max(0.0, (time.time() - (vi_end_wall - vi_total_min * 60.0)) / 60.0) if vi_total_min > 0 else 0.0
+            vi_results.append({
+                "idx": capture_idx,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "elapsed_min": elapsed_min,
+                "A": "WARN", "B": "WARN", "C": "WARN", "D": "WARN", "L": "WARN",
+                "overall": "WARN",
+                "reason": q_reason,
+            })
+            return True
+
+        run_id = state.test_name.strip() or "test_report"
+        cyc_num = max(1, int(capture_idx))
+        ok_save, _name, out_path = save_capture_frame(frame, "cyc", run_id, cyc_num, mode=OUTPUT_MODE_VISUAL)
+        if not ok_save:
+            set_alert("red", "VI capture save failed")
+            return False
+
+        _vi_overall_verdict, _vi_score, _vi_mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(
+            golden_frame, frame, run_id, cyc_num, use_temporal_gate=False, mode=OUTPUT_MODE_VISUAL
+        )
+        _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_VISUAL)
+        _append_cycle_video_frame(disp, cyc_num, mode=OUTPUT_MODE_VISUAL)
+
+        # per-region VI evaluation: A/B/C/D + Large area L
+        region_results = {}
+        for btn in BUTTON_ORDER:
+            region_results[btn] = _vi_eval_region(golden_frame, frame, btn, button_rois[btn])
+        region_results["L"] = _vi_eval_region(golden_frame, frame, "L", area_l_roi)
+
+        overall_pass = all(region_results[k]["verdict"] == "PASS" for k in ["A", "B", "C", "D", "L"])
+        overall_verdict = "PASS" if overall_pass else "FAIL"
+        failed_regions = [k for k in ["A", "B", "C", "D", "L"] if region_results[k]["verdict"] != "PASS"]
+
+        last_capture_frame = frame.copy()
+        last_capture_path = out_path
+        last_capture_frames_used = int(frames_used)
+        elapsed_min = max(0.0, (time.time() - (vi_end_wall - vi_total_min * 60.0)) / 60.0) if vi_total_min > 0 else 0.0
+        vi_results.append({
+            "idx": capture_idx,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "elapsed_min": elapsed_min,
+            "A": region_results["A"]["verdict"],
+            "B": region_results["B"]["verdict"],
+            "C": region_results["C"]["verdict"],
+            "D": region_results["D"]["verdict"],
+            "L": region_results["L"]["verdict"],
+            "overall": overall_verdict,
+            "reason": "ok" if overall_pass else f"failed:{','.join(failed_regions)}",
+        })
+
+        _manifest_write({
+            "run_id": run_id,
+            "cycle": cyc_num,
+            "capture_type": "vi",
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "camera_status": camera_status,
+            "result": "OK",
+            "message": "vi_inspection",
+            "reason_code": "inspection_scored",
+            "file_path": out_path,
+            "score": "",
+            "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
+            "verdict": overall_verdict,
+            "golden_path": golden_path or "",
+            "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_VISUAL),
+            "anomaly_path": anomaly_path,
+            "policy": state.auto_fail_policy,
+            "decision_logic": decision_trace.get("decision_logic", ""),
+            "failed_metric": decision_trace.get("failed_metric", ""),
+            "max_contour_area": decision_trace.get("max_contour_area", ""),
+            "max_bbox": decision_trace.get("max_bbox", ""),
+            "score_role": decision_trace.get("score_role", ""),
+            "button_drop_pct": decision_trace.get("button_drop_pct", ""),
+            "white_ratio_button": decision_trace.get("white_ratio_button", ""),
+            "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""),
+            "A": region_results["A"]["verdict"],
+            "B": region_results["B"]["verdict"],
+            "C": region_results["C"]["verdict"],
+            "D": region_results["D"]["verdict"],
+            "L": region_results["L"]["verdict"],
+            "overall": overall_verdict,
+            "reason": "ok" if overall_pass else f"failed:{','.join(failed_regions)}",
+        }, mode=OUTPUT_MODE_VISUAL)
+
+        try:
+            if vi_report_path:
+                build_vi_report_pdf(vi_report_path)
+        except Exception as exc:
+            print(f"[VI] report update failed: {exc}")
+
+        with state_lock:
+            state.last_capture_result = f"vi/{overall_verdict}"
+        set_alert("green" if overall_verdict == "PASS" else "orange", f"VI {capture_idx}: {overall_verdict}")
+        return True
+
+    def _begin_vi_session():
+        nonlocal vi_running, vi_next_capture_wall, vi_end_wall, vi_capture_idx, vi_results, vi_report_path, vi_interval_min, vi_total_min, vi_status_text
+        now = time.time()
+        vi_running = True
+        vi_capture_idx = 0
+        vi_results = []
+        vi_next_capture_wall = now + vi_interval_min * 60.0
+        vi_end_wall = now + vi_total_min * 60.0
+        run_id = state.test_name.strip() or "test_report"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        vi_report_path = os.path.join(_mode_report_dir(OUTPUT_MODE_VISUAL), f"visual_inspection_report_{run_id}_{ts}.pdf")
+        try:
+            build_vi_report_pdf(vi_report_path)
+        except Exception as exc:
+            print(f"[VI] initial report build failed: {exc}")
+        vi_status_text = f"VI in progress | next capture in {vi_interval_min:.2f} min"
+        set_alert("#0ea5e9", f"VI started: every {vi_interval_min:g} min for {vi_total_min:g} min")
+
+    def on_start_vi(_evt):
+        nonlocal vi_interval_min, vi_total_min
+        if popup_active:
+            return
+        try:
+            vi_interval_min = float(tb_vi_interval.text)
+            vi_total_min = float(tb_vi_total.text)
+        except Exception:
+            set_alert("red", "VI settings invalid")
+            return
+        if vi_interval_min <= 0 or vi_total_min <= 0:
+            set_alert("red", "VI interval/total must be > 0")
+            return
+        if vi_total_min < vi_interval_min:
+            set_alert("red", "VI total time must be >= VI interval")
+            return
+        if vi_running:
+            set_alert("#475569", "VI already running")
+            return
+
+        if _vi_has_locked_golden():
+            show_golden_reuse_popup("vi")
+            set_alert("#0ea5e9", "VI prompt: choose Re-capture or Reuse")
+            return
+
+        set_alert("#d97706", "VI: capturing Golden first")
+        on_golden_capture(None, mode=OUTPUT_MODE_VISUAL)
+        if not _vi_has_locked_golden():
+            set_alert("red", "VI start blocked: Golden/ROI not ready")
+            return
+        _begin_vi_session()
+
+    def on_stop_vi(_evt):
+        nonlocal vi_running, vi_status_text
+        if not vi_running:
+            set_alert("#475569", "VI is not running")
+            return
+        vi_running = False
+        vi_status_text = "VI stopped"
+        set_alert("#475569", "VI stopped")
 
     def on_return_to_test(_evt):
         with state_lock:
@@ -2440,12 +2915,25 @@ def main():
             state.paused = False
             state.stopped = False
         set_alert("#0891b2", "At Home. Restarting cycle test")
+        need_tare, drift_force, drift_thr = should_re_tare_for_drift("return_to_test")
+        if need_tare:
+            set_alert("#f59e0b", f"Force drift {drift_force:.2f}lbs>{drift_thr:.2f}lbs. Re-tare...")
+            if not perform_tare("return_to_test_drift"):
+                with state_lock:
+                    state.running = False
+                    state.paused = True
+                    state.stopped = True
+                set_alert("red", "Return to Test failed: drift re-tare failed")
+                print("[GUI] Return to Test aborted: drift re-tare failed")
+                return
+
         print("[GUI] Return to Test: automatic cycle resumed")
 
     def on_reset(_evt):
         nonlocal golden_frame, golden_path, last_capture_frame, last_capture_path, locked_roi, roi_locked
-        nonlocal button_rois, button_color_baselines, button_roi_locked, button_fail_history
-        nonlocal cycle_video_writer, cycle_video_path, cycle_video_started, auto_report_written_cycle
+        nonlocal button_rois, area_l_roi, button_color_baselines, button_roi_locked, button_fail_history
+        nonlocal cycle_video_path, auto_report_written_cycle
+        nonlocal vi_running, vi_results, vi_capture_idx, vi_report_path, vi_next_capture_wall, vi_end_wall, vi_status_text
         with state_lock:
             state.force_out_of_range = {"A": 0, "B": 0, "C": 0, "D": 0}
             state.button_did_not_retract = {"A": 0, "B": 0, "C": 0, "D": 0}
@@ -2469,15 +2957,25 @@ def main():
             "worst_score": -1.0,
             "worst_cycle": "",
         })
-        if cycle_video_writer is not None:
-            try:
-                cycle_video_writer.release()
-            except Exception:
-                pass
-        cycle_video_writer = None
+        for _mode in OUTPUT_MODES:
+            _st = _video_state(_mode)
+            if _st["writer"] is not None:
+                try:
+                    _st["writer"].release()
+                except Exception:
+                    pass
+            _st["writer"] = None
+            _st["path"] = None
+            _st["started"] = False
         cycle_video_path = None
-        cycle_video_started = False
         auto_report_written_cycle = -1
+        vi_running = False
+        vi_results = []
+        vi_capture_idx = 0
+        vi_report_path = None
+        vi_next_capture_wall = 0.0
+        vi_end_wall = 0.0
+        vi_status_text = ""
         _recover_camera_preview()
         with state_lock:
             state.golden_ready = False
@@ -2596,46 +3094,20 @@ def main():
             anomaly_fig.text(0.06, y, stats_txt, fontsize=9)
             y -= 0.06
             if inspection_records:
-                table_cols = ["Cycle", "Type", "Verdict", "Metric", "FailedBtn", "A%", "B%", "C%", "D%", "Reason"]
+                table_cols = ["#", "Timestamp", "Elapsed(min)", "A", "B", "C", "D", "L", "Overall", "Reason"]
                 table_rows = []
                 for rec in inspection_records[-20:]:
-                    try:
-                        score_txt = f"{float(rec.get('score', '')):.2f}"
-                    except Exception:
-                        score_txt = str(rec.get('score', ''))
-                    drops = {b: "0.00" for b in BUTTON_ORDER}
-                    drop_raw = str(rec.get("button_drop_pct", "") or "")
-                    for token in drop_raw.split("|"):
-                        if ":" not in token:
-                            continue
-                        k, v = token.split(":", 1)
-                        k = k.strip()
-                        if k in drops:
-                            try:
-                                drops[k] = f"{float(v):.2f}"
-                            except Exception:
-                                drops[k] = v.strip()
-                    verdict_txt = str(rec.get("verdict", "") or "")
-                    failed_btn = "-"
-                    if verdict_txt.upper() == "FAIL":
-                        failed_btn = str(rec.get("white_ratio_button", "") or "")
-                        if not failed_btn:
-                            fm = str(rec.get("failed_metric", "") or "")
-                            if ":" in fm:
-                                failed_btn = fm.split(":", 1)[1].strip()
-                        failed_btn = failed_btn or "-"
-                    metric_name = rec.get("score_role", "inspection_metric")
                     table_rows.append([
                         str(rec.get("cycle", "")),
-                        str(rec.get("capture_type", "")),
-                        verdict_txt,
-                        f"{metric_name}:{score_txt}",
-                        failed_btn,
-                        drops["A"],
-                        drops["B"],
-                        drops["C"],
-                        drops["D"],
-                        str(rec.get("reason_code", rec.get("message", "")) or ""),
+                        str(rec.get("timestamp", ""))[:19],
+                        "",
+                        str(rec.get("A", "")),
+                        str(rec.get("B", "")),
+                        str(rec.get("C", "")),
+                        str(rec.get("D", "")),
+                        str(rec.get("L", "")),
+                        str(rec.get("overall", rec.get("verdict", ""))),
+                        str(rec.get("reason", rec.get("reason_code", rec.get("message", ""))))[:34],
                     ])
 
                 anomaly_fig.text(0.06, y, "Inspection Snapshot (latest 20)", fontsize=11, weight="bold")
@@ -2644,7 +3116,7 @@ def main():
                 table_bottom = table_top - table_height
                 table_ax = anomaly_fig.add_axes([0.05, table_bottom, 0.90, table_height])
                 table_ax.axis("off")
-                col_widths = [0.06, 0.07, 0.08, 0.15, 0.08, 0.05, 0.05, 0.05, 0.05, 0.22]
+                col_widths = [0.06, 0.15, 0.09, 0.06, 0.06, 0.06, 0.06, 0.06, 0.09, 0.25]
                 inspection_table = table_ax.table(
                     cellText=table_rows,
                     colLabels=table_cols,
@@ -2702,7 +3174,7 @@ def main():
     def _auto_report_path():
         run_id = state.test_name.strip() or "test_report"
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return os.path.join(reports_dir, f"report_{run_id}_{ts}.pdf")
+        return os.path.join(_mode_report_dir(OUTPUT_MODE_DURABILITY), f"report_{run_id}_{ts}.pdf")
 
     def _open_file(path):
         if sys.platform.startswith("win"):
@@ -2713,7 +3185,8 @@ def main():
             subprocess.run(["xdg-open", path], check=False)
 
     def _latest_report_path():
-        files = [os.path.join(reports_dir, f) for f in os.listdir(reports_dir) if f.lower().endswith(".pdf")]
+        report_dir = _mode_report_dir(OUTPUT_MODE_DURABILITY)
+        files = [os.path.join(report_dir, f) for f in os.listdir(report_dir) if f.lower().endswith(".pdf")]
         if not files:
             return None
         files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
@@ -2764,12 +3237,15 @@ def main():
     btn_re_tare.on_clicked(on_re_tare)
     btn_tare_on_start.on_clicked(on_toggle_tare_on_start)
     btn_auto_cap.on_clicked(on_toggle_auto_cap)
+    btn_cam_tune_toggle.on_clicked(on_toggle_cam_tune)
     btn_fail_policy.on_clicked(on_toggle_fail_policy)
     btn_detect_contour.on_clicked(on_toggle_detect_contour)
     btn_detect_white.on_clicked(on_toggle_detect_white)
     btn_lock_roi.on_clicked(on_lock_roi)
     btn_coating_gate.on_clicked(on_toggle_coating_gate)
     btn_baseline_q.on_clicked(on_toggle_baseline_quality)
+    btn_vi_start.on_clicked(on_start_vi)
+    btn_vi_stop.on_clicked(on_stop_vi)
     btn_ic_home.on_clicked(on_ic_home)
     btn_return_test.on_clicked(on_return_to_test)
     btn_camera_tune.on_clicked(on_camera_tune)
@@ -2779,9 +3255,12 @@ def main():
     btn_reset.on_clicked(on_reset)
     btn_report.on_clicked(on_download_report)
     btn_exit.on_clicked(on_exit)
+    btn_popup_recapture.on_clicked(on_popup_recapture)
+    btn_popup_reuse.on_clicked(on_popup_reuse)
 
     update_tare_toggle_button()
     update_auto_cap_button()
+    update_cam_tune_toggle_button()
     update_fail_policy_button()
     update_detector_buttons()
     update_coating_gate_button()
@@ -3104,6 +3583,25 @@ def main():
                     set_alert("red", f"Auto report failed: {exc}")
                     print(f"[Report] Auto-save failed: {exc}")
 
+            # VI scheduler (independent of robot connection)
+            if vi_running:
+                now_wall = time.time()
+                next_min = max(0.0, (vi_next_capture_wall - now_wall) / 60.0)
+                rem_min = max(0.0, (vi_end_wall - now_wall) / 60.0)
+                vi_status_text = f"VI in progress | next capture in {next_min:.2f} min | remaining {rem_min:.2f} min"
+                if now_wall >= vi_end_wall:
+                    vi_running = False
+                    vi_status_text = "VI done"
+                    set_alert("#475569", "VI done")
+                elif now_wall >= vi_next_capture_wall:
+                    vi_capture_idx += 1
+                    ok_vi = _vi_capture_and_inspect(vi_capture_idx)
+                    vi_next_capture_wall = now_wall + max(1e-6, vi_interval_min * 60.0)
+                    if not ok_vi:
+                        vi_running = False
+                        vi_status_text = "VI stopped: capture/inspection failure"
+                        set_alert("red", "VI stopped due to capture/inspection failure")
+
             # UI text / alerts
             with state_lock:
                 mode = "RUNNING" if state.running else ("PAUSED" if state.paused else "STOPPED")
@@ -3137,6 +3635,7 @@ def main():
                     camera_im.set_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
                 cam_lock_txt = "LOCKED" if camera_settings_locked else "UNLOCKED"
+                tune_state = "TUNE:ON" if camera_tune_enabled else "TUNE:OFF"
                 tare_txt = "Tare@Start:ON" if state.tare_on_start else "Tare@Start:OFF"
                 sched_txt = "ON" if state.auto_capture_enabled else "OFF"
                 gold_txt = "READY" if state.golden_ready else "NO"
@@ -3146,12 +3645,15 @@ def main():
                     f"State: {mode} | Mode: {robot_mode_text} | {manual_state} | {tare_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
                 )
                 roi_txt = f"ROI:LOCKED {list(button_rois.keys())}" if (button_roi_locked and button_rois) else (f"ROI:LOCKED {locked_roi}" if (roi_locked and locked_roi is not None) else "ROI:UNSET")
-                auto_status_1.set_text(f"Camera: {camera_txt} / {cam_lock_txt}")
+                auto_status_1.set_text(f"Camera: {camera_txt} / {cam_lock_txt} / {tune_state}")
                 auto_status_2.set_text(f"AutoCap: {sched_txt} every={state.capture_every_x_cycles} next={next_cap} retries={state.auto_capture_retries}")
                 auto_status_3.set_text(f"Golden ready: {gold_txt}")
                 bq = "ON" if state.baseline_quality_enabled else "OFF"
                 auto_status_4.set_text(f"{roi_txt} | FailPolicy: {fail_pol} | CoatGate:{state.coating_degradation_pct:.0f}% | BaseQ:{bq}")
-                auto_status_5.set_text(f"Inspection/Capture: {state.last_capture_result}")
+                vi_line = vi_status_text.strip()
+                if vi_running and vi_line == "":
+                    vi_line = "VI in progress"
+                auto_status_5.set_text(f"Inspection/Capture: {state.last_capture_result}" + (f" | {vi_line}" if vi_line else ""))
                 param_line.set_text("")
                 fail_line_1.set_text(
                     f"Force out of range  A:{state.force_out_of_range['A']}  B:{state.force_out_of_range['B']}  C:{state.force_out_of_range['C']}  D:{state.force_out_of_range['D']} | "
@@ -3193,8 +3695,11 @@ def main():
         pass
     finally:
         try:
-            if cycle_video_writer is not None:
-                cycle_video_writer.release()
+            for _mode in OUTPUT_MODES:
+                _st = _video_state(_mode)
+                if _st["writer"] is not None:
+                    _st["writer"].release()
+                    _st["writer"] = None
         except Exception:
             pass
         try:
