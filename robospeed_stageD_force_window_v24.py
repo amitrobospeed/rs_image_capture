@@ -98,6 +98,7 @@ PLAY_SHIFT_PX = 2.5
 CONTRAST_DELTA_THRESH = 18.0
 COLOR_DELTA_THRESH = 14.0
 WEAR_DIFF_THRESH = 22.0
+WEAR_STRICT_MULT = 1.25
 
 BUTTON_COLOR_RULES = {
     "A": {"name": "green",  "hsv": [((35, 40, 40), (90, 255, 255))]},
@@ -1297,9 +1298,11 @@ def main():
 
         if region_results:
             failed_regions = [k for k in ["A", "B", "C", "D", "L"] if region_results[k]["verdict"] != "PASS"]
+            play_regions = [k for k in ["A", "B", "C", "D", "L"] if region_results[k].get("anomaly_class", "") == "play"]
             defect_found = len(failed_regions) > 0
         else:
             failed_regions = []
+            play_regions = []
             defect_found = contour_fail or white_fail
 
         verdict = "FAIL" if defect_found else "PASS"
@@ -1311,6 +1314,8 @@ def main():
         )
         if region_results and failed_regions:
             failed_metric = f"roi_failed:{','.join(failed_regions)}"
+        elif region_results and play_regions:
+            failed_metric = f"roi_play:{','.join(play_regions)}"
         elif contour_fail and white_fail:
             failed_metric = f"contour+white_px_drop:{','.join(ratio_fail_buttons)}"
         elif white_fail:
@@ -1322,6 +1327,8 @@ def main():
         score_role = "informational_mean_pixel_diff" if contour_enabled else "white_pixel_drop_pct"
         score_value = score if contour_enabled else worst_ratio_drop_pct
         primary_failed = failed_regions[0] if failed_regions else ""
+        primary_play = play_regions[0] if play_regions else ""
+        primary_region = primary_failed if primary_failed else primary_play
 
         decision_trace = {
             "decision_logic": decision_logic,
@@ -1341,16 +1348,16 @@ def main():
             "roi_D": region_results.get("D", {}).get("verdict", ""),
             "roi_L": region_results.get("L", {}).get("verdict", ""),
             "roi_overall": verdict if region_results else "",
-            "roi_reason": "ok" if (region_results and not failed_regions) else ((f"failed:{','.join(failed_regions)}") if region_results else ""),
+            "roi_reason": (f"failed:{','.join(failed_regions)}" if failed_regions else (f"play:{','.join(play_regions)}" if play_regions else "ok")) if region_results else "",
             "roi_verdicts_map": {k: v.get("verdict", "") for k, v in region_results.items()} if region_results else {},
-            "anomaly_class": (region_results.get(primary_failed, {}).get("anomaly_class", "wear") if primary_failed else "ok") if region_results else ("wear" if defect_found else "ok"),
-            "reg_method": (region_results.get(primary_failed, {}).get("reg_method", "") if primary_failed else "") if region_results else "",
-            "reg_shift": (region_results.get(primary_failed, {}).get("reg_shift", 0.0) if primary_failed else 0.0) if region_results else 0.0,
-            "reg_quality": (region_results.get(primary_failed, {}).get("reg_quality", "") if primary_failed else "") if region_results else "",
-            "residual_drop_pct": (f"{float(region_results.get(primary_failed, {}).get('residual_drop_pct', 0.0)):.1f}" if primary_failed else "") if region_results else "",
-            "bbox_global": (region_results.get(primary_failed, {}).get("bbox_global", "") if primary_failed else "") if region_results else "",
-            "class_confidence": (f"{float(region_results.get(primary_failed, {}).get('class_confidence', 0.0)):.2f}" if primary_failed else "") if region_results else "",
-            "failure_source": (region_results.get(primary_failed, {}).get("failure_source", "") if primary_failed else "ok") if region_results else ("global_contour" if contour_fail else ("global_white_drop" if white_fail else "ok")),
+            "anomaly_class": (region_results.get(primary_region, {}).get("anomaly_class", "ok") if primary_region else "ok") if region_results else ("wear" if defect_found else "ok"),
+            "reg_method": (region_results.get(primary_region, {}).get("reg_method", "") if primary_region else "") if region_results else "",
+            "reg_shift": (region_results.get(primary_region, {}).get("reg_shift", 0.0) if primary_region else 0.0) if region_results else 0.0,
+            "reg_quality": (region_results.get(primary_region, {}).get("reg_quality", "") if primary_region else "") if region_results else "",
+            "residual_drop_pct": (f"{float(region_results.get(primary_region, {}).get('residual_drop_pct', 0.0)):.1f}" if primary_region else "") if region_results else "",
+            "bbox_global": (region_results.get(primary_region, {}).get("bbox_global", "") if primary_region else "") if region_results else "",
+            "class_confidence": (f"{float(region_results.get(primary_region, {}).get('class_confidence', 0.0)):.2f}" if primary_region else "") if region_results else "",
+            "failure_source": (region_results.get(primary_region, {}).get("failure_source", "") if primary_region else "ok") if region_results else ("global_contour" if contour_fail else ("global_white_drop" if white_fail else "ok")),
         }
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1373,6 +1380,16 @@ def main():
         cv2.putText(disp, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                     (0, 255, 0) if verdict == "PASS" else (0, 0, 255), 2)
 
+        if region_results:
+            class_items = []
+            for _k in ["A", "B", "C", "D", "L"]:
+                _cls = region_results.get(_k, {}).get("anomaly_class", "ok")
+                if _cls != "ok":
+                    class_items.append(f"{_k}:{_cls}")
+            class_txt = "Class:" + (", ".join(class_items) if class_items else "ok")
+            cv2.putText(disp, class_txt, (tx, ty + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                        (0, 255, 0) if verdict == "PASS" else (0, 0, 255), 2)
+
         # Keep overlay source consistent with failure source.
         # When per-ROI evaluation is active, avoid drawing global contour rectangles
         # that can appear outside the ROI that actually triggered FAIL.
@@ -1393,13 +1410,23 @@ def main():
                     try:
                         bx, by, bw, bh = [int(float(v)) for v in str(_bbox_g).split(",")[:4]]
                         cv2.rectangle(disp, (bx, by), (bx + bw, by + bh), (0, 0, 255), 2)
-                        cv2.putText(disp, f"{_r}:{_rr.get('anomaly_class', 'fail')}", (bx, max(16, by - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                     except Exception:
                         pass
                 if _r in BUTTON_ORDER and _r in button_rois:
                     _draw_roi(disp, button_rois[_r], color=(0, 0, 255), label=f"{_r}!")
                 elif _r == "L" and area_l_roi is not None:
                     _draw_roi(disp, area_l_roi, color=(0, 0, 255), label="L!")
+
+        if region_results and play_regions:
+            for _r in play_regions:
+                _rr = region_results.get(_r, {})
+                _bbox_g = _rr.get("bbox_global", "")
+                if _bbox_g:
+                    try:
+                        bx, by, bw, bh = [int(float(v)) for v in str(_bbox_g).split(",")[:4]]
+                        cv2.rectangle(disp, (bx, by), (bx + bw, by + bh), (0, 165, 255), 2)
+                    except Exception:
+                        pass
 
         if button_roi_locked and button_rois:
             for _btn, _roi in button_rois.items():
@@ -2779,6 +2806,12 @@ def main():
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        roi_edge = max(2, int(INSPECTION_EDGE_IGNORE_PX) + 1)
+        if mask.shape[0] > 2 * roi_edge and mask.shape[1] > 2 * roi_edge:
+            mask[:roi_edge, :] = 0
+            mask[-roi_edge:, :] = 0
+            mask[:, :roi_edge] = 0
+            mask[:, -roi_edge:] = 0
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         contour_fail = False
@@ -2791,6 +2824,9 @@ def main():
                     continue
                 rx, ry, rw, rh = cv2.boundingRect(cnt)
                 if rw < INSPECTION_MIN_DEFECT_W or rh < INSPECTION_MIN_DEFECT_H:
+                    continue
+                edge_guard = max(2, int(INSPECTION_EDGE_IGNORE_PX) + 1)
+                if rx <= edge_guard or ry <= edge_guard or (rx + rw) >= (gw - edge_guard) or (ry + rh) >= (gh - edge_guard):
                     continue
                 if area >= max_area:
                     max_area = area
@@ -2838,16 +2874,29 @@ def main():
         reg_quality_score += 0.15 if abs(float(reg.get("reg_rot_deg", 0.0))) <= 5.0 else 0.05
         reg_quality = "good" if reg_quality_score >= 0.80 else ("fair" if reg_quality_score >= 0.55 else "poor")
 
+        wear_signal = (
+            contour_fail and
+            (max_bbox_local is not None) and
+            (mean_diff >= (WEAR_DIFF_THRESH * WEAR_STRICT_MULT)) and
+            (residual_drop_pct <= 35.0) and
+            (reg_quality in ("good", "fair"))
+        )
+        if fail:
+            anomaly_class = "wear" if wear_signal else "play"
+
+        if anomaly_class == "play":
+            verdict = "PASS"
+            reason = "play"
+            fail = False
+
         if verdict == "PASS":
-            class_confidence = 1.0
-        elif anomaly_class == "play":
-            class_confidence = min(1.0, 0.45 + 0.35 * min(1.0, float(reg.get("reg_shift", 0.0)) / max(PLAY_SHIFT_PX, 1e-6)) + 0.20 * min(1.0, residual_drop_pct / 40.0))
+            class_confidence = 1.0 if anomaly_class == "ok" else min(1.0, 0.55 + 0.30 * min(1.0, float(reg.get("reg_shift", 0.0)) / max(PLAY_SHIFT_PX, 1e-6)) + 0.15 * min(1.0, residual_drop_pct / 40.0))
         elif anomaly_class == "wear":
-            class_confidence = min(1.0, 0.40 + 0.35 * min(1.0, mean_diff / max(WEAR_DIFF_THRESH, 1e-6)) + 0.25 * (1.0 - min(1.0, residual_drop_pct / 40.0)))
+            class_confidence = min(1.0, 0.45 + 0.40 * min(1.0, mean_diff / max(WEAR_DIFF_THRESH * WEAR_STRICT_MULT, 1e-6)) + 0.15 * (1.0 - min(1.0, residual_drop_pct / 40.0)))
         else:
             class_confidence = 0.70
 
-        failure_source = "roi_contour" if contour_fail else ("roi_white_drop" if white_fail else "ok")
+        failure_source = "roi_play_compensated" if anomaly_class == "play" else ("roi_contour" if contour_fail else ("roi_white_drop" if white_fail else "ok"))
 
         bbox_global = ""
         if max_bbox_local is not None:
