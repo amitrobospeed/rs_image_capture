@@ -608,7 +608,8 @@ def main():
             "golden_path", "video_path", "anomaly_path", "policy",
             "decision_logic", "failed_metric", "max_contour_area", "max_bbox", "score_role",
             "button_drop_pct", "white_ratio_button", "white_ratio_change_pct",
-            "A", "B", "C", "D", "L", "overall", "reason", "anomaly_class"
+            "A", "B", "C", "D", "L", "overall", "reason", "anomaly_class",
+            "reg_quality", "residual_drop_pct", "bbox_global", "class_confidence", "failure_source"
         ]
         with open(manifest_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
@@ -1320,6 +1321,8 @@ def main():
             failed_metric = "none"
         score_role = "informational_mean_pixel_diff" if contour_enabled else "white_pixel_drop_pct"
         score_value = score if contour_enabled else worst_ratio_drop_pct
+        primary_failed = failed_regions[0] if failed_regions else ""
+
         decision_trace = {
             "decision_logic": decision_logic,
             "failed_metric": failed_metric,
@@ -1340,9 +1343,14 @@ def main():
             "roi_overall": verdict if region_results else "",
             "roi_reason": "ok" if (region_results and not failed_regions) else ((f"failed:{','.join(failed_regions)}") if region_results else ""),
             "roi_verdicts_map": {k: v.get("verdict", "") for k, v in region_results.items()} if region_results else {},
-            "anomaly_class": (region_results.get(failed_regions[0], {}).get("anomaly_class", "wear") if failed_regions else "ok") if region_results else ("wear" if defect_found else "ok"),
-            "reg_method": (region_results.get(failed_regions[0], {}).get("reg_method", "") if failed_regions else "") if region_results else "",
-            "reg_shift": (region_results.get(failed_regions[0], {}).get("reg_shift", 0.0) if failed_regions else 0.0) if region_results else 0.0,
+            "anomaly_class": (region_results.get(primary_failed, {}).get("anomaly_class", "wear") if primary_failed else "ok") if region_results else ("wear" if defect_found else "ok"),
+            "reg_method": (region_results.get(primary_failed, {}).get("reg_method", "") if primary_failed else "") if region_results else "",
+            "reg_shift": (region_results.get(primary_failed, {}).get("reg_shift", 0.0) if primary_failed else 0.0) if region_results else 0.0,
+            "reg_quality": (region_results.get(primary_failed, {}).get("reg_quality", "") if primary_failed else "") if region_results else "",
+            "residual_drop_pct": (f"{float(region_results.get(primary_failed, {}).get('residual_drop_pct', 0.0)):.1f}" if primary_failed else "") if region_results else "",
+            "bbox_global": (region_results.get(primary_failed, {}).get("bbox_global", "") if primary_failed else "") if region_results else "",
+            "class_confidence": (f"{float(region_results.get(primary_failed, {}).get('class_confidence', 0.0)):.2f}" if primary_failed else "") if region_results else "",
+            "failure_source": (region_results.get(primary_failed, {}).get("failure_source", "") if primary_failed else "ok") if region_results else ("global_contour" if contour_fail else ("global_white_drop" if white_fail else "ok")),
         }
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1379,6 +1387,15 @@ def main():
 
         if region_results and failed_regions:
             for _r in failed_regions:
+                _rr = region_results.get(_r, {})
+                _bbox_g = _rr.get("bbox_global", "")
+                if _bbox_g:
+                    try:
+                        bx, by, bw, bh = [int(float(v)) for v in str(_bbox_g).split(",")[:4]]
+                        cv2.rectangle(disp, (bx, by), (bx + bw, by + bh), (0, 0, 255), 2)
+                        cv2.putText(disp, f"{_r}:{_rr.get('anomaly_class', 'fail')}", (bx, max(16, by - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                    except Exception:
+                        pass
                 if _r in BUTTON_ORDER and _r in button_rois:
                     _draw_roi(disp, button_rois[_r], color=(0, 0, 255), label=f"{_r}!")
                 elif _r == "L" and area_l_roi is not None:
@@ -1475,7 +1492,7 @@ def main():
         verdict = "WARN"
         score = ""
         anomaly_path = ""
-        decision_trace = {"decision_logic": "", "failed_metric": "", "max_contour_area": "", "max_bbox": "", "score_role": "", "button_drop_pct": "", "white_ratio_button": "", "white_ratio_change_pct": ""}
+        decision_trace = {"decision_logic": "", "failed_metric": "", "max_contour_area": "", "max_bbox": "", "score_role": "", "button_drop_pct": "", "white_ratio_button": "", "white_ratio_change_pct": "", "reg_quality": "", "residual_drop_pct": "", "bbox_global": "", "class_confidence": "", "failure_source": ""}
         msg = "captured"
 
         if capture_type == "golden":
@@ -1531,6 +1548,11 @@ def main():
             "overall": decision_trace.get("roi_overall", verdict),
             "reason": decision_trace.get("roi_reason", ""),
             "anomaly_class": decision_trace.get("anomaly_class", ""),
+            "reg_quality": decision_trace.get("reg_quality", ""),
+            "residual_drop_pct": decision_trace.get("residual_drop_pct", ""),
+            "bbox_global": decision_trace.get("bbox_global", ""),
+            "class_confidence": decision_trace.get("class_confidence", ""),
+            "failure_source": decision_trace.get("failure_source", ""),
         }
         _manifest_write(rec, mode=OUTPUT_MODE_DURABILITY)
         inspection_records.append(dict(rec, anomaly_path=anomaly_path))
@@ -2595,8 +2617,8 @@ def main():
         verdict, score, mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num, use_temporal_gate=False, mode=OUTPUT_MODE_MANUAL)
         _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_MANUAL)
         _append_cycle_video_frame(disp, cyc_num, mode=OUTPUT_MODE_MANUAL)
-        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", ""), "anomaly_class": decision_trace.get("anomaly_class", "")}, mode=OUTPUT_MODE_MANUAL)
-        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", ""), "anomaly_class": decision_trace.get("anomaly_class", "")})
+        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", ""), "anomaly_class": decision_trace.get("anomaly_class", ""), "reg_quality": decision_trace.get("reg_quality", ""), "residual_drop_pct": decision_trace.get("residual_drop_pct", ""), "bbox_global": decision_trace.get("bbox_global", ""), "class_confidence": decision_trace.get("class_confidence", ""), "failure_source": decision_trace.get("failure_source", "")}, mode=OUTPUT_MODE_MANUAL)
+        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", ""), "anomaly_class": decision_trace.get("anomaly_class", ""), "reg_quality": decision_trace.get("reg_quality", ""), "residual_drop_pct": decision_trace.get("residual_drop_pct", ""), "bbox_global": decision_trace.get("bbox_global", ""), "class_confidence": decision_trace.get("class_confidence", ""), "failure_source": decision_trace.get("failure_source", "")})
         _record_anomaly_stats(cyc_num, verdict, score)
         with state_lock:
             state.last_capture_result = f"manual/{verdict}"
@@ -2620,7 +2642,7 @@ def main():
             contour_on = bool(state.detect_contour_enabled)
             white_on = bool(state.detect_white_ratio_enabled)
 
-        headers = ["#", "Timestamp", "Elapsed(min)", "A", "B", "C", "D", "L", "Overall", "Anomaly Class", "Reason"]
+        headers = ["#", "Timestamp", "Elapsed(min)", "A", "B", "C", "D", "L", "Overall", "Anomaly Class", "RegQ", "ResDrop%", "BBox", "Conf", "Source", "Reason"]
         page_size = 26
         chunks = [rows[i:i + page_size] for i in range(0, max(1, len(rows)), page_size)] if rows else [[]]
 
@@ -2649,13 +2671,18 @@ def main():
                         str(r.get("L", "")),
                         str(r.get("overall", "")),
                         str(r.get("anomaly_class", "")),
-                        str(r.get("reason", ""))[:28],
+                        str(r.get("reg_quality", "")),
+                        str(r.get("residual_drop_pct", ""))[:8],
+                        str(r.get("bbox_global", ""))[:16],
+                        str(r.get("class_confidence", ""))[:6],
+                        str(r.get("failure_source", ""))[:10],
+                        str(r.get("reason", ""))[:22],
                     ])
 
                 ax_tbl = fig_vi.add_axes([0.05, 0.10, 0.90, 0.74])
                 ax_tbl.axis("off")
-                col_widths = [0.04, 0.14, 0.08, 0.05, 0.05, 0.05, 0.05, 0.05, 0.08, 0.12, 0.24]
-                table = ax_tbl.table(cellText=cell_rows if cell_rows else [["", "", "", "", "", "", "", "", "", "", "No rows"]],
+                col_widths = [0.03, 0.11, 0.06, 0.04, 0.04, 0.04, 0.04, 0.04, 0.06, 0.08, 0.06, 0.06, 0.10, 0.05, 0.07, 0.12]
+                table = ax_tbl.table(cellText=cell_rows if cell_rows else [["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "No rows"]],
                                      colLabels=headers,
                                      colLoc='center', cellLoc='center',
                                      colWidths=col_widths,
@@ -2739,6 +2766,7 @@ def main():
         aligned_src, reg = _align_roi_with_phase_ecc(g_src, c_src)
 
         g_gray = cv2.cvtColor(g_src, cv2.COLOR_BGR2GRAY)
+        c_gray_pre = cv2.cvtColor(c_src, cv2.COLOR_BGR2GRAY)
         c_gray = cv2.cvtColor(aligned_src, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         g_norm = clahe.apply(g_gray)
@@ -2755,6 +2783,7 @@ def main():
 
         contour_fail = False
         max_area = 0.0
+        max_bbox_local = None
         if contour_enabled:
             for cnt in contours:
                 area = float(cv2.contourArea(cnt))
@@ -2763,7 +2792,9 @@ def main():
                 rx, ry, rw, rh = cv2.boundingRect(cnt)
                 if rw < INSPECTION_MIN_DEFECT_W or rh < INSPECTION_MIN_DEFECT_H:
                     continue
-                max_area = max(max_area, area)
+                if area >= max_area:
+                    max_area = area
+                    max_bbox_local = (int(rx), int(ry), int(rw), int(rh))
                 contour_fail = True
 
         white_fail = False
@@ -2791,9 +2822,37 @@ def main():
         score = mean_diff if contour_enabled else white_drop
         score_role = "mean_pixel_diff" if contour_enabled else "white_pixel_drop_pct"
 
+        # compare residual before/after alignment (helps separate play vs wear)
+        c_pre_norm = clahe.apply(c_gray_pre)
+        c_pre_blur = cv2.GaussianBlur(c_pre_norm, (5, 5), 0)
+        pre_align_diff = float(np.mean(cv2.absdiff(g_blur, c_pre_blur)))
+        residual_drop_pct = max(0.0, ((pre_align_diff - mean_diff) / max(pre_align_diff, 1e-6)) * 100.0)
+
         luma_delta = abs(float(np.mean(g_gray)) - float(np.mean(c_gray)))
         color_delta = float(np.mean(np.abs(g_src.astype(np.float32) - aligned_src.astype(np.float32))))
         anomaly_class = _classify_anomaly(verdict, mean_diff, white_drop, reg["reg_shift"], luma_delta, color_delta)
+
+        reg_quality_score = 0.0
+        reg_quality_score += 0.55 if float(reg.get("reg_ecc", -1.0)) >= 0.80 else (0.35 if float(reg.get("reg_ecc", -1.0)) >= 0.60 else 0.10)
+        reg_quality_score += 0.30 if float(reg.get("reg_phase_resp", 0.0)) >= 0.08 else (0.15 if float(reg.get("reg_phase_resp", 0.0)) >= 0.03 else 0.05)
+        reg_quality_score += 0.15 if abs(float(reg.get("reg_rot_deg", 0.0))) <= 5.0 else 0.05
+        reg_quality = "good" if reg_quality_score >= 0.80 else ("fair" if reg_quality_score >= 0.55 else "poor")
+
+        if verdict == "PASS":
+            class_confidence = 1.0
+        elif anomaly_class == "play":
+            class_confidence = min(1.0, 0.45 + 0.35 * min(1.0, float(reg.get("reg_shift", 0.0)) / max(PLAY_SHIFT_PX, 1e-6)) + 0.20 * min(1.0, residual_drop_pct / 40.0))
+        elif anomaly_class == "wear":
+            class_confidence = min(1.0, 0.40 + 0.35 * min(1.0, mean_diff / max(WEAR_DIFF_THRESH, 1e-6)) + 0.25 * (1.0 - min(1.0, residual_drop_pct / 40.0)))
+        else:
+            class_confidence = 0.70
+
+        failure_source = "roi_contour" if contour_fail else ("roi_white_drop" if white_fail else "ok")
+
+        bbox_global = ""
+        if max_bbox_local is not None:
+            bx, by, bw, bh = max_bbox_local
+            bbox_global = f"{gx + bx},{gy + by},{bw},{bh}"
 
         return {
             "verdict": verdict,
@@ -2801,7 +2860,15 @@ def main():
             "score": score,
             "score_role": score_role,
             "max_area": max_area,
+            "max_bbox_local": max_bbox_local,
+            "bbox_global": bbox_global,
+            "pre_align_diff": pre_align_diff,
+            "post_align_diff": mean_diff,
+            "residual_drop_pct": residual_drop_pct,
             "anomaly_class": anomaly_class,
+            "class_confidence": float(class_confidence),
+            "failure_source": failure_source,
+            "reg_quality": reg_quality,
             "luma_delta": luma_delta,
             "color_delta": color_delta,
             **reg,
@@ -2827,6 +2894,11 @@ def main():
                 "overall": "WARN",
                 "reason": q_reason,
                 "anomaly_class": "warning",
+                "reg_quality": "",
+                "residual_drop_pct": "",
+                "bbox_global": "",
+                "class_confidence": "",
+                "failure_source": "quality_gate",
             })
             return True
 
@@ -2869,6 +2941,11 @@ def main():
             "overall": overall_verdict,
             "reason": "ok" if overall_pass else f"failed:{','.join(failed_regions)}",
             "anomaly_class": "ok" if overall_pass else "/".join(sorted(set(region_results[k]["anomaly_class"] for k in failed_regions))),
+            "reg_quality": "" if overall_pass else "/".join(sorted(set(str(region_results[k].get("reg_quality", "")) for k in failed_regions))),
+            "residual_drop_pct": "" if overall_pass else "/".join(sorted(set(f"{float(region_results[k].get('residual_drop_pct', 0.0)):.1f}" for k in failed_regions))),
+            "bbox_global": "" if overall_pass else ";".join(sorted(set(str(region_results[k].get("bbox_global", "")) for k in failed_regions if region_results[k].get("bbox_global", "")))),
+            "class_confidence": "" if overall_pass else "/".join(sorted(set(f"{float(region_results[k].get('class_confidence', 0.0)):.2f}" for k in failed_regions))),
+            "failure_source": "ok" if overall_pass else "/".join(sorted(set(str(region_results[k].get("failure_source", "")) for k in failed_regions))),
         })
 
         _manifest_write({
@@ -2904,6 +2981,11 @@ def main():
             "overall": overall_verdict,
             "reason": "ok" if overall_pass else f"failed:{','.join(failed_regions)}",
             "anomaly_class": "ok" if overall_pass else "/".join(sorted(set(region_results[k]["anomaly_class"] for k in failed_regions))),
+            "reg_quality": "" if overall_pass else "/".join(sorted(set(str(region_results[k].get("reg_quality", "")) for k in failed_regions))),
+            "residual_drop_pct": "" if overall_pass else "/".join(sorted(set(f"{float(region_results[k].get('residual_drop_pct', 0.0)):.1f}" for k in failed_regions))),
+            "bbox_global": "" if overall_pass else ";".join(sorted(set(str(region_results[k].get("bbox_global", "")) for k in failed_regions if region_results[k].get("bbox_global", "")))),
+            "class_confidence": "" if overall_pass else "/".join(sorted(set(f"{float(region_results[k].get('class_confidence', 0.0)):.2f}" for k in failed_regions))),
+            "failure_source": "ok" if overall_pass else "/".join(sorted(set(str(region_results[k].get("failure_source", "")) for k in failed_regions))),
         }, mode=OUTPUT_MODE_VISUAL)
 
         try:
@@ -3187,7 +3269,7 @@ def main():
             anomaly_fig.text(0.06, y, stats_txt, fontsize=9)
             y -= 0.06
             if inspection_records:
-                table_cols = ["#", "Timestamp", "Elapsed(min)", "A", "B", "C", "D", "L", "Overall", "Anomaly Class", "Reason"]
+                table_cols = ["#", "Timestamp", "Elapsed(min)", "A", "B", "C", "D", "L", "Overall", "Anomaly Class", "RegQ", "ResDrop%", "BBox", "Conf", "Source", "Reason"]
                 table_rows = []
                 for rec in inspection_records[-20:]:
                     table_rows.append([
@@ -3201,7 +3283,12 @@ def main():
                         str(rec.get("L", "")),
                         str(rec.get("overall", rec.get("verdict", ""))),
                         str(rec.get("anomaly_class", "")),
-                        str(rec.get("reason", rec.get("reason_code", rec.get("message", ""))))[:24],
+                        str(rec.get("reg_quality", "")),
+                        str(rec.get("residual_drop_pct", ""))[:8],
+                        str(rec.get("bbox_global", ""))[:16],
+                        str(rec.get("class_confidence", ""))[:6],
+                        str(rec.get("failure_source", ""))[:10],
+                        str(rec.get("reason", rec.get("reason_code", rec.get("message", ""))))[:20],
                     ])
 
                 anomaly_fig.text(0.06, y, "Inspection Snapshot (latest 20)", fontsize=11, weight="bold")
@@ -3210,7 +3297,7 @@ def main():
                 table_bottom = table_top - table_height
                 table_ax = anomaly_fig.add_axes([0.05, table_bottom, 0.90, table_height])
                 table_ax.axis("off")
-                col_widths = [0.06, 0.13, 0.08, 0.05, 0.05, 0.05, 0.05, 0.05, 0.08, 0.12, 0.22]
+                col_widths = [0.04, 0.11, 0.06, 0.04, 0.04, 0.04, 0.04, 0.04, 0.06, 0.08, 0.06, 0.06, 0.10, 0.05, 0.07, 0.11]
                 inspection_table = table_ax.table(
                     cellText=table_rows,
                     colLabels=table_cols,
