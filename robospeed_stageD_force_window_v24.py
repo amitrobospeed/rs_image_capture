@@ -1365,7 +1365,11 @@ def main():
         cv2.putText(disp, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                     (0, 255, 0) if verdict == "PASS" else (0, 0, 255), 2)
 
-        if defect_rect is not None:
+        # Keep overlay source consistent with failure source.
+        # When per-ROI evaluation is active, avoid drawing global contour rectangles
+        # that can appear outside the ROI that actually triggered FAIL.
+        draw_global_rect = (defect_rect is not None) and (not region_results)
+        if draw_global_rect:
             rx, ry, rw, rh = defect_rect
             if roi_locked and locked_roi is not None:
                 ox, oy, _, _ = locked_roi
@@ -2764,13 +2768,17 @@ def main():
 
         white_fail = False
         white_drop = 0.0
-        if white_enabled and label in BUTTON_ORDER and button_rois and button_color_baselines:
+        if white_enabled and label in BUTTON_ORDER and button_color_baselines:
             base = button_color_baselines.get(label)
             if base:
+                # Use aligned ROI patch for white-drop to avoid false positives from button play/shift.
                 thr_ref = float(base.get("adaptive_white_thr", 1.0))
-                cur = _compute_button_color_stats(cyc_img, button_rois[label], label, threshold_ref=thr_ref)
+                g_gray_roi = cv2.cvtColor(g_src, cv2.COLOR_BGR2GRAY)
+                c_gray_roi = cv2.cvtColor(aligned_src, cv2.COLOR_BGR2GRAY)
                 base_white = float(base.get("white_px", 0.0))
-                cur_white = float(cur.get("white_px", 0.0))
+                cur_white = float(np.sum(c_gray_roi >= thr_ref))
+                if base_white <= 0:
+                    base_white = float(np.sum(g_gray_roi >= thr_ref))
                 if base_white > 0:
                     white_drop = max(0.0, ((base_white - cur_white) / base_white) * 100.0)
                 with state_lock:
