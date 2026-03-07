@@ -1149,6 +1149,9 @@ def main():
             if os.path.exists(out_path):
                 out_name = f"golden_{run_id}_{ts}.png"
                 out_path = os.path.join(_mode_dir(mode, "golden"), out_name)
+        elif capture_type == "golden_roi":
+            out_name = f"golden_roi_{run_id}_{ts}.png"
+            out_path = os.path.join(_mode_dir(mode, "golden"), out_name)
         elif capture_type == "cyc":
             out_name = f"cycle_{cycle_num}_{ts}.png"
             out_path = os.path.join(_mode_dir(mode, "cycle_data"), out_name)
@@ -1359,6 +1362,13 @@ def main():
                 cv2.rectangle(disp, (ox + rx, oy + ry), (ox + rx + rw, oy + ry + rh), (0, 0, 255), 2)
             else:
                 cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 2)
+
+        if region_results and failed_regions:
+            for _r in failed_regions:
+                if _r in BUTTON_ORDER and _r in button_rois:
+                    _draw_roi(disp, button_rois[_r], color=(0, 0, 255), label=f"{_r}!")
+                elif _r == "L" and area_l_roi is not None:
+                    _draw_roi(disp, area_l_roi, color=(0, 0, 255), label="L!")
 
         if button_roi_locked and button_rois:
             for _btn, _roi in button_rois.items():
@@ -2211,7 +2221,7 @@ def main():
                     return
             else:
                 set_alert("#d97706", "VI: capture new Golden now")
-            on_golden_capture(None)
+            on_golden_capture(None, mode=OUTPUT_MODE_VISUAL)
             if _vi_has_locked_golden():
                 _begin_vi_session()
             else:
@@ -2504,7 +2514,7 @@ def main():
         else:
             set_alert("#f59e0b", "Camera tune disabled (inspection still allowed)")
 
-    def on_golden_capture(_evt):
+    def on_golden_capture(_evt, mode=OUTPUT_MODE_MANUAL):
         nonlocal golden_frame, golden_path, locked_roi, roi_locked, button_rois, area_l_roi, button_color_baselines, button_roi_locked, button_fail_history
         frame, frames_used = capture_average_frame()
         if frame is None:
@@ -2513,7 +2523,7 @@ def main():
             return
 
         run_id = state.test_name.strip() or "test_report"
-        ok, out_name, out_path = save_capture_frame(frame, "golden", run_id, 0, mode=OUTPUT_MODE_MANUAL)
+        ok, out_name, out_path = save_capture_frame(frame, "golden", run_id, 0, mode=mode)
         if not ok:
             set_alert("red", "Golden Capture failed: save error")
             print(f"[GUI] Golden Capture failed: could not save {out_path}")
@@ -2524,6 +2534,12 @@ def main():
         with state_lock:
             state.golden_ready = True
         if _select_button_rois_and_calibrate(golden_frame):
+            overlay = golden_frame.copy()
+            for _btn, _roi in button_rois.items():
+                _draw_roi(overlay, _roi, color=(255, 0, 0), label=_btn)
+            if area_l_roi is not None:
+                _draw_roi(overlay, area_l_roi, color=(0, 255, 255), label="L")
+            save_capture_frame(overlay, "golden_roi", run_id, 0, mode=mode)
             set_alert("#d97706", f"Golden saved + button ROIs locked: {out_name}")
             print(f"[GUI] Button ROIs locked -> {button_rois}")
         else:
@@ -2589,53 +2605,57 @@ def main():
             contour_on = bool(state.detect_contour_enabled)
             white_on = bool(state.detect_white_ratio_enabled)
 
+        headers = ["#", "Timestamp", "Elapsed(min)", "A", "B", "C", "D", "L", "Overall", "Reason"]
+        page_size = 26
+        chunks = [rows[i:i + page_size] for i in range(0, max(1, len(rows)), page_size)] if rows else [[]]
+
         pdf = PdfPages(path)
         try:
-            fig_vi = plt.figure(figsize=(11, 8.5), facecolor="white")
-            fig_vi.text(0.06, 0.95, "Visual Inspection Report", fontsize=16, weight="bold")
-            fig_vi.text(0.06, 0.92, f"Run: {run_id}", fontsize=10)
-            fig_vi.text(0.06, 0.90, f"VI total={total_min:.2f} min | interval={interval_min:.2f} min", fontsize=10)
-            score_meaning = "mean pixel diff (contour)" if contour_on else ("white pixel drop %" if white_on else "n/a")
-            fig_vi.text(0.06, 0.88, f"Score meaning: {score_meaning}", fontsize=9, color="#334155")
+            total_pages = len(chunks)
+            for page_idx, chunk in enumerate(chunks, start=1):
+                fig_vi = plt.figure(figsize=(11, 8.5), facecolor="white")
+                fig_vi.text(0.06, 0.95, "Visual Inspection Report", fontsize=16, weight="bold")
+                fig_vi.text(0.06, 0.92, f"Run: {run_id}", fontsize=10)
+                fig_vi.text(0.06, 0.90, f"VI total={total_min:.2f} min | interval={interval_min:.2f} min", fontsize=10)
+                score_meaning = "mean pixel diff (contour)" if contour_on else ("white pixel drop %" if white_on else "n/a")
+                fig_vi.text(0.06, 0.88, f"Score meaning: {score_meaning}", fontsize=9, color="#334155")
+                fig_vi.text(0.84, 0.95, f"Page {page_idx}/{total_pages}", fontsize=9, color="#334155")
 
-            headers = ["#", "Timestamp", "Elapsed(min)", "A", "B", "C", "D", "L", "Overall", "Reason"]
-            max_rows = 26
-            show_rows = rows[-max_rows:]
-            cell_rows = []
-            for r in show_rows:
-                cell_rows.append([
-                    str(r.get("idx", "")),
-                    str(r.get("timestamp", ""))[:19],
-                    f"{float(r.get('elapsed_min', 0.0)):.2f}",
-                    str(r.get("A", "")),
-                    str(r.get("B", "")),
-                    str(r.get("C", "")),
-                    str(r.get("D", "")),
-                    str(r.get("L", "")),
-                    str(r.get("overall", "")),
-                    str(r.get("reason", ""))[:34],
-                ])
+                cell_rows = []
+                for r in chunk:
+                    cell_rows.append([
+                        str(r.get("idx", "")),
+                        str(r.get("timestamp", ""))[:19],
+                        f"{float(r.get('elapsed_min', 0.0)):.2f}",
+                        str(r.get("A", "")),
+                        str(r.get("B", "")),
+                        str(r.get("C", "")),
+                        str(r.get("D", "")),
+                        str(r.get("L", "")),
+                        str(r.get("overall", "")),
+                        str(r.get("reason", ""))[:34],
+                    ])
 
-            ax_tbl = fig_vi.add_axes([0.05, 0.10, 0.90, 0.74])
-            ax_tbl.axis("off")
-            col_widths = [0.04, 0.16, 0.09, 0.06, 0.06, 0.06, 0.06, 0.06, 0.09, 0.28]
-            table = ax_tbl.table(cellText=cell_rows if cell_rows else [["", "", "", "", "", "", "", "", "", "No rows"]],
-                                 colLabels=headers,
-                                 colLoc='center', cellLoc='center',
-                                 colWidths=col_widths,
-                                 loc='upper left')
-            table.auto_set_font_size(False)
-            table.set_fontsize(8)
-            table.scale(1, 1.25)
-            for (r, c), cell in table.get_celld().items():
-                cell.set_edgecolor("#475569")
-                if r == 0:
-                    cell.set_facecolor("#e2e8f0")
-                    cell.set_text_props(weight='bold')
+                ax_tbl = fig_vi.add_axes([0.05, 0.10, 0.90, 0.74])
+                ax_tbl.axis("off")
+                col_widths = [0.04, 0.16, 0.09, 0.06, 0.06, 0.06, 0.06, 0.06, 0.09, 0.28]
+                table = ax_tbl.table(cellText=cell_rows if cell_rows else [["", "", "", "", "", "", "", "", "", "No rows"]],
+                                     colLabels=headers,
+                                     colLoc='center', cellLoc='center',
+                                     colWidths=col_widths,
+                                     loc='upper left')
+                table.auto_set_font_size(False)
+                table.set_fontsize(8)
+                table.scale(1, 1.25)
+                for (r, c), cell in table.get_celld().items():
+                    cell.set_edgecolor("#475569")
+                    if r == 0:
+                        cell.set_facecolor("#e2e8f0")
+                        cell.set_text_props(weight='bold')
 
-            fig_vi.text(0.06, 0.05, f"Rows stored: {len(rows)}", fontsize=9)
-            pdf.savefig(fig_vi)
-            plt.close(fig_vi)
+                fig_vi.text(0.06, 0.05, f"Rows stored: {len(rows)}", fontsize=9)
+                pdf.savefig(fig_vi)
+                plt.close(fig_vi)
         finally:
             pdf.close()
 
@@ -2848,7 +2868,7 @@ def main():
             return
 
         set_alert("#d97706", "VI: capturing Golden first")
-        on_golden_capture(None)
+        on_golden_capture(None, mode=OUTPUT_MODE_VISUAL)
         if not _vi_has_locked_golden():
             set_alert("red", "VI start blocked: Golden/ROI not ready")
             return
