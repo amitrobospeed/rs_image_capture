@@ -83,6 +83,7 @@ INSPECTION_MIN_DEFECT_AREA = 25
 INSPECTION_MIN_DEFECT_W = 10
 INSPECTION_MIN_DEFECT_H = 10
 INSPECTION_EDGE_IGNORE_PX = 2
+ROI_ANOMALY_MIN_OVERLAP_RATIO = 0.05
 BUTTON_COATING_DEGRADATION_PCT_DEFAULT = 10.0
 BUTTON_TEMPORAL_WINDOW = 3
 BUTTON_TEMPORAL_FAILS_REQUIRED = 2
@@ -1292,13 +1293,89 @@ def main():
                 ratio_fail_buttons = _apply_temporal_white_fail(ratio_fail_buttons)
             white_fail = len(ratio_fail_buttons) > 0
 
+        global_contour_boxes = []
+        if contour_enabled and defect_rects:
+            for rx, ry, rw, rh in defect_rects:
+                if roi_locked and locked_roi is not None:
+                    ox, oy, _, _ = locked_roi
+                    global_contour_boxes.append((int(ox + rx), int(oy + ry), int(rw), int(rh)))
+                else:
+                    global_contour_boxes.append((int(rx), int(ry), int(rw), int(rh)))
+
         region_results = {}
         if button_roi_locked and button_rois and (area_l_roi is not None):
             for _btn in BUTTON_ORDER:
                 region_results[_btn] = _vi_eval_region(golden, cyc, _btn, button_rois[_btn])
             region_results["L"] = _vi_eval_region(golden, cyc, "L", area_l_roi)
 
+        roi_anomaly_counts = {k: 0 for k in ["A", "B", "C", "D", "L"]}
+        roi_contour_boxes = {k: [] for k in ["A", "B", "C", "D", "L"]}
+        if contour_enabled and global_contour_boxes and button_roi_locked and button_rois and (area_l_roi is not None):
+            roi_specs = {
+                "A": button_rois.get("A"),
+                "B": button_rois.get("B"),
+                "C": button_rois.get("C"),
+                "D": button_rois.get("D"),
+                "L": area_l_roi,
+            }
+            roi_masks = {}
+            for _k, _roi in roi_specs.items():
+                if _roi is not None:
+                    _mask, _ = _roi_mask_from_spec(cyc.shape, _roi)
+                    roi_masks[_k] = (_mask > 0)
+
+            for bx, by, bw, bh in global_contour_boxes:
+                aw = max(0, int(bw))
+                ah = max(0, int(bh))
+                if aw <= 0 or ah <= 0:
+                    continue
+                x0 = max(0, int(bx))
+                y0 = max(0, int(by))
+                x1 = min(cyc.shape[1], int(bx + bw))
+                y1 = min(cyc.shape[0], int(by + bh))
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                anomaly_area = float((x1 - x0) * (y1 - y0))
+                if anomaly_area <= 0:
+                    continue
+                box_txt = f"{x0},{y0},{x1 - x0},{y1 - y0}"
+                for _k in ["A", "B", "C", "D", "L"]:
+                    _rm = roi_masks.get(_k)
+                    if _rm is None:
+                        continue
+                    inter_area = float(np.count_nonzero(_rm[y0:y1, x0:x1]))
+                    overlap_ratio = inter_area / anomaly_area
+                    if overlap_ratio >= ROI_ANOMALY_MIN_OVERLAP_RATIO:
+                        roi_anomaly_counts[_k] += 1
+                        roi_contour_boxes[_k].append(box_txt)
+
+        for _k in roi_contour_boxes:
+            if roi_contour_boxes[_k]:
+                roi_contour_boxes[_k] = sorted(set(roi_contour_boxes[_k]))
+
         if region_results:
+            for _k in ["A", "B", "C", "D", "L"]:
+                r = region_results.get(_k, {})
+                contour_roi_fail = roi_anomaly_counts.get(_k, 0) > 0
+                white_roi_fail = (str(r.get("failure_source", "")) == "roi_white_drop") and (str(r.get("verdict", "PASS")) == "FAIL")
+                if contour_roi_fail or white_roi_fail:
+                    r["verdict"] = "FAIL"
+                    if contour_roi_fail and white_roi_fail:
+                        r["reason"] = "contour+white"
+                        r["failure_source"] = "roi_contour+roi_white_drop"
+                    elif contour_roi_fail:
+                        r["reason"] = "contour"
+                        r["failure_source"] = "roi_contour"
+                    else:
+                        r["reason"] = "white"
+                        r["failure_source"] = "roi_white_drop"
+                else:
+                    r["verdict"] = "PASS"
+                    r["reason"] = "ok"
+                    r["failure_source"] = "ok"
+                r["bbox_global"] = ";".join(roi_contour_boxes.get(_k, []))
+                region_results[_k] = r
+
             failed_regions = [k for k in ["A", "B", "C", "D", "L"] if region_results[k]["verdict"] != "PASS"]
             defect_found = len(failed_regions) > 0
         else:
@@ -1312,8 +1389,9 @@ def main():
             f"bbox>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}; "
             f"white gate: white_px_drop>per-button threshold; temporal={'ON' if use_temporal_gate else 'OFF'} ({BUTTON_TEMPORAL_FAILS_REQUIRED}/{BUTTON_TEMPORAL_WINDOW})"
         )
+        roi_count_txt = "|".join([f"{k}:{roi_anomaly_counts.get(k, 0)}" for k in ["A", "B", "C", "D", "L"]])
         if region_results and failed_regions:
-            failed_metric = f"roi_failed:{','.join(failed_regions)}"
+            failed_metric = f"roi_failed:{','.join([f'{k}({roi_anomaly_counts.get(k, 0)})' for k in failed_regions])}"
         elif contour_fail and white_fail:
             failed_metric = f"contour+white_px_drop:{','.join(ratio_fail_buttons)}"
         elif white_fail:
@@ -1344,7 +1422,7 @@ def main():
             "roi_D": region_results.get("D", {}).get("verdict", ""),
             "roi_L": region_results.get("L", {}).get("verdict", ""),
             "roi_overall": verdict if region_results else "",
-            "roi_reason": (f"failed:{','.join(failed_regions)}" if failed_regions else "ok") if region_results else "",
+            "roi_reason": (f"failed:{','.join(failed_regions)}|counts:{roi_count_txt}" if failed_regions else f"ok|counts:{roi_count_txt}") if region_results else "",
             "roi_verdicts_map": {k: v.get("verdict", "") for k, v in region_results.items()} if region_results else {},
             "anomaly_class": "",
             "reg_method": (region_results.get(primary_region, {}).get("reg_method", "") if primary_region else "") if region_results else "",
@@ -1354,6 +1432,7 @@ def main():
             "bbox_global": (region_results.get(primary_region, {}).get("bbox_global", "") if primary_region else "") if region_results else "",
             "class_confidence": "",
             "failure_source": (region_results.get(primary_region, {}).get("failure_source", "") if primary_region else "ok") if region_results else ("global_contour" if contour_fail else ("global_white_drop" if white_fail else "ok")),
+            "roi_counts": roi_count_txt,
         }
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1385,13 +1464,8 @@ def main():
                 seen_boxes.add(key)
                 draw_boxes.append(key)
 
-        if not region_results:
-            for rx, ry, rw, rh in defect_rects:
-                if roi_locked and locked_roi is not None:
-                    ox, oy, _, _ = locked_roi
-                    _push_box(ox + rx, oy + ry, rw, rh)
-                else:
-                    _push_box(rx, ry, rw, rh)
+        for rx, ry, rw, rh in global_contour_boxes:
+            _push_box(rx, ry, rw, rh)
 
         if region_results and failed_regions:
             for _r in failed_regions:
@@ -1408,7 +1482,7 @@ def main():
                     _draw_roi(disp, area_l_roi, color=(0, 0, 255), label="L!")
 
         for bx, by, bw, bh in draw_boxes:
-            cv2.rectangle(disp, (bx, by), (bx + bw, by + bh), (0, 0, 255), 2)
+            cv2.rectangle(disp, (bx, by), (bx + bw, by + bh), (0, 255, 255), 2)
 
         if button_roi_locked and button_rois:
             for _btn, _roi in button_rois.items():
@@ -2899,11 +2973,14 @@ def main():
         _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_VISUAL)
         _append_cycle_video_frame(disp, cyc_num, mode=OUTPUT_MODE_VISUAL)
 
-        # per-region VI evaluation: A/B/C/D + Large area L
-        region_results = {}
-        for btn in BUTTON_ORDER:
-            region_results[btn] = _vi_eval_region(golden_frame, frame, btn, button_rois[btn])
-        region_results["L"] = _vi_eval_region(golden_frame, frame, "L", area_l_roi)
+        # Reuse run_basic_inspection ROI ownership (intersection-based) results.
+        region_results = {
+            "A": {"verdict": str(decision_trace.get("roi_A", "PASS") or "PASS")},
+            "B": {"verdict": str(decision_trace.get("roi_B", "PASS") or "PASS")},
+            "C": {"verdict": str(decision_trace.get("roi_C", "PASS") or "PASS")},
+            "D": {"verdict": str(decision_trace.get("roi_D", "PASS") or "PASS")},
+            "L": {"verdict": str(decision_trace.get("roi_L", "PASS") or "PASS")},
+        }
 
         overall_pass = all(region_results[k]["verdict"] == "PASS" for k in ["A", "B", "C", "D", "L"])
         overall_verdict = "PASS" if overall_pass else "FAIL"
