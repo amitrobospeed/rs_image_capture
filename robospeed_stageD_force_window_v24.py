@@ -78,10 +78,10 @@ AUTO_FAIL_POLICY_OPTIONS = ("safe_stop", "continue")
 IC_CAPTURE_SETTLE_S = 2.0
 CAPTURE_AVG_MIN_FRAMES = 10
 CAPTURE_AVG_TIMEOUT_S = 2.5
-INSPECTION_DIFF_THRESHOLD = 25
-INSPECTION_MIN_DEFECT_AREA = 25
-INSPECTION_MIN_DEFECT_W = 10
-INSPECTION_MIN_DEFECT_H = 10
+INSPECTION_DIFF_THRESHOLD = 15
+INSPECTION_MIN_DEFECT_AREA = 10
+INSPECTION_MIN_DEFECT_W = 3
+INSPECTION_MIN_DEFECT_H = 3
 INSPECTION_EDGE_IGNORE_PX = 2
 ROI_ANOMALY_MIN_OVERLAP_RATIO = 0.05
 BUTTON_COATING_DEGRADATION_PCT_DEFAULT = 10.0
@@ -258,6 +258,11 @@ class SystemState:
     detect_white_ratio_enabled: bool = False
     coating_degradation_pct: float = BUTTON_COATING_DEGRADATION_PCT_DEFAULT
     baseline_quality_enabled: bool = False
+    insp_diff_threshold: int = INSPECTION_DIFF_THRESHOLD
+    insp_min_defect_area: int = INSPECTION_MIN_DEFECT_AREA
+    insp_min_defect_w: int = INSPECTION_MIN_DEFECT_W
+    insp_min_defect_h: int = INSPECTION_MIN_DEFECT_H
+    insp_roi_overlap_pct: int = int(round(ROI_ANOMALY_MIN_OVERLAP_RATIO * 100.0))
 
 
 def main():
@@ -390,6 +395,15 @@ def main():
     def _cycle_video_path_for_mode(mode, variant="anomaly"):
         st = _video_state(mode)
         return st.get(variant, {}).get("path") or ""
+
+    def _inspection_threshold_text():
+        with state_lock:
+            d = int(clamp(int(state.insp_diff_threshold), 0, 255))
+            a = int(clamp(int(state.insp_min_defect_area), 1, 50))
+            w = int(clamp(int(state.insp_min_defect_w), 1, 50))
+            h = int(clamp(int(state.insp_min_defect_h), 1, 50))
+            r = int(clamp(int(state.insp_roi_overlap_pct), 1, 30))
+        return f"thr>{d}|area>{a}|wh>={w}x{h}|roi>={r}%"
 
     def _set_camera_status(msg):
         nonlocal camera_status
@@ -1263,9 +1277,18 @@ def main():
         g_blur = cv2.GaussianBlur(g_norm, (5, 5), 0)
         c_blur = cv2.GaussianBlur(c_norm, (5, 5), 0)
 
+        with state_lock:
+            contour_enabled = state.detect_contour_enabled
+            white_enabled = state.detect_white_ratio_enabled
+            diff_thr = int(clamp(int(state.insp_diff_threshold), 0, 255))
+            min_area = int(clamp(int(state.insp_min_defect_area), 1, 50))
+            min_w = int(clamp(int(state.insp_min_defect_w), 1, 50))
+            min_h = int(clamp(int(state.insp_min_defect_h), 1, 50))
+            roi_overlap_ratio = float(clamp(float(state.insp_roi_overlap_pct), 1, 30)) / 100.0
+
         diff = cv2.absdiff(g_blur, c_blur)
         score = float(np.mean(diff))
-        _, mask = cv2.threshold(diff, INSPECTION_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+        _, mask = cv2.threshold(diff, diff_thr, 255, cv2.THRESH_BINARY)
 
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
@@ -1280,10 +1303,6 @@ def main():
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        with state_lock:
-            contour_enabled = state.detect_contour_enabled
-            white_enabled = state.detect_white_ratio_enabled
-
         defect_found = False
         defect_rect = None
         defect_rects = []
@@ -1297,10 +1316,10 @@ def main():
         if contour_enabled:
             for contour in contours:
                 area = float(cv2.contourArea(contour))
-                if area <= INSPECTION_MIN_DEFECT_AREA:
+                if area <= min_area:
                     continue
                 rx, ry, rw, rh = cv2.boundingRect(contour)
-                if rw < INSPECTION_MIN_DEFECT_W or rh < INSPECTION_MIN_DEFECT_H:
+                if rw < min_w or rh < min_h:
                     continue
                 if area > max_area:
                     max_area = area
@@ -1389,7 +1408,7 @@ def main():
                         continue
                     inter_area = float(np.count_nonzero(_rm[y0:y1, x0:x1]))
                     overlap_ratio = inter_area / anomaly_area
-                    if overlap_ratio >= ROI_ANOMALY_MIN_OVERLAP_RATIO:
+                    if overlap_ratio >= roi_overlap_ratio:
                         roi_anomaly_counts[_k] += 1
                         roi_contour_boxes[_k].append(box_txt)
 
@@ -1429,8 +1448,8 @@ def main():
         verdict = "FAIL" if defect_found else "PASS"
         decision_logic = (
             f"Enabled detectors -> contour={'ON' if contour_enabled else 'OFF'}, white_px={'ON' if white_enabled else 'OFF'}; "
-            f"contour gate: diff>{INSPECTION_DIFF_THRESHOLD}, area>{INSPECTION_MIN_DEFECT_AREA}, "
-            f"bbox>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}; "
+            f"contour gate: diff>{diff_thr}, area>{min_area}, "
+            f"bbox>={min_w}x{min_h}; "
             f"white gate: white_px_drop>per-button threshold; temporal={'ON' if use_temporal_gate else 'OFF'} ({BUTTON_TEMPORAL_FAILS_REQUIRED}/{BUTTON_TEMPORAL_WINDOW})"
         )
         roi_count_txt = "|".join([f"{k}:{roi_anomaly_counts.get(k, 0)}" for k in ["A", "B", "C", "D", "L"]])
@@ -1562,7 +1581,7 @@ def main():
                 "reason_code": reason_code,
                 "file_path": "",
                 "score": "",
-                "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
+                "threshold": _inspection_threshold_text(),
                 "verdict": "FAIL",
                 "golden_path": golden_path or "",
                 "video_path": cycle_video_path or "",
@@ -1653,7 +1672,7 @@ def main():
             "reason_code": reason_code,
             "file_path": out_path,
             "score": f"{score:.2f}" if score not in ("", None) else "",
-            "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
+            "threshold": _inspection_threshold_text(),
             "verdict": verdict,
             "golden_path": golden_path or "",
             "video_path": cycle_video_path or "",
@@ -1858,6 +1877,15 @@ def main():
     fig.text(x0 + 2 * (manual_btn_w + manual_btn_gap), row4_y + manual_btn_h + 0.002, "VI interval (min)", color="#e2e8f0", fontsize=8)
     fig.text(x0 + 3 * (manual_btn_w + manual_btn_gap), row4_y + manual_btn_h + 0.002, "VI total (min)", color="#e2e8f0", fontsize=8)
 
+    # Row 5: Inspection threshold controls (abbreviated labels)
+    row5_y = row4_y - (manual_btn_h + manual_btn_gap)
+    thr_w = force_box_w
+    tb_diff = TextBox(fig.add_axes([x0 + 0 * (manual_btn_w + manual_btn_gap), row5_y, thr_w, manual_btn_h]), "DIFFT", initial=str(int(state.insp_diff_threshold)))
+    tb_area = TextBox(fig.add_axes([x0 + 1 * (manual_btn_w + manual_btn_gap), row5_y, thr_w, manual_btn_h]), "AREAM", initial=str(int(state.insp_min_defect_area)))
+    tb_bxw = TextBox(fig.add_axes([x0 + 2 * (manual_btn_w + manual_btn_gap), row5_y, thr_w, manual_btn_h]), "BBOXW", initial=str(int(state.insp_min_defect_w)))
+    tb_bxh = TextBox(fig.add_axes([x0 + 3 * (manual_btn_w + manual_btn_gap), row5_y, thr_w, manual_btn_h]), "BBOXH", initial=str(int(state.insp_min_defect_h)))
+    tb_roig = TextBox(fig.add_axes([x0 + 4 * (manual_btn_w + manual_btn_gap), row5_y, thr_w, manual_btn_h]), "ROIGT", initial=str(int(state.insp_roi_overlap_pct)))
+
     # Auto-capture settings/status panel
     px_x = 1.0 / (fig.get_figwidth() * fig.dpi)
     px_y = 1.0 / (fig.get_figheight() * fig.dpi)
@@ -1926,7 +1954,7 @@ def main():
         _tb.label.set_color("white")
         _tb.label.set_horizontalalignment("left")
         _tb.label.set_position((-1.27, 0.5))
-    for _tb in [tb_fmin, tb_fmax, tb_cap_every, tb_cap_retry, tb_vi_interval, tb_vi_total]:
+    for _tb in [tb_fmin, tb_fmax, tb_cap_every, tb_cap_retry, tb_vi_interval, tb_vi_total, tb_diff, tb_area, tb_bxw, tb_bxh, tb_roig]:
         _tb.label.set_color("white")
     tb_fmin.label.set_horizontalalignment("left")
     force_label_x = -1.27 * (tb_w / force_box_w)
@@ -2150,6 +2178,11 @@ def main():
             fmax = _parse_float(tb_fmax.text, state.force_max)
             cap_every = _parse_int(tb_cap_every.text, state.capture_every_x_cycles)
             cap_retry = _parse_int(tb_cap_retry.text, state.auto_capture_retries)
+            t_diff = _parse_int(tb_diff.text, state.insp_diff_threshold)
+            t_area = _parse_int(tb_area.text, state.insp_min_defect_area)
+            t_bxw = _parse_int(tb_bxw.text, state.insp_min_defect_w)
+            t_bxh = _parse_int(tb_bxh.text, state.insp_min_defect_h)
+            t_roig = _parse_int(tb_roig.text, state.insp_roi_overlap_pct)
 
             state.vel = clamp(v, VEL_MIN, VEL_MAX)
             state.acc = clamp(a, ACC_MIN, ACC_MAX)
@@ -2174,6 +2207,11 @@ def main():
             state.auto_capture_enabled = state.capture_every_x_cycles > 0
             state.next_auto_capture_cycle = state.capture_every_x_cycles if state.auto_capture_enabled else 0
             state.auto_capture_retries = clamp(cap_retry, 0, 10)
+            state.insp_diff_threshold = int(clamp(t_diff, 0, 255))
+            state.insp_min_defect_area = int(clamp(t_area, 1, 50))
+            state.insp_min_defect_w = int(clamp(t_bxw, 1, 50))
+            state.insp_min_defect_h = int(clamp(t_bxh, 1, 50))
+            state.insp_roi_overlap_pct = int(clamp(t_roig, 1, 30))
 
 
     def on_start(_evt):
@@ -2348,7 +2386,7 @@ def main():
                 "reason_code": "golden_initialized",
                 "file_path": out_path,
                 "score": "",
-                "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
+                "threshold": _inspection_threshold_text(),
                 "verdict": "GOLDEN",
                 "golden_path": out_path,
                 "video_path": cycle_video_path or "",
@@ -2606,7 +2644,7 @@ def main():
                 "reason_code": "avg_no_camera_frame",
                 "file_path": "",
                 "score": "",
-                "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
+                "threshold": _inspection_threshold_text(),
                 "verdict": "FAIL",
                 "golden_path": golden_path or "",
                 "video_path": cycle_video_path or "",
@@ -2631,7 +2669,7 @@ def main():
                 "reason_code": "save_failed",
                 "file_path": "",
                 "score": "",
-                "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
+                "threshold": _inspection_threshold_text(),
                 "verdict": "FAIL",
                 "golden_path": golden_path or "",
                 "video_path": cycle_video_path or "",
@@ -2654,7 +2692,7 @@ def main():
             "reason_code": "manual_capture",
             "file_path": out_path,
             "score": "",
-            "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
+            "threshold": _inspection_threshold_text(),
             "verdict": "CAPTURED",
             "golden_path": golden_path or "",
             "video_path": cycle_video_path or "",
@@ -2744,8 +2782,8 @@ def main():
         verdict, score, mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num, use_temporal_gate=False, mode=OUTPUT_MODE_MANUAL)
         _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_MANUAL)
         _append_cycle_video_frame(last_capture_frame, disp, cyc_num, mode=OUTPUT_MODE_MANUAL)
-        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", ""), "anomaly_class": decision_trace.get("anomaly_class", ""), "reg_quality": decision_trace.get("reg_quality", ""), "residual_drop_pct": decision_trace.get("residual_drop_pct", ""), "bbox_global": decision_trace.get("bbox_global", ""), "class_confidence": decision_trace.get("class_confidence", ""), "failure_source": decision_trace.get("failure_source", "")}, mode=OUTPUT_MODE_MANUAL)
-        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", ""), "anomaly_class": decision_trace.get("anomaly_class", ""), "reg_quality": decision_trace.get("reg_quality", ""), "residual_drop_pct": decision_trace.get("residual_drop_pct", ""), "bbox_global": decision_trace.get("bbox_global", ""), "class_confidence": decision_trace.get("class_confidence", ""), "failure_source": decision_trace.get("failure_source", "")})
+        _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": _inspection_threshold_text(), "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", ""), "anomaly_class": decision_trace.get("anomaly_class", ""), "reg_quality": decision_trace.get("reg_quality", ""), "residual_drop_pct": decision_trace.get("residual_drop_pct", ""), "bbox_global": decision_trace.get("bbox_global", ""), "class_confidence": decision_trace.get("class_confidence", ""), "failure_source": decision_trace.get("failure_source", "")}, mode=OUTPUT_MODE_MANUAL)
+        inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": _inspection_threshold_text(), "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", ""), "anomaly_class": decision_trace.get("anomaly_class", ""), "reg_quality": decision_trace.get("reg_quality", ""), "residual_drop_pct": decision_trace.get("residual_drop_pct", ""), "bbox_global": decision_trace.get("bbox_global", ""), "class_confidence": decision_trace.get("class_confidence", ""), "failure_source": decision_trace.get("failure_source", "")})
         _record_anomaly_stats(cyc_num, verdict, score)
         with state_lock:
             state.last_capture_result = f"manual/{verdict}"
@@ -2878,6 +2916,10 @@ def main():
         with state_lock:
             contour_enabled = state.detect_contour_enabled
             white_enabled = state.detect_white_ratio_enabled
+            diff_thr = int(clamp(int(state.insp_diff_threshold), 0, 255))
+            min_area = int(clamp(int(state.insp_min_defect_area), 1, 50))
+            min_w = int(clamp(int(state.insp_min_defect_w), 1, 50))
+            min_h = int(clamp(int(state.insp_min_defect_h), 1, 50))
         roi = _sanitize_roi(roi_like, golden_img.shape)
         gx, gy, gw, gh = _roi_bounds(roi, golden_img.shape)
         g_src = golden_img[gy:gy + gh, gx:gx + gw]
@@ -2894,16 +2936,10 @@ def main():
         c_blur = cv2.GaussianBlur(c_norm, (5, 5), 0)
         diff = cv2.absdiff(g_blur, c_blur)
         mean_diff = float(np.mean(diff))
-        _, mask = cv2.threshold(diff, INSPECTION_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+        _, mask = cv2.threshold(diff, diff_thr, 255, cv2.THRESH_BINARY)
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        roi_edge = max(2, int(INSPECTION_EDGE_IGNORE_PX) + 1)
-        if mask.shape[0] > 2 * roi_edge and mask.shape[1] > 2 * roi_edge:
-            mask[:roi_edge, :] = 0
-            mask[-roi_edge:, :] = 0
-            mask[:, :roi_edge] = 0
-            mask[:, -roi_edge:] = 0
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         contour_fail = False
@@ -2913,13 +2949,10 @@ def main():
         if contour_enabled:
             for cnt in contours:
                 area = float(cv2.contourArea(cnt))
-                if area <= INSPECTION_MIN_DEFECT_AREA:
+                if area <= min_area:
                     continue
                 rx, ry, rw, rh = cv2.boundingRect(cnt)
-                if rw < INSPECTION_MIN_DEFECT_W or rh < INSPECTION_MIN_DEFECT_H:
-                    continue
-                edge_guard = max(2, int(INSPECTION_EDGE_IGNORE_PX) + 1)
-                if rx <= edge_guard or ry <= edge_guard or (rx + rw) >= (gw - edge_guard) or (ry + rh) >= (gh - edge_guard):
+                if rw < min_w or rh < min_h:
                     continue
                 if area >= max_area:
                     max_area = area
@@ -3068,7 +3101,7 @@ def main():
             "reason_code": "inspection_scored",
             "file_path": out_path,
             "score": "",
-            "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}",
+            "threshold": _inspection_threshold_text(),
             "verdict": overall_verdict,
             "golden_path": golden_path or "",
             "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_VISUAL),
@@ -3646,6 +3679,41 @@ def main():
         except Exception:
             pass
 
+    def on_diff_submit(text):
+        try:
+            with state_lock:
+                state.insp_diff_threshold = int(clamp(int(float(text)), 0, 255))
+        except Exception:
+            pass
+
+    def on_area_submit(text):
+        try:
+            with state_lock:
+                state.insp_min_defect_area = int(clamp(int(float(text)), 1, 50))
+        except Exception:
+            pass
+
+    def on_bxw_submit(text):
+        try:
+            with state_lock:
+                state.insp_min_defect_w = int(clamp(int(float(text)), 1, 50))
+        except Exception:
+            pass
+
+    def on_bxh_submit(text):
+        try:
+            with state_lock:
+                state.insp_min_defect_h = int(clamp(int(float(text)), 1, 50))
+        except Exception:
+            pass
+
+    def on_roig_submit(text):
+        try:
+            with state_lock:
+                state.insp_roi_overlap_pct = int(clamp(int(float(text)), 1, 30))
+        except Exception:
+            pass
+
     tb_vel.on_submit(on_vel_submit)
     tb_acc.on_submit(on_acc_submit)
     tb_jerk.on_submit(on_jerk_submit)
@@ -3655,6 +3723,11 @@ def main():
     tb_fmax.on_submit(on_fmax_submit)
     tb_cap_every.on_submit(on_cap_every_submit)
     tb_cap_retry.on_submit(on_cap_retry_submit)
+    tb_diff.on_submit(on_diff_submit)
+    tb_area.on_submit(on_area_submit)
+    tb_bxw.on_submit(on_bxw_submit)
+    tb_bxh.on_submit(on_bxh_submit)
+    tb_roig.on_submit(on_roig_submit)
 
     # ---- Force buffers ----
     times = deque()
