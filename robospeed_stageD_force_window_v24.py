@@ -341,11 +341,21 @@ def main():
             "anomaly": os.path.join(_root, "anomaly"),
             "masks": os.path.join(_root, "masks"),
             "videos": os.path.join(_root, "videos"),
+            "videos_raw": os.path.join(_root, "videos", "raw"),
+            "videos_labels": os.path.join(_root, "videos", "labels"),
+            "videos_anomaly": os.path.join(_root, "videos", "anomaly"),
             "reports": os.path.join(_root, "reports"),
             "manifest": os.path.join(_root, "manifest.csv"),
         }
 
-    cycle_video_state = {m: {"path": None, "writer": None, "started": False} for m in OUTPUT_MODES}
+    cycle_video_state = {
+        m: {
+            "raw": {"path": None, "writer": None, "started": False},
+            "labels": {"path": None, "writer": None, "started": False},
+            "anomaly": {"path": None, "writer": None, "started": False},
+        }
+        for m in OUTPUT_MODES
+    }
     cycle_video_path = None
     last_saved_report_path = None
     auto_report_written_cycle = -1
@@ -362,7 +372,7 @@ def main():
     vi_status_text = ""
 
     for _mode in OUTPUT_MODES:
-        for _k in ("root", "golden", "cycle_data", "anomaly", "masks", "videos", "reports"):
+        for _k in ("root", "golden", "cycle_data", "anomaly", "masks", "videos", "videos_raw", "videos_labels", "videos_anomaly", "reports"):
             os.makedirs(mode_dirs[_mode][_k], exist_ok=True)
 
     def _mode_dir(mode, key):
@@ -377,8 +387,9 @@ def main():
     def _video_state(mode):
         return cycle_video_state.get(mode, cycle_video_state[OUTPUT_MODE_DURABILITY])
 
-    def _cycle_video_path_for_mode(mode):
-        return _video_state(mode).get("path") or ""
+    def _cycle_video_path_for_mode(mode, variant="anomaly"):
+        st = _video_state(mode)
+        return st.get(variant, {}).get("path") or ""
 
     def _set_camera_status(msg):
         nonlocal camera_status
@@ -1116,40 +1127,73 @@ def main():
     def _ensure_cycle_video(golden_img, run_id, mode=OUTPUT_MODE_DURABILITY):
         nonlocal cycle_video_path
         st = _video_state(mode)
-        if st["writer"] is not None:
-            cycle_video_path = st.get("path")
+        if st["anomaly"]["writer"] is not None:
+            cycle_video_path = st.get("anomaly", {}).get("path")
             return True
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        st["path"] = os.path.join(_mode_dir(mode, "videos"), f"cycle_inspection_{run_id}_{ts}.mp4")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        st["writer"] = cv2.VideoWriter(st["path"], fourcc, max(1, CAMERA_FPS), (CAMERA_WIDTH, CAMERA_HEIGHT))
-        if not st["writer"].isOpened():
-            st["writer"] = None
-            st["path"] = None
-            return False
+        variant_dirs = {
+            "raw": _mode_dir(mode, "videos_raw"),
+            "labels": _mode_dir(mode, "videos_labels"),
+            "anomaly": _mode_dir(mode, "videos_anomaly"),
+        }
+
+        for variant in ("raw", "labels", "anomaly"):
+            path = os.path.join(variant_dirs[variant], f"cycle_inspection_{run_id}_{ts}.mp4")
+            writer = cv2.VideoWriter(path, fourcc, max(1, CAMERA_FPS), (CAMERA_WIDTH, CAMERA_HEIGHT))
+            if not writer.isOpened():
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+                for _v in ("raw", "labels", "anomaly"):
+                    _w = st[_v].get("writer")
+                    if _w is not None:
+                        try:
+                            _w.release()
+                        except Exception:
+                            pass
+                    st[_v]["writer"] = None
+                    st[_v]["path"] = None
+                    st[_v]["started"] = False
+                return False
+            st[variant]["path"] = path
+            st[variant]["writer"] = writer
+
         golden_tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        intro_src = golden_img.copy()
+        intro_raw = golden_img.copy()
+        intro_labels = _stamp(golden_img.copy(), f"GOLDEN | run={run_id} | {golden_tag}")
+        intro_anomaly_src = golden_img.copy()
         if button_roi_locked and button_rois:
             for _btn, _roi in button_rois.items():
-                _draw_roi(intro_src, _roi, color=(255, 0, 0), label=_btn)
+                _draw_roi(intro_anomaly_src, _roi, color=(255, 0, 0), label=_btn)
         elif roi_locked and locked_roi is not None:
             x, y, w, h = locked_roi
-            cv2.rectangle(intro_src, (x, y), (x + w, y + h), (255, 0, 0), 2)
-        intro = _stamp(intro_src, f"GOLDEN | run={run_id} | {golden_tag}")
-        st["writer"].write(intro)
-        st["started"] = True
-        cycle_video_path = st.get("path")
+            cv2.rectangle(intro_anomaly_src, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        intro_anomaly = _stamp(intro_anomaly_src, f"GOLDEN | run={run_id} | {golden_tag}")
+
+        st["raw"]["writer"].write(intro_raw)
+        st["labels"]["writer"].write(intro_labels)
+        st["anomaly"]["writer"].write(intro_anomaly)
+        for variant in ("raw", "labels", "anomaly"):
+            st[variant]["started"] = True
+        cycle_video_path = st.get("anomaly", {}).get("path")
         return True
 
-    def _append_cycle_video_frame(frame, cycle_num, mode=OUTPUT_MODE_DURABILITY):
+    def _append_cycle_video_frame(raw_frame, anomaly_frame, cycle_num, mode=OUTPUT_MODE_DURABILITY):
         nonlocal cycle_video_path
         st = _video_state(mode)
-        if st["writer"] is None:
+        if st["raw"]["writer"] is None or st["labels"]["writer"] is None or st["anomaly"]["writer"] is None:
             return
         tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        stamped = _stamp(frame, f"CYCLE {cycle_num} | {tag}", color=(0, 255, 0))
-        st["writer"].write(stamped)
-        cycle_video_path = st.get("path")
+        label_text = f"CYCLE {cycle_num} | {tag}"
+        labels_frame = _stamp(raw_frame, label_text, color=(0, 255, 0))
+        anomaly_stamped = _stamp(anomaly_frame, label_text, color=(0, 255, 0))
+        st["raw"]["writer"].write(raw_frame)
+        st["labels"]["writer"].write(labels_frame)
+        st["anomaly"]["writer"].write(anomaly_stamped)
+        cycle_video_path = st.get("anomaly", {}).get("path")
 
     def save_capture_frame(frame, capture_type, run_id, cycle_num=0, mode=OUTPUT_MODE_DURABILITY):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1590,7 +1634,7 @@ def main():
         elif golden_frame is not None:
             verdict, score, _mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, frame, run_id, cycle_num, use_temporal_gate=True, mode=OUTPUT_MODE_DURABILITY)
             _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_DURABILITY)
-            _append_cycle_video_frame(disp, cycle_num, mode=OUTPUT_MODE_DURABILITY)
+            _append_cycle_video_frame(frame, disp, cycle_num, mode=OUTPUT_MODE_DURABILITY)
             msg = "inspection_done"
             reason_code = "inspection_scored"
         else:
@@ -2699,7 +2743,7 @@ def main():
 
         verdict, score, mask_path, anomaly_path, disp, decision_trace = run_basic_inspection(golden_frame, last_capture_frame, run_id, cyc_num, use_temporal_gate=False, mode=OUTPUT_MODE_MANUAL)
         _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_MANUAL)
-        _append_cycle_video_frame(disp, cyc_num, mode=OUTPUT_MODE_MANUAL)
+        _append_cycle_video_frame(last_capture_frame, disp, cyc_num, mode=OUTPUT_MODE_MANUAL)
         _manifest_write({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", ""), "anomaly_class": decision_trace.get("anomaly_class", ""), "reg_quality": decision_trace.get("reg_quality", ""), "residual_drop_pct": decision_trace.get("residual_drop_pct", ""), "bbox_global": decision_trace.get("bbox_global", ""), "class_confidence": decision_trace.get("class_confidence", ""), "failure_source": decision_trace.get("failure_source", "")}, mode=OUTPUT_MODE_MANUAL)
         inspection_records.append({"run_id": run_id, "cycle": cyc_num, "capture_type": "manual", "timestamp": datetime.now().isoformat(timespec="seconds"), "camera_status": camera_status, "result": "OK", "message": "manual_inspection", "reason_code": "inspection_scored", "file_path": last_capture_path or "", "score": f"{score:.2f}", "threshold": f"thr>{INSPECTION_DIFF_THRESHOLD}|area>{INSPECTION_MIN_DEFECT_AREA}|wh>={INSPECTION_MIN_DEFECT_W}x{INSPECTION_MIN_DEFECT_H}", "verdict": verdict, "golden_path": golden_path or "", "video_path": _cycle_video_path_for_mode(OUTPUT_MODE_MANUAL), "anomaly_path": anomaly_path, "policy": state.auto_fail_policy, "decision_logic": decision_trace.get("decision_logic", ""), "failed_metric": decision_trace.get("failed_metric", ""), "max_contour_area": decision_trace.get("max_contour_area", ""), "max_bbox": decision_trace.get("max_bbox", ""), "score_role": decision_trace.get("score_role", ""), "button_drop_pct": decision_trace.get("button_drop_pct", ""), "white_ratio_button": decision_trace.get("white_ratio_button", ""), "white_ratio_change_pct": decision_trace.get("white_ratio_change_pct", ""), "A": decision_trace.get("roi_A", ""), "B": decision_trace.get("roi_B", ""), "C": decision_trace.get("roi_C", ""), "D": decision_trace.get("roi_D", ""), "L": decision_trace.get("roi_L", ""), "overall": decision_trace.get("roi_overall", verdict), "reason": decision_trace.get("roi_reason", ""), "anomaly_class": decision_trace.get("anomaly_class", ""), "reg_quality": decision_trace.get("reg_quality", ""), "residual_drop_pct": decision_trace.get("residual_drop_pct", ""), "bbox_global": decision_trace.get("bbox_global", ""), "class_confidence": decision_trace.get("class_confidence", ""), "failure_source": decision_trace.get("failure_source", "")})
         _record_anomaly_stats(cyc_num, verdict, score)
@@ -2764,20 +2808,24 @@ def main():
 
                 ax_tbl = fig_vi.add_axes([0.05, 0.10, 0.90, 0.74])
                 ax_tbl.axis("off")
-                col_widths = [0.03, 0.11, 0.06, 0.04, 0.04, 0.04, 0.04, 0.04, 0.06, 0.08, 0.06, 0.06, 0.10, 0.05, 0.07, 0.12]
-                table = ax_tbl.table(cellText=cell_rows if cell_rows else [["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "No rows"]],
-                                     colLabels=headers,
+                col_widths = [0.03, 0.16, 0.06, 0.035, 0.035, 0.035, 0.035, 0.035, 0.055, 0.07, 0.05, 0.055, 0.09, 0.045, 0.06, 0.11]
+                header_top = ["Cycle", "Cycle", "Cycle", "ROI", "ROI", "ROI", "ROI", "ROI", "Result", "Diag", "Diag", "Diag", "Diag", "Diag", "Diag", "Diag"]
+                header_bottom = headers
+                table_rows = [header_top, header_bottom] + (cell_rows if cell_rows else [["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "No rows"]])
+                table = ax_tbl.table(cellText=table_rows,
                                      colLoc='center', cellLoc='center',
                                      colWidths=col_widths,
                                      loc='upper left')
                 table.auto_set_font_size(False)
-                table.set_fontsize(8)
-                table.scale(1, 1.25)
+                table.set_fontsize(7.6)
+                table.scale(1, 1.32)
                 for (r, c), cell in table.get_celld().items():
                     cell.set_edgecolor("#475569")
-                    if r == 0:
+                    if r in (0, 1):
                         cell.set_facecolor("#e2e8f0")
-                        cell.set_text_props(weight='bold')
+                        cell.set_text_props(weight='bold', color="#0f172a")
+                    elif r % 2 == 0:
+                        cell.set_facecolor("#f8fafc")
 
                 fig_vi.text(0.06, 0.05, f"Rows stored: {len(rows)}", fontsize=9)
                 pdf.savefig(fig_vi)
@@ -2971,7 +3019,7 @@ def main():
             golden_frame, frame, run_id, cyc_num, use_temporal_gate=False, mode=OUTPUT_MODE_VISUAL
         )
         _ensure_cycle_video(golden_frame, run_id, mode=OUTPUT_MODE_VISUAL)
-        _append_cycle_video_frame(disp, cyc_num, mode=OUTPUT_MODE_VISUAL)
+        _append_cycle_video_frame(frame, disp, cyc_num, mode=OUTPUT_MODE_VISUAL)
 
         # Reuse run_basic_inspection ROI ownership (intersection-based) results.
         region_results = {
@@ -3195,14 +3243,16 @@ def main():
         })
         for _mode in OUTPUT_MODES:
             _st = _video_state(_mode)
-            if _st["writer"] is not None:
-                try:
-                    _st["writer"].release()
-                except Exception:
-                    pass
-            _st["writer"] = None
-            _st["path"] = None
-            _st["started"] = False
+            for _variant in ("raw", "labels", "anomaly"):
+                _vw = _st.get(_variant, {})
+                if _vw.get("writer") is not None:
+                    try:
+                        _vw["writer"].release()
+                    except Exception:
+                        pass
+                _vw["writer"] = None
+                _vw["path"] = None
+                _vw["started"] = False
         cycle_video_path = None
         auto_report_written_cycle = -1
         vi_running = False
@@ -3358,20 +3408,22 @@ def main():
                 table_bottom = table_top - table_height
                 table_ax = anomaly_fig.add_axes([0.05, table_bottom, 0.90, table_height])
                 table_ax.axis("off")
-                col_widths = [0.04, 0.11, 0.06, 0.04, 0.04, 0.04, 0.04, 0.04, 0.06, 0.08, 0.06, 0.06, 0.10, 0.05, 0.07, 0.11]
+                col_widths = [0.04, 0.16, 0.06, 0.035, 0.035, 0.035, 0.035, 0.035, 0.055, 0.07, 0.05, 0.055, 0.09, 0.045, 0.06, 0.11]
+                header_top = ["Cycle", "Cycle", "Cycle", "ROI", "ROI", "ROI", "ROI", "ROI", "Result", "Diag", "Diag", "Diag", "Diag", "Diag", "Diag", "Diag"]
+                header_bottom = table_cols
+                table_rows_with_header = [header_top, header_bottom] + table_rows
                 inspection_table = table_ax.table(
-                    cellText=table_rows,
-                    colLabels=table_cols,
+                    cellText=table_rows_with_header,
                     colWidths=col_widths,
                     cellLoc="center",
                     loc="upper left",
                 )
                 inspection_table.auto_set_font_size(False)
-                inspection_table.set_fontsize(7.2)
-                inspection_table.scale(1, 1.20)
+                inspection_table.set_fontsize(6.9)
+                inspection_table.scale(1, 1.25)
 
                 for (row_idx, col_idx), cell in inspection_table.get_celld().items():
-                    if row_idx == 0:
+                    if row_idx in (0, 1):
                         cell.set_facecolor("#e2e8f0")
                         cell.set_text_props(weight="bold", color="#0f172a")
                     elif row_idx % 2 == 0:
@@ -3939,9 +3991,11 @@ def main():
         try:
             for _mode in OUTPUT_MODES:
                 _st = _video_state(_mode)
-                if _st["writer"] is not None:
-                    _st["writer"].release()
-                    _st["writer"] = None
+                for _variant in ("raw", "labels", "anomaly"):
+                    _vw = _st.get(_variant, {})
+                    if _vw.get("writer") is not None:
+                        _vw["writer"].release()
+                        _vw["writer"] = None
         except Exception:
             pass
         try:
