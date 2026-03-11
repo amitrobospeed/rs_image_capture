@@ -2807,7 +2807,7 @@ def main():
             contour_on = bool(state.detect_contour_enabled)
             white_on = bool(state.detect_white_ratio_enabled)
 
-        headers = ["#", "Timestamp", "Elapsed(min)", "A", "B", "C", "D", "L", "Overall", "Anomaly Class", "RegQ", "ResDrop%", "BBox", "Conf", "Source", "Reason"]
+        headers = ["#", "Timestamp", "(Mins)", "A", "B", "C", "D", "L", "Overall", "Anomaly", "RegQ", "Drop %", "BBox", "Conf", "Source", "Reason"]
         page_size = 26
         chunks = [rows[i:i + page_size] for i in range(0, max(1, len(rows)), page_size)] if rows else [[]]
 
@@ -2847,7 +2847,7 @@ def main():
                 ax_tbl = fig_vi.add_axes([0.05, 0.10, 0.90, 0.74])
                 ax_tbl.axis("off")
                 col_widths = [0.03, 0.16, 0.06, 0.035, 0.035, 0.035, 0.035, 0.035, 0.055, 0.07, 0.05, 0.055, 0.09, 0.045, 0.06, 0.11]
-                header_top = ["Cycle", "Cycle", "Cycle", "ROI", "ROI", "ROI", "ROI", "ROI", "Result", "Diag", "Diag", "Diag", "Diag", "Diag", "Diag", "Diag"]
+                header_top = ["", "Cycle", "", "ROI", "", "", "", "", "Result", "Diagnostics", "", "", "", "", "", ""]
                 header_bottom = headers
                 table_rows = [header_top, header_bottom] + (cell_rows if cell_rows else [["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "No rows"]])
                 table = ax_tbl.table(cellText=table_rows,
@@ -3066,6 +3066,9 @@ def main():
         overall_pass = all(region_results[k]["verdict"] == "PASS" for k in ["A", "B", "C", "D", "L"])
         overall_verdict = "PASS" if overall_pass else "FAIL"
         failed_regions = [k for k in ["A", "B", "C", "D", "L"] if region_results[k]["verdict"] != "PASS"]
+        vi_failure_source = str(decision_trace.get("failure_source", "") or "")
+        if not vi_failure_source:
+            vi_failure_source = "ok" if overall_pass else "roi_contour"
 
         last_capture_frame = frame.copy()
         last_capture_path = out_path
@@ -3087,7 +3090,7 @@ def main():
             "residual_drop_pct": "",
             "bbox_global": "" if overall_pass else ";".join(sorted(set(str(region_results[k].get("bbox_global", "")) for k in failed_regions if region_results[k].get("bbox_global", "")))),
             "class_confidence": "",
-            "failure_source": "ok" if overall_pass else "/".join(sorted(set(str(region_results[k].get("failure_source", "")) for k in failed_regions))),
+            "failure_source": vi_failure_source,
         })
 
         _manifest_write({
@@ -3127,7 +3130,7 @@ def main():
             "residual_drop_pct": "",
             "bbox_global": "" if overall_pass else ";".join(sorted(set(str(region_results[k].get("bbox_global", "")) for k in failed_regions if region_results[k].get("bbox_global", "")))),
             "class_confidence": "",
-            "failure_source": "ok" if overall_pass else "/".join(sorted(set(str(region_results[k].get("failure_source", "")) for k in failed_regions))),
+            "failure_source": vi_failure_source,
         }, mode=OUTPUT_MODE_VISUAL)
 
         try:
@@ -3413,7 +3416,7 @@ def main():
             anomaly_fig.text(0.06, y, stats_txt, fontsize=9)
             y -= 0.06
             if inspection_records:
-                table_cols = ["#", "Timestamp", "Elapsed(min)", "A", "B", "C", "D", "L", "Overall", "Anomaly Class", "RegQ", "ResDrop%", "BBox", "Conf", "Source", "Reason"]
+                table_cols = ["#", "Timestamp", "(Mins)", "A", "B", "C", "D", "L", "Overall", "Anomaly", "RegQ", "Drop %", "BBox", "Conf", "Source", "Reason"]
                 table_rows = []
                 for rec in inspection_records[-20:]:
                     table_rows.append([
@@ -3442,7 +3445,7 @@ def main():
                 table_ax = anomaly_fig.add_axes([0.05, table_bottom, 0.90, table_height])
                 table_ax.axis("off")
                 col_widths = [0.04, 0.16, 0.06, 0.035, 0.035, 0.035, 0.035, 0.035, 0.055, 0.07, 0.05, 0.055, 0.09, 0.045, 0.06, 0.11]
-                header_top = ["Cycle", "Cycle", "Cycle", "ROI", "ROI", "ROI", "ROI", "ROI", "Result", "Diag", "Diag", "Diag", "Diag", "Diag", "Diag", "Diag"]
+                header_top = ["", "Cycle", "", "ROI", "", "", "", "", "Result", "Diagnostics", "", "", "", "", "", ""]
                 header_bottom = table_cols
                 table_rows_with_header = [header_top, header_bottom] + table_rows
                 inspection_table = table_ax.table(
