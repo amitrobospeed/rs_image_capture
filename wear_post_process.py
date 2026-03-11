@@ -156,6 +156,7 @@ def _select_rois(frame: np.ndarray, buttons: List[str]) -> Dict[str, object]:
     current_idx = 0
     roi_targets = list(buttons)
     status_msg = "Draw ROI then Next; when all done click Lock All (or press L)."
+    should_exit = False
 
     help_line = "Keys: N=Next, L=Lock All, Enter=Finalize poly, Backspace=Undo poly, Esc/Q=Cancel"
 
@@ -235,7 +236,7 @@ def _select_rois(frame: np.ndarray, buttons: List[str]) -> Dict[str, object]:
         return True
 
     def _mouse_cb(evt, x, y, _flags, _param):
-        nonlocal shape_mode, start_pt, drag_pt, poly_pts, working_roi, current_idx, status_msg
+        nonlocal shape_mode, start_pt, drag_pt, poly_pts, working_roi, current_idx, status_msg, should_exit
         if evt == cv2.EVENT_LBUTTONDOWN:
             k = _hit_button(x, y)
             if k in ("rect", "circle", "poly"):
@@ -256,7 +257,8 @@ def _select_rois(frame: np.ndarray, buttons: List[str]) -> Dict[str, object]:
                     working_roi = selected.get(_target_btn())
                 return
             if k == "lock":
-                _try_lock_all()
+                if _try_lock_all():
+                    should_exit = True
                 return
             if shape_mode == "poly":
                 poly_pts.append((x, y))
@@ -321,6 +323,8 @@ def _select_rois(frame: np.ndarray, buttons: List[str]) -> Dict[str, object]:
 
         cv2.imshow(win, canvas)
         key = cv2.waitKey(20) & 0xFF
+        if should_exit:
+            break
         if key in (13, 10):
             if shape_mode == "poly":
                 _finalize_working_from_poly()
@@ -363,13 +367,50 @@ def _mean_lab_from_patch(frame: np.ndarray, title: str) -> np.ndarray:
     return patch_lab.reshape(-1, 3).mean(axis=0)
 
 
+def _mean_lab_from_patch_constrained(frame: np.ndarray, local_roi_mask: np.ndarray, title: str) -> np.ndarray:
+    while True:
+        x, y, w, h = cv2.selectROI(title, frame, False, False)
+        cv2.destroyWindow(title)
+        if w <= 0 or h <= 0:
+            raise RuntimeError(f"Patch not selected: {title}")
+        x, y, w, h = int(x), int(y), int(w), int(h)
+        patch = frame[y:y + h, x:x + w]
+        patch_mask = local_roi_mask[y:y + h, x:x + w]
+        if patch.size == 0 or patch_mask.size == 0:
+            print(f"[wear_post_process] Invalid patch bounds for {title}. Please select again.")
+            continue
+
+        valid = patch_mask > 0
+        valid_n = int(np.count_nonzero(valid))
+        total_n = int(valid.size)
+        if valid_n <= 0:
+            print(f"[wear_post_process] Patch must overlap active ROI shape for {title}. Select again.")
+            continue
+
+        overlap_ratio = valid_n / float(max(total_n, 1))
+        if overlap_ratio < 0.5:
+            print(f"[wear_post_process] Patch overlap with active ROI is too low ({overlap_ratio:.2f}). Select again.")
+            continue
+
+        patch_lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB)
+        vals = patch_lab[valid]
+        if vals.size == 0:
+            print(f"[wear_post_process] No valid ROI pixels in patch for {title}. Select again.")
+            continue
+        return vals.reshape(-1, 3).mean(axis=0)
+
+
 def _collect_calibration(frame0: np.ndarray, rois: Dict[str, object]) -> Dict[str, ButtonCalibration]:
     calib: Dict[str, ButtonCalibration] = {}
     for btn, roi in rois.items():
-        _mask, (x, y, w, h) = _roi_mask_from_spec(frame0.shape, roi)
+        full_mask, (x, y, w, h) = _roi_mask_from_spec(frame0.shape, roi)
         crop = frame0[y:y + h, x:x + w]
-        plastic_lab = _mean_lab_from_patch(crop, f"{btn}: Select PLASTIC color patch")
-        print_lab = _mean_lab_from_patch(crop, f"{btn}: Select PRINT color patch")
+        local_mask = (full_mask[y:y + h, x:x + w] > 0).astype(np.uint8) * 255
+
+        print(f"[wear_post_process] {btn}: select PLASTIC patch inside ROI")
+        plastic_lab = _mean_lab_from_patch_constrained(crop, local_mask, f"{btn}: Select PLASTIC color patch")
+        print(f"[wear_post_process] {btn}: select PRINT patch inside ROI")
+        print_lab = _mean_lab_from_patch_constrained(crop, local_mask, f"{btn}: Select PRINT color patch")
         calib[btn] = ButtonCalibration(roi=roi, plastic_lab=plastic_lab, print_lab=print_lab)
     return calib
 
