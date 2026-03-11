@@ -62,8 +62,8 @@ OUTPUT_MODE_DURABILITY = "cycle_durability"
 OUTPUT_MODE_VISUAL = "cycle_visual"
 OUTPUT_MODE_MANUAL = "manual_inspection"
 OUTPUT_MODES = (OUTPUT_MODE_DURABILITY, OUTPUT_MODE_VISUAL, OUTPUT_MODE_MANUAL)
-CAMERA_WIDTH = 1280
-CAMERA_HEIGHT = 720
+CAMERA_WIDTH = 1920
+CAMERA_HEIGHT = 1080
 CAMERA_FPS = 15
 TARGET_LUMA_MEAN = 95
 MAX_SAT_PCT = 3.0
@@ -1155,7 +1155,8 @@ def main():
 
         for variant in ("raw", "labels", "anomaly"):
             path = os.path.join(variant_dirs[variant], f"cycle_inspection_{run_id}_{ts}.mp4")
-            writer = cv2.VideoWriter(path, fourcc, max(1, CAMERA_FPS), (CAMERA_WIDTH, CAMERA_HEIGHT))
+            frame_size = (int(golden_img.shape[1]), int(golden_img.shape[0])) if golden_img is not None else (CAMERA_WIDTH, CAMERA_HEIGHT)
+            writer = cv2.VideoWriter(path, fourcc, max(1, CAMERA_FPS), frame_size)
             if not writer.isOpened():
                 try:
                     writer.release()
