@@ -978,8 +978,11 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             ro = QHBoxLayout(); self.out_edit = QLineEdit(str(initial.out_dir) if str(initial.out_dir) else ''); b2 = QPushButton('Browse'); ro.addWidget(self.out_edit); ro.addWidget(b2); right.addLayout(ro)
             b2.clicked.connect(self._browse_out)
 
-            right.addWidget(QLabel('Buttons (space-separated)'))
-            self.buttons_edit = QLineEdit(' '.join(initial.buttons)); right.addWidget(self.buttons_edit)
+            right.addWidget(QLabel('Number of buttons to test (1-15)'))
+            self.button_count = QSpinBox(); self.button_count.setRange(1, 15); self.button_count.setValue(max(1, min(15, len(initial.buttons) if initial.buttons else 4))); right.addWidget(self.button_count)
+
+            right.addWidget(QLabel('Button labels (comma-separated; e.g. 1,2,3 or A,B,C,D)'))
+            self.buttons_edit = QLineEdit(','.join(initial.buttons)); right.addWidget(self.buttons_edit)
 
             n1 = QHBoxLayout(); n1.addWidget(QLabel('Print tol')); self.print_tol = QDoubleSpinBox(); self.print_tol.setRange(1,255); self.print_tol.setValue(float(initial.print_tol)); n1.addWidget(self.print_tol); n1.addWidget(QLabel('Plastic tol')); self.plastic_tol = QDoubleSpinBox(); self.plastic_tol.setRange(1,255); self.plastic_tol.setValue(float(initial.plastic_tol)); n1.addWidget(self.plastic_tol); right.addLayout(n1)
             n2 = QHBoxLayout(); n2.addWidget(QLabel('Wear % (+/-)')); self.wear_thr = QDoubleSpinBox(); self.wear_thr.setRange(0,100); self.wear_thr.setValue(float(initial.wear_threshold_pct)); n2.addWidget(self.wear_thr); n2.addWidget(QLabel('Max frames')); self.max_frames = QSpinBox(); self.max_frames.setRange(0,10_000_000); self.max_frames.setValue(int(initial.max_frames)); n2.addWidget(self.max_frames); right.addLayout(n2)
@@ -1022,19 +1025,15 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.btn_patch_end.clicked.connect(self._end_patch_selection)
             self.btn_patch_prev.clicked.connect(lambda: self._step_patch(-1))
             self.btn_patch_next.clicked.connect(lambda: self._step_patch(1))
+            self.button_count.valueChanged.connect(lambda _v: self._sync_button_state_ui())
+            self.buttons_edit.editingFinished.connect(self._sync_button_state_ui)
 
             self.swatch_rows = {}
-            for bname in initial.buttons:
-                row = QHBoxLayout()
-                lbl = QLabel(f'{bname}:'); lbl.setFixedWidth(30)
-                s1 = QLabel(); s1.setFixedSize(20,20); s1.setStyleSheet('background:#333;border:1px solid #999;')
-                s2 = QLabel(); s2.setFixedSize(20,20); s2.setStyleSheet('background:#333;border:1px solid #999;')
-                txt = QLabel('plastic/print unset'); txt.setFixedWidth(120)
-                row.addWidget(lbl); row.addWidget(s1); row.addWidget(s2); row.addWidget(txt)
-                right.addLayout(row)
-                self.swatch_rows[bname] = (s1, s2, txt)
+            self.swatch_layout = QVBoxLayout()
+            right.addLayout(self.swatch_layout)
+            self._sync_button_state_ui()
 
-            acts = QHBoxLayout(); cbtn = QPushButton('Cancel'); cbtn.clicked.connect(self._cancel); sbtn = QPushButton('Start Analysis'); sbtn.clicked.connect(self._start_analysis); acts.addWidget(cbtn); acts.addWidget(sbtn); right.addLayout(acts)
+            acts = QHBoxLayout(); sbtn = QPushButton('Start Analysis'); sbtn.clicked.connect(self._start_analysis); rbtn = QPushButton('Reset'); rbtn.clicked.connect(self._reset_all); cbtn = QPushButton('Cancel'); cbtn.clicked.connect(self._cancel); acts.addWidget(sbtn); acts.addWidget(rbtn); acts.addWidget(cbtn); right.addLayout(acts)
             right.addStretch(1)
 
         def _build_post_tab(self):
@@ -1168,10 +1167,8 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
                 self.render_pre()
                 return
             if self.mode in ('rect', 'circle', 'poly') and not self.roi_selection_active:
-                self.status.setText('Start ROI Selection first.')
                 return
             if self.mode in ('patch_plastic', 'patch_print') and not self.patch_selection_active:
-                self.status.setText('Start Patch Selection first.')
                 return
             if self.mode == 'poly':
                 self.poly_pts.append((x, y))
@@ -1360,9 +1357,58 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
 
         # ---------- existing workflow ----------
         def _buttons(self):
-            return [b.strip().upper() for b in self.buttons_edit.text().split() if b.strip()]
+            raw = self.buttons_edit.text().strip()
+            tokens = [t.strip() for t in raw.replace(';', ',').split(',') if t.strip()]
+            labels = [t.upper() for t in tokens]
+            count = int(self.button_count.value())
+            if len(labels) < count:
+                used = set(labels)
+                n = 1
+                while len(labels) < count:
+                    cand = str(n)
+                    if cand not in used:
+                        labels.append(cand)
+                        used.add(cand)
+                    n += 1
+            elif len(labels) > count:
+                labels = labels[:count]
+            if not labels:
+                labels = ['1']
+            return labels
+
+        def _sync_button_state_ui(self):
+            btns = self._buttons()
+            self.buttons_edit.setText(','.join(btns))
+            existing = self.patches if isinstance(self.patches, dict) else {}
+            self.patches = {b: existing.get(b, {'plastic': None, 'print': None}) for b in btns}
+            self.target_idx = int(np.clip(self.target_idx, 0, max(0, len(btns)-1)))
+            # clear and rebuild swatch rows
+            if hasattr(self, 'swatch_layout'):
+                while self.swatch_layout.count():
+                    item = self.swatch_layout.takeAt(0)
+                    w = item.widget()
+                    if w is not None:
+                        w.deleteLater()
+                    lay = item.layout()
+                    if lay is not None:
+                        while lay.count():
+                            wi = lay.takeAt(0).widget()
+                            if wi is not None:
+                                wi.deleteLater()
+                self.swatch_rows = {}
+                for bname in btns:
+                    row = QHBoxLayout()
+                    lbl = QLabel(f'{bname}:'); lbl.setFixedWidth(30)
+                    s1 = QLabel(); s1.setFixedSize(20,20); s1.setStyleSheet('background:#333;border:1px solid #999;')
+                    s2 = QLabel(); s2.setFixedSize(20,20); s2.setStyleSheet('background:#333;border:1px solid #999;')
+                    txt = QLabel('plastic/print unset'); txt.setFixedWidth(120)
+                    row.addWidget(lbl); row.addWidget(s1); row.addWidget(s2); row.addWidget(txt)
+                    self.swatch_layout.addLayout(row)
+                    self.swatch_rows[bname] = (s1, s2, txt)
+                    self._update_swatch(bname)
 
         def _target(self):
+            self._sync_button_state_ui()
             btns = self._buttons()
             if not btns:
                 return 'A'
@@ -1461,8 +1507,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             cap.release()
             if ok and f is not None:
                 self.frame0 = f
-                for b in self._buttons():
-                    self.patches.setdefault(b, {'plastic':None,'print':None})
+                self._sync_button_state_ui()
                 self.render_pre()
 
         def _is_valid(self, roi):
@@ -1498,6 +1543,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             if not self.roi_selection_active:
                 self.status.setText('Start ROI Selection first.')
                 return
+            self._sync_button_state_ui()
             btns = self._buttons()
             if not btns:
                 return
@@ -1582,6 +1628,28 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             s2.setStyleSheet(f'background:{lab_to_css(qv)};border:1px solid #999;')
             txt.setText(f'P:{"set" if pv is not None else "-"} Q:{"set" if qv is not None else "-"}')
 
+
+        def _reset_all(self):
+            self.roi_selection_active = False
+            self.roi_locked = False
+            self.patch_selection_active = False
+            self.patch_sequence = []
+            self.patch_step_idx = 0
+            self.mode = 'rect'
+            self.poly_pts = []
+            self.working = None
+            self.rois = {}
+            self.pre_mouse_down = None
+            self.pre_mouse_drag = None
+            self.pre_distance_pts = []
+            self.pre_last_xy = None
+            self.pre_xy_lbl.setText('XY: -,-   Dist: -')
+            self.patch_step_lbl.setText('Patch step: inactive')
+            self.btn_roi_lock.setText('End/Save ROIs')
+            self.status.setText('Reset complete. Load/select settings and click Start ROI Selection.')
+            self._sync_button_state_ui()
+            self.render_pre()
+
         def _cancel(self):
             if self.post_cap is not None:
                 self.post_cap.release()
@@ -1599,6 +1667,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             if self.frame0 is None:
                 QMessageBox.warning(self, 'No frame', 'Could not read first frame.')
                 return
+            self._sync_button_state_ui()
             btns = self._buttons()
             if not btns:
                 QMessageBox.warning(self, 'Missing buttons', 'Enter at least one button label.')
