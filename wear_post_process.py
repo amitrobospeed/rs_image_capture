@@ -32,21 +32,299 @@ import numpy as np
 
 @dataclass
 class ButtonCalibration:
-    roi: Tuple[int, int, int, int]
+    roi: object
     plastic_lab: np.ndarray
     print_lab: np.ndarray
     baseline_nnz: int = 0
 
 
-def _select_rois(frame: np.ndarray, buttons: List[str]) -> Dict[str, Tuple[int, int, int, int]]:
-    rois: Dict[str, Tuple[int, int, int, int]] = {}
-    for btn in buttons:
-        x, y, w, h = cv2.selectROI(f"Select ROI for {btn} (Enter to accept)", frame, False, False)
-        cv2.destroyWindow(f"Select ROI for {btn} (Enter to accept)")
-        if w <= 0 or h <= 0:
-            raise RuntimeError(f"ROI not selected for button {btn}")
-        rois[btn] = (int(x), int(y), int(w), int(h))
-    return rois
+def _roi_bounds(roi_like, shape):
+    if isinstance(roi_like, dict):
+        rshape = roi_like.get("shape", "rect")
+        if rshape == "rect":
+            return (
+                int(roi_like.get("x", 0)),
+                int(roi_like.get("y", 0)),
+                int(roi_like.get("w", 0)),
+                int(roi_like.get("h", 0)),
+            )
+        if rshape == "circle":
+            cx = int(roi_like.get("cx", 0))
+            cy = int(roi_like.get("cy", 0))
+            r = int(roi_like.get("r", 0))
+            return (cx - r, cy - r, 2 * r, 2 * r)
+        if rshape == "poly":
+            pts = np.array(roi_like.get("points", []), dtype=np.int32)
+            if pts.size == 0:
+                return (0, 0, 1, 1)
+            x, y, w, h = cv2.boundingRect(pts)
+            return (int(x), int(y), int(w), int(h))
+    return tuple(map(int, roi_like))
+
+
+def _sanitize_roi(roi_like, shape):
+    x, y, w, h = _roi_bounds(roi_like, shape)
+    h_img, w_img = shape[:2]
+    x = max(0, min(int(x), max(0, w_img - 1)))
+    y = max(0, min(int(y), max(0, h_img - 1)))
+    w = max(1, min(int(w), w_img - x))
+    h = max(1, min(int(h), h_img - y))
+    if isinstance(roi_like, dict):
+        rshape = roi_like.get("shape", "rect")
+        if rshape == "circle":
+            cx = int(np.clip(int(roi_like.get("cx", x + w // 2)), x, x + w - 1))
+            cy = int(np.clip(int(roi_like.get("cy", y + h // 2)), y, y + h - 1))
+            r_max = max(1, min(cx - x, x + w - 1 - cx, cy - y, y + h - 1 - cy))
+            r = int(max(1, min(int(roi_like.get("r", 1)), r_max)))
+            return {"shape": "circle", "cx": cx, "cy": cy, "r": r}
+        if rshape == "poly":
+            pts = []
+            for px, py in roi_like.get("points", []):
+                pts.append((int(np.clip(int(px), 0, w_img - 1)), int(np.clip(int(py), 0, h_img - 1))))
+            if len(pts) < 3:
+                pts = [(x, y), (x + w - 1, y), (x + w - 1, y + h - 1), (x, y + h - 1)]
+            return {"shape": "poly", "points": pts}
+        return {"shape": "rect", "x": x, "y": y, "w": w, "h": h}
+    return (x, y, w, h)
+
+
+def _draw_roi(frame: np.ndarray, roi_like, color=(255, 0, 0), label: Optional[str] = None):
+    roi = _sanitize_roi(roi_like, frame.shape)
+    if isinstance(roi, dict):
+        if roi.get("shape") == "circle":
+            cv2.circle(frame, (roi["cx"], roi["cy"]), roi["r"], color, 1)
+            lx, ly = roi["cx"] - roi["r"], roi["cy"] - roi["r"]
+        elif roi.get("shape") == "poly":
+            pts = np.array(roi.get("points", []), dtype=np.int32)
+            cv2.polylines(frame, [pts], True, color, 1)
+            lx, ly = int(pts[:, 0].min()), int(pts[:, 1].min())
+        else:
+            x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
+            lx, ly = x, y
+    else:
+        x, y, w, h = roi
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
+        lx, ly = x, y
+    if label:
+        cv2.putText(frame, label, (lx + 2, max(14, ly - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+
+def _roi_mask_from_spec(shape, roi_like):
+    roi = _sanitize_roi(roi_like, shape)
+    mask = np.zeros(shape[:2], dtype=np.uint8)
+    if isinstance(roi, dict):
+        rshape = roi.get("shape", "rect")
+        if rshape == "circle":
+            cv2.circle(mask, (roi["cx"], roi["cy"]), roi["r"], 255, -1)
+            x, y, w, h = _roi_bounds(roi, shape)
+            return mask, (x, y, w, h)
+        if rshape == "poly":
+            pts = np.array(roi.get("points", []), dtype=np.int32)
+            if pts.size > 0:
+                cv2.fillPoly(mask, [pts], 255)
+                x, y, w, h = cv2.boundingRect(pts)
+                return mask, (int(x), int(y), int(w), int(h))
+            return mask, (0, 0, 1, 1)
+        x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
+        cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
+        return mask, (x, y, w, h)
+    x, y, w, h = roi
+    cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
+    return mask, (x, y, w, h)
+
+
+def _select_rois(frame: np.ndarray, buttons: List[str]) -> Dict[str, object]:
+    selected: Dict[str, object] = {}
+    shape_mode = "rect"
+    start_pt = None
+    drag_pt = None
+    poly_pts = []
+    working_roi = None
+    actions = {}
+    current_idx = 0
+    roi_targets = list(buttons)
+    status_msg = "Draw ROI then Next; select all buttons then Lock All"
+
+    def _is_valid_roi(roi):
+        if not roi:
+            return False
+        if isinstance(roi, dict):
+            rshape = roi.get("shape", "rect")
+            if rshape == "rect":
+                return int(roi.get("w", 0)) >= 4 and int(roi.get("h", 0)) >= 4
+            if rshape == "circle":
+                return int(roi.get("r", 0)) >= 3
+            if rshape == "poly":
+                return len(roi.get("points", [])) >= 3
+        return False
+
+    def _target_btn():
+        return roi_targets[current_idx]
+
+    def _draw_buttons(canvas):
+        nonlocal actions
+        actions = {}
+        items = [
+            ("rect", "Rectangle", 140),
+            ("circle", "Circle", 120),
+            ("poly", "Polygon", 130),
+            ("next", "Next Button", 150),
+            ("lock", "Lock All", 120),
+        ]
+        x0, y0 = 20, 50
+        for key, title, w in items:
+            h = 34
+            x1, y1 = x0 + w, y0 + h
+            active = key == shape_mode and key in ("rect", "circle", "poly")
+            fill = (46, 204, 113) if active else ((192, 57, 43) if key == "lock" else (44, 62, 80))
+            cv2.rectangle(canvas, (x0, y0), (x1, y1), fill, -1)
+            cv2.rectangle(canvas, (x0, y0), (x1, y1), (236, 240, 241), 1)
+            cv2.putText(canvas, title, (x0 + 8, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+            actions[key] = (x0, y0, x1, y1)
+            x0 += w + 8
+
+    def _hit_button(x, y):
+        for key, (x0, y0, x1, y1) in actions.items():
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return key
+        return None
+
+    def _finalize_working_from_poly():
+        nonlocal working_roi, status_msg
+        if len(poly_pts) >= 3:
+            working_roi = {"shape": "poly", "points": poly_pts.copy()}
+            status_msg = f"{_target_btn()} polygon ready"
+            return True
+        status_msg = "Polygon needs >=3 points"
+        return False
+
+    def _commit_current_btn():
+        nonlocal status_msg, working_roi
+        btn = _target_btn()
+        if shape_mode == "poly":
+            _finalize_working_from_poly()
+        if not _is_valid_roi(working_roi):
+            status_msg = f"Draw valid ROI for button {btn}"
+            return False
+        selected[btn] = _sanitize_roi(working_roi, frame.shape)
+        status_msg = f"Saved ROI for button {btn}"
+        return True
+
+    def _try_lock_all():
+        nonlocal status_msg
+        if _is_valid_roi(working_roi):
+            _commit_current_btn()
+        missing = [b for b in roi_targets if b not in selected]
+        if missing:
+            status_msg = f"Missing ROI: {','.join(missing)}"
+            return False
+        return True
+
+    def _mouse_cb(evt, x, y, _flags, _param):
+        nonlocal shape_mode, start_pt, drag_pt, poly_pts, working_roi, current_idx, status_msg
+        if evt == cv2.EVENT_LBUTTONDOWN:
+            k = _hit_button(x, y)
+            if k in ("rect", "circle", "poly"):
+                shape_mode = k
+                start_pt = None
+                drag_pt = None
+                working_roi = None
+                if k != "poly":
+                    poly_pts = []
+                status_msg = f"{k.title()} mode for button {_target_btn()}"
+                return
+            if k == "next":
+                if _commit_current_btn():
+                    current_idx = (current_idx + 1) % len(roi_targets)
+                    start_pt = None
+                    drag_pt = None
+                    poly_pts = []
+                    working_roi = selected.get(_target_btn())
+                return
+            if k == "lock":
+                _try_lock_all()
+                return
+            if shape_mode == "poly":
+                poly_pts.append((x, y))
+                working_roi = None
+                status_msg = f"{_target_btn()} polygon points: {len(poly_pts)}"
+                return
+            start_pt = (x, y)
+            drag_pt = (x, y)
+        elif evt == cv2.EVENT_MOUSEMOVE:
+            if start_pt is not None and shape_mode in ("rect", "circle"):
+                drag_pt = (x, y)
+        elif evt == cv2.EVENT_LBUTTONUP:
+            if start_pt is None or drag_pt is None or shape_mode == "poly":
+                return
+            x0, y0 = start_pt
+            x1, y1 = drag_pt
+            if shape_mode == "rect":
+                rx, ry = min(x0, x1), min(y0, y1)
+                rw, rh = abs(x1 - x0), abs(y1 - y0)
+                working_roi = {"shape": "rect", "x": rx, "y": ry, "w": rw, "h": rh}
+            else:
+                cx = int((x0 + x1) / 2)
+                cy = int((y0 + y1) / 2)
+                r = int(max(abs(x1 - x0), abs(y1 - y0)) / 2)
+                working_roi = {"shape": "circle", "cx": cx, "cy": cy, "r": r}
+            start_pt = None
+            drag_pt = None
+            status_msg = f"{_target_btn()} ROI ready"
+
+    win = "Wear ROI Selector"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(win, _mouse_cb)
+
+    while True:
+        canvas = frame.copy()
+        _draw_buttons(canvas)
+        cv2.putText(canvas, f"Target: {_target_btn()} | mode={shape_mode}", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 2)
+        cv2.putText(canvas, status_msg, (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+        for b, r in selected.items():
+            _draw_roi(canvas, r, color=(80, 220, 120), label=b)
+
+        if shape_mode == "poly" and poly_pts:
+            for i, p in enumerate(poly_pts):
+                cv2.circle(canvas, p, 3, (0, 215, 255), -1)
+                if i > 0:
+                    cv2.line(canvas, poly_pts[i - 1], p, (0, 215, 255), 1)
+        elif working_roi is not None:
+            _draw_roi(canvas, working_roi, color=(0, 215, 255), label=f"{_target_btn()}*")
+        elif start_pt is not None and drag_pt is not None and shape_mode in ("rect", "circle"):
+            x0, y0 = start_pt
+            x1, y1 = drag_pt
+            if shape_mode == "rect":
+                cv2.rectangle(canvas, (x0, y0), (x1, y1), (0, 215, 255), 1)
+            else:
+                cx = int((x0 + x1) / 2)
+                cy = int((y0 + y1) / 2)
+                r = int(max(abs(x1 - x0), abs(y1 - y0)) / 2)
+                cv2.circle(canvas, (cx, cy), r, (0, 215, 255), 1)
+
+        cv2.imshow(win, canvas)
+        key = cv2.waitKey(20) & 0xFF
+        if key in (13, 10):
+            if shape_mode == "poly":
+                _finalize_working_from_poly()
+            continue
+        if key == 8:
+            if shape_mode == "poly" and poly_pts:
+                poly_pts.pop()
+                working_roi = None
+                status_msg = f"{_target_btn()} polygon points: {len(poly_pts)}"
+            continue
+        if key in (27, ord("q")):
+            cv2.destroyWindow(win)
+            raise RuntimeError("ROI selection canceled")
+        if key in (ord("l"), ord("L")):
+            if _try_lock_all():
+                break
+
+    cv2.destroyWindow(win)
+    return {b: _sanitize_roi(selected[b], frame.shape) for b in roi_targets}
 
 
 def _mean_lab_from_patch(frame: np.ndarray, title: str) -> np.ndarray:
@@ -61,10 +339,10 @@ def _mean_lab_from_patch(frame: np.ndarray, title: str) -> np.ndarray:
     return patch_lab.reshape(-1, 3).mean(axis=0)
 
 
-def _collect_calibration(frame0: np.ndarray, rois: Dict[str, Tuple[int, int, int, int]]) -> Dict[str, ButtonCalibration]:
+def _collect_calibration(frame0: np.ndarray, rois: Dict[str, object]) -> Dict[str, ButtonCalibration]:
     calib: Dict[str, ButtonCalibration] = {}
     for btn, roi in rois.items():
-        x, y, w, h = roi
+        _mask, (x, y, w, h) = _roi_mask_from_spec(frame0.shape, roi)
         crop = frame0[y:y + h, x:x + w]
         plastic_lab = _mean_lab_from_patch(crop, f"{btn}: Select PLASTIC color patch")
         print_lab = _mean_lab_from_patch(crop, f"{btn}: Select PRINT color patch")
@@ -159,13 +437,14 @@ def run(video_path: Path, out_dir: Path, buttons: List[str], print_tol: float,
 
         for btn in buttons:
             c = calib[btn]
-            x, y, w, h = c.roi
+            roi_mask, (x, y, w, h) = _roi_mask_from_spec(frame.shape, c.roi)
             crop = frame[y:y + h, x:x + w]
-            if crop.size == 0:
+            local_roi = roi_mask[y:y + h, x:x + w] > 0
+            if crop.size == 0 or local_roi.size == 0 or np.count_nonzero(local_roi) == 0:
                 nnz = 0
             else:
                 mask = _compute_print_mask(crop, c.plastic_lab, c.print_lab, print_tol, plastic_tol)
-                nnz = int(np.count_nonzero(mask))
+                nnz = int(np.count_nonzero((mask > 0) & local_roi))
 
             if frame_idx == 0:
                 c.baseline_nnz = max(1, nnz)
@@ -177,7 +456,7 @@ def run(video_path: Path, out_dir: Path, buttons: List[str], print_tol: float,
             rec[f"drop_pct_{btn}"] = round(drop_pct, 4)
             rec[f"wear_{btn}"] = verdict
 
-            cv2.rectangle(overlay, (x, y), (x + w, y + h), (255, 220, 0), 2)
+            _draw_roi(overlay, c.roi, color=(255, 220, 0), label=btn)
             cv2.putText(
                 overlay,
                 f"{btn} nnz={nnz} drop={drop_pct:.1f}% {verdict}",
