@@ -724,7 +724,7 @@ def _default_output_dir(video_path: Path) -> Path:
     return Path("inspection_output") / "post_process" / "print_wear_detect" / f"{video_path.stem}_{ts}"
 
 
-def run(config: WearConfig) -> None:
+def run(config: WearConfig, preselected_rois: Optional[Dict[str, object]] = None, preselected_calib: Optional[Dict[str, ButtonCalibration]] = None) -> Dict[str, str]:
     out_dir = config.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -738,25 +738,25 @@ def run(config: WearConfig) -> None:
         raise RuntimeError("Could not read first frame from video")
 
     print("Select button ROIs on baseline frame...")
-    rois = None
-    calib = None
-    if config.use_qt_interactions:
-        qt_out = _collect_rois_and_calibration_pyqt6(frame0, config.buttons)
-        if qt_out is not None:
-            rois, calib = qt_out
-        else:
-            print("[wear_post_process] PyQt6 ROI/Patch interaction unavailable; using OpenCV selection.")
+    rois = preselected_rois
+    calib = preselected_calib
+    if rois is None or calib is None:
+        if config.use_qt_interactions:
+            qt_out = _collect_rois_and_calibration_pyqt6(frame0, config.buttons)
+            if qt_out is not None:
+                rois, calib = qt_out
 
     if rois is None or calib is None:
         rois = _select_rois(frame0, config.buttons)
         print("Select plastic/print patches for each button ROI...")
         calib = _collect_calibration(frame0, rois)
 
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     fps = cap.get(cv2.CAP_PROP_FPS) or 15.0
     writer = None
     if config.save_overlay:
-        writer = cv2.VideoWriter(str(out_dir / "wear_overlay.mp4"), fourcc, float(max(1.0, fps)),
+        writer = cv2.VideoWriter(str(out_dir / f"wear_overlay_{ts}.mp4"), fourcc, float(max(1.0, fps)),
                                  (frame0.shape[1], frame0.shape[0]))
 
     rows = []
@@ -787,17 +787,19 @@ def run(config: WearConfig) -> None:
             if frame_idx == 0:
                 c.baseline_nnz = max(1, nnz)
 
-            drop_pct = max(0.0, (float(c.baseline_nnz) - float(nnz)) / float(max(c.baseline_nnz, 1)) * 100.0)
-            verdict = "FAIL" if drop_pct >= config.wear_threshold_pct else "PASS"
+            delta_pct = 0.0 if c.baseline_nnz <= 0 else ((float(nnz) - float(c.baseline_nnz)) / float(max(c.baseline_nnz, 1)) * 100.0)
+            abs_delta_pct = abs(delta_pct)
+            verdict = "PASS" if abs_delta_pct <= float(config.wear_threshold_pct) else "FAIL"
 
             rec[f"nnz_{btn}"] = nnz
-            rec[f"drop_pct_{btn}"] = round(drop_pct, 4)
+            rec[f"delta_pct_{btn}"] = round(delta_pct, 4)
+            rec[f"abs_delta_pct_{btn}"] = round(abs_delta_pct, 4)
             rec[f"wear_{btn}"] = verdict
 
             _draw_roi(overlay, c.roi, color=(255, 220, 0), label=btn, thick=2)
             cv2.putText(
                 overlay,
-                f"{btn} nnz={nnz} drop={drop_pct:.1f}% {verdict}",
+                f"{btn} nnz={nnz} Δ={delta_pct:+.1f}% {verdict}",
                 (x + 4, max(16, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -815,10 +817,10 @@ def run(config: WearConfig) -> None:
     if writer is not None:
         writer.release()
 
-    csv_path = out_dir / "wear_metrics.csv"
+    csv_path = out_dir / f"wear_metrics_{ts}.csv"
     fieldnames = ["frame_idx", "time_s"]
     for btn in config.buttons:
-        fieldnames += [f"nnz_{btn}", f"drop_pct_{btn}", f"wear_{btn}"]
+        fieldnames += [f"nnz_{btn}", f"delta_pct_{btn}", f"abs_delta_pct_{btn}", f"wear_{btn}"]
 
     with csv_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -834,165 +836,374 @@ def run(config: WearConfig) -> None:
         "baseline_nnz": {btn: int(calib[btn].baseline_nnz) for btn in config.buttons},
         "frames_processed": frame_idx,
         "csv": str(csv_path),
-        "overlay_video": str(out_dir / "wear_overlay.mp4") if config.save_overlay else "",
+        "overlay_video": str(out_dir / f"wear_overlay_{ts}.mp4") if config.save_overlay else "",
     }
-    (out_dir / "wear_summary.json").write_text(json.dumps(summary, indent=2))
+    summary_path = out_dir / f"wear_summary_{ts}.json"
+    summary_path.write_text(json.dumps(summary, indent=2))
 
     print(f"Done. Processed {frame_idx} frames")
     print(f"CSV: {csv_path}")
-    print(f"Summary: {out_dir / 'wear_summary.json'}")
+    print(f"Summary: {summary_path}")
     if config.save_overlay:
-        print(f"Overlay: {out_dir / 'wear_overlay.mp4'}")
+        print(f"Overlay: {out_dir / f'wear_overlay_{ts}.mp4'}")
+    return {"csv": str(csv_path), "summary": str(summary_path), "overlay": str(out_dir / f"wear_overlay_{ts}.mp4") if config.save_overlay else ""}
 
 
-# ---------------- PyQt6 settings UI ----------------
-def _collect_config_pyqt6(initial: WearConfig) -> Optional[WearConfig]:
+# ---------------- PyQt6 unified app shell ----------------
+def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
     try:
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QImage, QPixmap, QColor
         from PyQt6.QtWidgets import (
-            QApplication,
-            QWidget,
-            QVBoxLayout,
-            QHBoxLayout,
-            QLabel,
-            QLineEdit,
-            QPushButton,
-            QFileDialog,
-            QDoubleSpinBox,
-            QSpinBox,
-            QCheckBox,
-            QMessageBox,
+            QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+            QFileDialog, QDoubleSpinBox, QSpinBox, QCheckBox, QMessageBox, QTabWidget,
+            QFrame
         )
     except Exception:
         return None
 
     app = QApplication.instance() or QApplication(sys.argv)
 
-    class SettingsWindow(QWidget):
+    def bgr_to_pix(bgr: np.ndarray, max_w: int, max_h: int):
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+        pix = QPixmap.fromImage(qimg)
+        if w <= 0 or h <= 0:
+            return pix, 1.0
+        scale = min(max_w / float(w), max_h / float(h), 1.0)
+        out = pix.scaled(int(w * scale), int(h * scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        return out, scale
+
+    class MainWin(QWidget):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("Print Wear Post-Process (PyQt6)")
-            self.result: Optional[WearConfig] = None
+            self.setWindowTitle('Print Wear Post-Process (PyQt6)')
+            self.resize(1460, 920)
+            self.video_path = Path(str(initial.video_path)) if str(initial.video_path) else None
+            self.frame0 = None
+            self.scale = 1.0
+            self.target_idx = 0
+            self.mode = 'rect'
+            self.poly_pts = []
+            self.working = None
+            self.rois = {}
+            self.last_down = None
+            self.last_drag = None
+            self.patches = {b: {'plastic': None, 'print': None} for b in initial.buttons}
+            self.output_paths = {}
 
             root = QVBoxLayout(self)
+            self.tabs = QTabWidget()
+            root.addWidget(self.tabs)
+            self.tab_pre = QWidget(); self.tab_post = QWidget()
+            self.tabs.addTab(self.tab_pre, 'Pre-Process')
+            self.tabs.addTab(self.tab_post, 'Post-Process')
 
-            root.addWidget(QLabel("Video file"))
-            row_video = QHBoxLayout()
-            self.video_edit = QLineEdit(str(initial.video_path) if str(initial.video_path) else "")
-            btn_video = QPushButton("Browse")
-            row_video.addWidget(self.video_edit)
-            row_video.addWidget(btn_video)
-            root.addLayout(row_video)
+            # pre tab
+            pre = QHBoxLayout(self.tab_pre)
+            left = QVBoxLayout()
+            pre.addLayout(left, 3)
+            self.canvas = QLabel('Load a video to begin')
+            self.canvas.setFrameStyle(QFrame.Shape.Box)
+            self.canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.canvas.setMinimumSize(960, 540)
+            self.canvas.mousePressEvent = self._mouse_press
+            self.canvas.mouseMoveEvent = self._mouse_move
+            self.canvas.mouseReleaseEvent = self._mouse_release
+            left.addWidget(self.canvas)
+            self.status = QLabel('Select video, then draw ROI and select patches in this same window.')
+            left.addWidget(self.status)
 
-            root.addWidget(QLabel("Output directory"))
-            row_out = QHBoxLayout()
-            self.out_edit = QLineEdit(str(initial.out_dir) if str(initial.out_dir) else "")
-            btn_out = QPushButton("Browse")
-            row_out.addWidget(self.out_edit)
-            row_out.addWidget(btn_out)
-            root.addLayout(row_out)
+            right = QVBoxLayout(); pre.addLayout(right, 1)
+            right.addWidget(QLabel('Video file'))
+            r = QHBoxLayout(); self.video_edit = QLineEdit(str(self.video_path) if self.video_path else ''); b=QPushButton('Browse'); r.addWidget(self.video_edit); r.addWidget(b); right.addLayout(r)
+            b.clicked.connect(self._browse_video)
 
-            root.addWidget(QLabel("Buttons (space-separated)"))
-            self.buttons_edit = QLineEdit(" ".join(initial.buttons))
-            root.addWidget(self.buttons_edit)
+            right.addWidget(QLabel('Output directory'))
+            r2 = QHBoxLayout(); self.out_edit = QLineEdit(str(initial.out_dir) if str(initial.out_dir) else ''); b2=QPushButton('Browse'); r2.addWidget(self.out_edit); r2.addWidget(b2); right.addLayout(r2)
+            b2.clicked.connect(self._browse_out)
 
-            row_num1 = QHBoxLayout()
-            row_num1.addWidget(QLabel("Print tol"))
-            self.print_tol = QDoubleSpinBox()
-            self.print_tol.setRange(1.0, 255.0)
-            self.print_tol.setValue(float(initial.print_tol))
-            row_num1.addWidget(self.print_tol)
+            right.addWidget(QLabel('Buttons (space-separated)'))
+            self.buttons_edit = QLineEdit(' '.join(initial.buttons)); right.addWidget(self.buttons_edit)
 
-            row_num1.addWidget(QLabel("Plastic tol"))
-            self.plastic_tol = QDoubleSpinBox()
-            self.plastic_tol.setRange(1.0, 255.0)
-            self.plastic_tol.setValue(float(initial.plastic_tol))
-            row_num1.addWidget(self.plastic_tol)
-            root.addLayout(row_num1)
+            n1 = QHBoxLayout(); n1.addWidget(QLabel('Print tol')); self.print_tol=QDoubleSpinBox(); self.print_tol.setRange(1,255); self.print_tol.setValue(float(initial.print_tol)); n1.addWidget(self.print_tol); n1.addWidget(QLabel('Plastic tol')); self.plastic_tol=QDoubleSpinBox(); self.plastic_tol.setRange(1,255); self.plastic_tol.setValue(float(initial.plastic_tol)); n1.addWidget(self.plastic_tol); right.addLayout(n1)
+            n2 = QHBoxLayout(); n2.addWidget(QLabel('Wear % (+/-)')); self.wear_thr=QDoubleSpinBox(); self.wear_thr.setRange(0,100); self.wear_thr.setValue(float(initial.wear_threshold_pct)); n2.addWidget(self.wear_thr); n2.addWidget(QLabel('Max frames')); self.max_frames=QSpinBox(); self.max_frames.setRange(0,10_000_000); self.max_frames.setValue(int(initial.max_frames)); n2.addWidget(self.max_frames); right.addLayout(n2)
+            self.save_overlay = QCheckBox('Save overlay video'); self.save_overlay.setChecked(bool(initial.save_overlay)); right.addWidget(self.save_overlay)
 
-            row_num2 = QHBoxLayout()
-            row_num2.addWidget(QLabel("Wear threshold %"))
-            self.wear_thr = QDoubleSpinBox()
-            self.wear_thr.setRange(0.0, 100.0)
-            self.wear_thr.setValue(float(initial.wear_threshold_pct))
-            row_num2.addWidget(self.wear_thr)
+            m1=QHBoxLayout();
+            for txt,mode in [('Rectangle','rect'),('Circle','circle'),('Polygon','poly')]:
+                btn=QPushButton(txt); btn.clicked.connect(lambda _=False,m=mode:self._set_mode(m)); m1.addWidget(btn)
+            right.addLayout(m1)
+            m2=QHBoxLayout();
+            bn=QPushButton('Finalize Poly'); bn.clicked.connect(self._finalize_poly); m2.addWidget(bn)
+            bx=QPushButton('Next'); bx.clicked.connect(self._next); m2.addWidget(bx)
+            bl=QPushButton('Lock All'); bl.clicked.connect(self._lock_all); m2.addWidget(bl)
+            right.addLayout(m2)
+            m3=QHBoxLayout(); bp=QPushButton('Pick Plastic'); bp.clicked.connect(lambda: self._set_mode('patch_plastic')); m3.addWidget(bp); bq=QPushButton('Pick Print'); bq.clicked.connect(lambda: self._set_mode('patch_print')); m3.addWidget(bq); right.addLayout(m3)
 
-            row_num2.addWidget(QLabel("Max frames (0=all)"))
-            self.max_frames = QSpinBox()
-            self.max_frames.setRange(0, 10_000_000)
-            self.max_frames.setValue(int(initial.max_frames))
-            row_num2.addWidget(self.max_frames)
-            root.addLayout(row_num2)
+            self.swatch_rows = {}
+            for bname in initial.buttons:
+                row = QHBoxLayout()
+                lbl = QLabel(f'{bname}:')
+                lbl.setFixedWidth(30)
+                row.addWidget(lbl)
+                s1 = QLabel(); s1.setFixedSize(20,20); s1.setStyleSheet('background:#333;border:1px solid #999;')
+                s2 = QLabel(); s2.setFixedSize(20,20); s2.setStyleSheet('background:#333;border:1px solid #999;')
+                txt = QLabel('plastic/print unset'); txt.setFixedWidth(120)
+                row.addWidget(s1); row.addWidget(s2); row.addWidget(txt)
+                right.addLayout(row)
+                self.swatch_rows[bname]=(s1,s2,txt)
 
-            self.save_overlay = QCheckBox("Save overlay video")
-            self.save_overlay.setChecked(bool(initial.save_overlay))
-            root.addWidget(self.save_overlay)
+            acts=QHBoxLayout()
+            cbtn=QPushButton('Cancel'); cbtn.clicked.connect(self._cancel)
+            sbtn=QPushButton('Start Analysis'); sbtn.clicked.connect(self._start_analysis); self.start_btn=sbtn
+            acts.addWidget(cbtn); acts.addWidget(sbtn); right.addLayout(acts)
+            right.addStretch(1)
 
-            help_lbl = QLabel("Workflow: pick settings -> Start -> ROI selector -> patch selectors -> processing")
-            root.addWidget(help_lbl)
+            # post tab
+            post = QVBoxLayout(self.tab_post)
+            self.post_info = QLabel('No results yet.')
+            post.addWidget(self.post_info)
+            self.post_preview = QLabel('Overlay preview path will appear here after processing.')
+            self.post_preview.setWordWrap(True)
+            post.addWidget(self.post_preview)
 
-            row_btn = QHBoxLayout()
-            btn_start = QPushButton("Start")
-            btn_cancel = QPushButton("Cancel")
-            row_btn.addWidget(btn_start)
-            row_btn.addWidget(btn_cancel)
-            root.addLayout(row_btn)
+            self._load_first_frame_if_possible()
 
-            def browse_video():
-                path, _ = QFileDialog.getOpenFileName(self, "Select inspection video", "", "Video files (*.mp4 *.avi *.mov *.mkv);;All files (*.*)")
-                if path:
-                    self.video_edit.setText(path)
-                    if not self.out_edit.text().strip():
-                        self.out_edit.setText(str(_default_output_dir(Path(path))))
+        def _buttons(self):
+            return [b.strip().upper() for b in self.buttons_edit.text().split() if b.strip()]
 
-            def browse_out():
-                path = QFileDialog.getExistingDirectory(self, "Select output directory", "")
-                if path:
-                    self.out_edit.setText(path)
+        def _target(self):
+            btns=self._buttons()
+            if not btns:
+                return 'A'
+            self.target_idx = min(self.target_idx, len(btns)-1)
+            return btns[self.target_idx]
 
-            def on_cancel():
-                self.result = None
-                self.close()
+        def _set_mode(self, m):
+            self.mode = m
+            self.status.setText(f'Target {self._target()} | mode={m}')
 
-            def on_start():
-                video_txt = self.video_edit.text().strip()
-                if not video_txt:
-                    QMessageBox.warning(self, "Missing video", "Please select a video file.")
-                    return
-                video_path = Path(video_txt)
-                if not video_path.exists():
-                    QMessageBox.warning(self, "Video not found", f"Video path does not exist:\n{video_path}")
-                    return
+        def _browse_video(self):
+            path, _ = QFileDialog.getOpenFileName(self, 'Select inspection video', '', 'Video files (*.mp4 *.avi *.mov *.mkv);;All files (*.*)')
+            if path:
+                self.video_edit.setText(path)
+                self.video_path = Path(path)
+                if not self.out_edit.text().strip():
+                    self.out_edit.setText(str(_default_output_dir(self.video_path)))
+                self._load_first_frame_if_possible()
 
-                buttons = [b.strip().upper() for b in self.buttons_edit.text().split() if b.strip()]
-                if not buttons:
-                    QMessageBox.warning(self, "Missing buttons", "Enter at least one button label.")
-                    return
+        def _browse_out(self):
+            path = QFileDialog.getExistingDirectory(self, 'Select output directory', '')
+            if path:
+                self.out_edit.setText(path)
 
-                out_txt = self.out_edit.text().strip()
-                out_dir = Path(out_txt) if out_txt else _default_output_dir(video_path)
+        def _load_first_frame_if_possible(self):
+            if not self.video_edit.text().strip():
+                return
+            vp = Path(self.video_edit.text().strip())
+            if not vp.exists():
+                return
+            cap = cv2.VideoCapture(str(vp))
+            ok, f = cap.read()
+            cap.release()
+            if ok and f is not None:
+                self.frame0 = f
+                for b in self._buttons():
+                    self.patches.setdefault(b, {'plastic':None,'print':None})
+                self.render()
 
-                self.result = WearConfig(
-                    video_path=video_path,
-                    out_dir=out_dir,
-                    buttons=buttons,
-                    print_tol=float(self.print_tol.value()),
-                    plastic_tol=float(self.plastic_tol.value()),
-                    wear_threshold_pct=float(self.wear_thr.value()),
-                    max_frames=int(self.max_frames.value()),
-                    save_overlay=bool(self.save_overlay.isChecked()),
-                )
-                self.close()
+        def _to_frame_coords(self, x, y):
+            if self.frame0 is None or self.scale <= 0:
+                return 0, 0
+            px = self.canvas.pixmap()
+            if px is None:
+                return 0,0
+            ox = max(0, (self.canvas.width() - px.width()) // 2)
+            oy = max(0, (self.canvas.height() - px.height()) // 2)
+            x = np.clip(x - ox, 0, px.width()-1)
+            y = np.clip(y - oy, 0, px.height()-1)
+            fx = int(x / self.scale)
+            fy = int(y / self.scale)
+            h,w=self.frame0.shape[:2]
+            return int(np.clip(fx,0,w-1)), int(np.clip(fy,0,h-1))
 
-            btn_video.clicked.connect(browse_video)
-            btn_out.clicked.connect(browse_out)
-            btn_cancel.clicked.connect(on_cancel)
-            btn_start.clicked.connect(on_start)
+        def _mouse_press(self, e):
+            if self.frame0 is None or e.button()!=Qt.MouseButton.LeftButton:
+                return
+            x,y=self._to_frame_coords(int(e.position().x()), int(e.position().y()))
+            self.last_down=(x,y); self.last_drag=(x,y)
+            if self.mode=='poly':
+                self.poly_pts.append((x,y))
+            self.render()
 
-    win = SettingsWindow()
-    win.resize(760, 360)
+        def _mouse_move(self, e):
+            if self.last_down is None or self.frame0 is None:
+                return
+            x,y=self._to_frame_coords(int(e.position().x()), int(e.position().y()))
+            self.last_drag=(x,y); self.render()
+
+        def _mouse_release(self, e):
+            if self.last_down is None or self.frame0 is None:
+                return
+            x,y=self._to_frame_coords(int(e.position().x()), int(e.position().y()))
+            x0,y0=self.last_down
+            if self.mode=='rect':
+                self.working={'shape':'rect','x':min(x0,x),'y':min(y0,y),'w':abs(x-x0),'h':abs(y-y0)}
+            elif self.mode=='circle':
+                self.working={'shape':'circle','cx':int((x0+x)/2),'cy':int((y0+y)/2),'r':int(max(abs(x-x0),abs(y-y0))/2)}
+            elif self.mode in ('patch_plastic','patch_print'):
+                self._pick_patch(x0,y0,x,y)
+            self.last_down=None; self.last_drag=None
+            self.render()
+
+        def _is_valid(self, roi):
+            if not roi: return False
+            s=roi.get('shape')
+            if s=='rect': return roi.get('w',0)>=4 and roi.get('h',0)>=4
+            if s=='circle': return roi.get('r',0)>=3
+            if s=='poly': return len(roi.get('points',[]))>=3
+            return False
+
+        def _finalize_poly(self):
+            if len(self.poly_pts)>=3:
+                self.working={'shape':'poly','points':self.poly_pts.copy()}
+                self.status.setText(f'{self._target()} polygon ready')
+            else:
+                self.status.setText('Polygon needs >=3 points')
+            self.render()
+
+        def _commit(self):
+            if self.mode=='poly': self._finalize_poly()
+            if self.frame0 is None or not self._is_valid(self.working or {}):
+                self.status.setText(f'Draw valid ROI for {self._target()}')
+                return False
+            self.rois[self._target()] = _sanitize_roi(self.working, self.frame0.shape)
+            return True
+
+        def _next(self):
+            btns=self._buttons()
+            if not btns: return
+            if self._commit():
+                self.target_idx=(self.target_idx+1)%len(btns)
+                self.working=self.rois.get(self._target())
+                self.poly_pts=[]
+                self.status.setText(f'Now edit/select ROI for {self._target()}')
+            self.render()
+
+        def _lock_all(self):
+            if self.working and self._is_valid(self.working): self._commit()
+            missing=[b for b in self._buttons() if b not in self.rois]
+            if missing:
+                self.status.setText('Missing ROI: '+','.join(missing)); self.render(); return
+            self.status.setText('ROIs locked. Pick plastic/print patches per button.')
+
+        def _pick_patch(self,x0,y0,x1,y1):
+            if self.frame0 is None: return
+            rx,ry=min(x0,x1),min(y0,y1); rw,rh=abs(x1-x0),abs(y1-y0)
+            if rw<=0 or rh<=0: self.status.setText('Patch invalid size'); return
+            btn=self._target(); roi=self.rois.get(btn)
+            if roi is None: self.status.setText(f'Lock ROI for {btn} first.'); return
+            roi_mask,_=_roi_mask_from_spec(self.frame0.shape, roi)
+            pmask=roi_mask[ry:ry+rh, rx:rx+rw] > 0
+            if pmask.size==0 or int(np.count_nonzero(pmask))<=0:
+                self.status.setText('Patch must overlap active ROI shape.'); return
+            if (np.count_nonzero(pmask)/float(max(pmask.size,1))) < 0.5:
+                self.status.setText('Patch overlap too low (<50%).'); return
+            patch=self.frame0[ry:ry+rh, rx:rx+rw]
+            vals=cv2.cvtColor(patch, cv2.COLOR_BGR2LAB)[pmask]
+            if vals.size==0: self.status.setText('No valid ROI pixels in patch.'); return
+            mean_lab=vals.reshape(-1,3).mean(axis=0)
+            kind='plastic' if self.mode=='patch_plastic' else 'print'
+            self.patches.setdefault(btn, {'plastic':None,'print':None})[kind]=mean_lab
+            self._update_swatch(btn)
+            self.status.setText(f'{btn}: {kind} patch captured.')
+
+        def _update_swatch(self,b):
+            s1,s2,txt=self.swatch_rows[b]
+            pv=self.patches.get(b,{}).get('plastic')
+            qv=self.patches.get(b,{}).get('print')
+            def lab_to_css(v):
+                if v is None: return '#333333'
+                arr=np.array([[v]],dtype=np.uint8)
+                bgr=cv2.cvtColor(arr, cv2.COLOR_LAB2BGR)[0,0]
+                return QColor(int(bgr[2]),int(bgr[1]),int(bgr[0])).name()
+            s1.setStyleSheet(f'background:{lab_to_css(pv)};border:1px solid #999;')
+            s2.setStyleSheet(f'background:{lab_to_css(qv)};border:1px solid #999;')
+            txt.setText(f'P:{"set" if pv is not None else "-"} Q:{"set" if qv is not None else "-"}')
+
+        def _cancel(self):
+            self.close()
+
+        def _render_frame(self):
+            if self.frame0 is None:
+                return None
+            canvas=self.frame0.copy()
+            for b,r in self.rois.items():
+                _draw_roi(canvas,r,color=(80,220,120),label=b,thick=2)
+            if self.mode=='poly' and self.poly_pts:
+                for i,p in enumerate(self.poly_pts):
+                    cv2.circle(canvas,p,5,(0,215,255),-1)
+                    if i>0: cv2.line(canvas,self.poly_pts[i-1],p,(0,215,255),2)
+            elif self.working is not None and self.mode in ('rect','circle','poly'):
+                _draw_roi(canvas,self.working,color=(0,215,255),label=f'{self._target()}*',thick=2)
+            if self.last_down and self.last_drag and self.mode in ('rect','circle','patch_plastic','patch_print'):
+                x0,y0=self.last_down; x1,y1=self.last_drag
+                if self.mode in ('rect','patch_plastic','patch_print'):
+                    cv2.rectangle(canvas,(x0,y0),(x1,y1),(0,215,255),2)
+                else:
+                    cx=int((x0+x1)/2); cy=int((y0+y1)/2); r=int(max(abs(x1-x0),abs(y1-y0))/2)
+                    cv2.circle(canvas,(cx,cy),r,(0,215,255),2)
+            return canvas
+
+        def render(self):
+            img=self._render_frame()
+            if img is None: return
+            pix,sc=bgr_to_pix(img, max(640,self.canvas.width()-8), max(360,self.canvas.height()-8))
+            self.scale=sc
+            self.canvas.setPixmap(pix)
+
+        def _start_analysis(self):
+            video_txt=self.video_edit.text().strip()
+            if not video_txt:
+                QMessageBox.warning(self,'Missing video','Please select a video file.'); return
+            vp=Path(video_txt)
+            if not vp.exists():
+                QMessageBox.warning(self, 'Video not found', f'Video path does not exist:\n{vp}')
+                return
+            if self.frame0 is None:
+                QMessageBox.warning(self,'No frame','Could not read first frame.'); return
+            btns=self._buttons()
+            if not btns:
+                QMessageBox.warning(self,'Missing buttons','Enter at least one button label.'); return
+            missing=[b for b in btns if b not in self.rois]
+            if missing:
+                QMessageBox.warning(self,'Missing ROI','Create ROIs for: '+', '.join(missing)); return
+            for b in btns:
+                pp=self.patches.get(b,{}).get('plastic'); qq=self.patches.get(b,{}).get('print')
+                if pp is None or qq is None:
+                    QMessageBox.warning(self,'Missing patch',f'Select plastic+print patches for {b}.'); return
+
+            out_base = Path(self.out_edit.text().strip()) if self.out_edit.text().strip() else _default_output_dir(vp)
+            ts=datetime.now().strftime('%Y%m%d_%H%M%S')
+            out_dir=out_base / f'run_{ts}'
+            out_dir.mkdir(parents=True, exist_ok=True)
+            cfg=WearConfig(video_path=vp,out_dir=out_dir,buttons=btns,print_tol=float(self.print_tol.value()),plastic_tol=float(self.plastic_tol.value()),wear_threshold_pct=float(self.wear_thr.value()),max_frames=int(self.max_frames.value()),save_overlay=bool(self.save_overlay.isChecked()),use_qt_interactions=True)
+            calib={b: ButtonCalibration(roi=self.rois[b], plastic_lab=self.patches[b]['plastic'], print_lab=self.patches[b]['print']) for b in btns}
+            try:
+                paths = run(cfg, preselected_rois=self.rois, preselected_calib=calib)
+            except Exception as ex:
+                QMessageBox.critical(self,'Processing failed',str(ex)); return
+            self.output_paths=paths
+            self.post_info.setText('Processing complete. Outputs created.')
+            self.post_preview.setText('\n'.join([f'{k}: {v}' for k, v in paths.items()]))
+            self.tabs.setCurrentWidget(self.tab_post)
+
+    win = MainWin()
     win.show()
     app.exec()
-    return win.result
+    return True
 
 
 def _collect_config_cli(args) -> WearConfig:
@@ -1031,7 +1242,7 @@ def main() -> None:
     p.add_argument("--buttons", nargs="+", default=["A", "B", "C", "D"], help="Buttons to process")
     p.add_argument("--print-tol", type=float, default=32.0, help="LAB distance tolerance for print color")
     p.add_argument("--plastic-tol", type=float, default=24.0, help="LAB distance tolerance for plastic color")
-    p.add_argument("--wear-threshold-pct", type=float, default=10.0, help="Fail threshold for nnz drop %")
+    p.add_argument("--wear-threshold-pct", type=float, default=10.0, help="Fail threshold for absolute nnz deviation % from golden")
     p.add_argument("--max-frames", type=int, default=0, help="Limit frames processed (0 = all)")
     p.add_argument("--no-overlay", action="store_true", help="Disable overlay video output")
     p.add_argument("--cli", action="store_true", help="Use CLI config flow instead of PyQt6 settings UI")
@@ -1050,15 +1261,13 @@ def main() -> None:
         use_qt_interactions=not bool(args.opencv_ui),
     )
 
-    config: Optional[WearConfig] = None
     if not args.cli:
-        config = _collect_config_pyqt6(initial)
-        if config is None:
-            print("[wear_post_process] PyQt6 not available or dialog canceled; falling back to CLI.")
+        handled = _run_pyqt6_shell(initial)
+        if handled is True:
+            return
+        print("[wear_post_process] PyQt6 unavailable; falling back to CLI.")
 
-    if config is None:
-        config = _collect_config_cli(args)
-
+    config = _collect_config_cli(args)
     run(config)
 
 
