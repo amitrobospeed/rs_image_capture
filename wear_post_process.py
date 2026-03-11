@@ -21,9 +21,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -84,6 +85,36 @@ def _compute_print_mask(crop_bgr: np.ndarray, plastic_lab: np.ndarray, print_lab
     closer_to_print = d_print < d_plastic
     mask = print_like & (~plastic_like) & closer_to_print
     return (mask.astype(np.uint8) * 255)
+
+
+def _pick_video_path() -> Optional[Path]:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+        path = filedialog.askopenfilename(
+            title="Select inspection video",
+            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")],
+        )
+        root.destroy()
+        if path:
+            return Path(path)
+    except Exception:
+        pass
+
+    try:
+        txt = input("Enter video path: ").strip()
+    except Exception:
+        txt = ""
+    return Path(txt) if txt else None
+
+
+def _default_output_dir(video_path: Path) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Path("inspection_output") / "post_process" / "print_wear_detect" / f"{video_path.stem}_{ts}"
 
 
 def run(video_path: Path, out_dir: Path, buttons: List[str], print_tol: float,
@@ -199,8 +230,8 @@ def run(video_path: Path, out_dir: Path, buttons: List[str], print_tol: float,
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Post-process wear detection on inspection video")
-    p.add_argument("--video", required=True, help="Path to input raw/labeled video")
-    p.add_argument("--out-dir", default="wear_post_output", help="Output folder")
+    p.add_argument("--video", default="", help="Path to input raw/labeled video (optional; prompts if omitted)")
+    p.add_argument("--out-dir", default="", help="Output folder (default: inspection_output/post_process/print_wear_detect/<video>_<timestamp>)")
     p.add_argument("--buttons", nargs="+", default=["A", "B", "C", "D"], help="Buttons to process")
     p.add_argument("--print-tol", type=float, default=32.0, help="LAB distance tolerance for print color")
     p.add_argument("--plastic-tol", type=float, default=24.0, help="LAB distance tolerance for plastic color")
@@ -209,9 +240,17 @@ def main() -> None:
     p.add_argument("--no-overlay", action="store_true", help="Disable overlay video output")
     args = p.parse_args()
 
+    video_path = Path(args.video) if str(args.video).strip() else _pick_video_path()
+    if video_path is None or not str(video_path):
+        raise SystemExit("No video selected")
+    if not video_path.exists():
+        raise SystemExit(f"Video not found: {video_path}")
+
+    out_dir = Path(args.out_dir) if str(args.out_dir).strip() else _default_output_dir(video_path)
+
     run(
-        video_path=Path(args.video),
-        out_dir=Path(args.out_dir),
+        video_path=video_path,
+        out_dir=out_dir,
         buttons=[str(b).strip().upper() for b in args.buttons],
         print_tol=float(args.print_tol),
         plastic_tol=float(args.plastic_tol),
