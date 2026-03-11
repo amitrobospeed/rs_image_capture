@@ -1034,7 +1034,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             right.addLayout(self.swatch_layout)
             self._sync_button_state_ui()
 
-            acts = QHBoxLayout(); sbtn = QPushButton('Start Analysis'); sbtn.clicked.connect(self._start_analysis); rbtn = QPushButton('Reset'); rbtn.clicked.connect(self._reset_all); cbtn = QPushButton('Cancel'); cbtn.clicked.connect(self._cancel); acts.addWidget(sbtn); acts.addWidget(rbtn); acts.addWidget(cbtn); right.addLayout(acts)
+            acts = QHBoxLayout(); sbtn = QPushButton('Start Analysis'); sbtn.clicked.connect(self._start_analysis); rbtn = QPushButton('Reset'); rbtn.clicked.connect(self._reset_all); cbtn = QPushButton('Exit'); cbtn.clicked.connect(self._cancel); acts.addWidget(sbtn); acts.addWidget(rbtn); acts.addWidget(cbtn); right.addLayout(acts)
             right.addStretch(1)
 
         def _build_post_tab(self):
@@ -1648,9 +1648,43 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.pre_xy_lbl.setText('XY: -,-   Dist: -')
             self.patch_step_lbl.setText('Patch step: inactive')
             self.btn_roi_lock.setText('End/Save ROIs')
-            self.status.setText('Reset complete. Load/select settings and click Start ROI Selection.')
+            self.status.setText('Reset complete. Select video/output and click Start ROI Selection.')
+            # clear selected pre-process inputs and image
+            self.video_edit.setText('')
+            self.out_edit.setText('')
+            self.video_path = None
+            self.frame0 = None
+            self.canvas.setPixmap(QPixmap())
+            self.canvas.setText('Load a video to begin')
+
+            # clear patch values and swatches
+            for b in list(self.patches.keys()):
+                self.patches[b] = {'plastic': None, 'print': None}
             self._sync_button_state_ui()
-            self.render_pre()
+
+            # clear post-process artifacts and viewer state
+            if self.post_cap is not None:
+                self.post_cap.release()
+            self.post_cap = None
+            self.post_frame_idx = 0
+            self.post_total_frames = 0
+            self.post_current_frame = None
+            self.post_mouse_down = None
+            self.post_mouse_drag = None
+            self.post_distance_pts = []
+            self.post_last_xy = None
+            self.post_xy_lbl.setText('XY: -,-   Dist: -')
+            self.post_slider.blockSignals(True)
+            self.post_slider.setMinimum(0)
+            self.post_slider.setMaximum(0)
+            self.post_slider.setValue(0)
+            self.post_slider.blockSignals(False)
+            self.post_info.setText('No results yet.')
+            self.post_preview.setText('Overlay preview path will appear here after processing.')
+            self.post_canvas.setPixmap(QPixmap())
+            self.post_canvas.setText('No post-process video loaded')
+            self.output_paths = {}
+            self.tabs.setCurrentWidget(self.tab_pre)
 
         def _cancel(self):
             if self.post_cap is not None:
