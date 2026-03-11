@@ -2,13 +2,10 @@
 """Post-process cycle inspection videos to measure print wear trends.
 
 Workflow
-1) Open input video and read first frame as baseline.
-2) User selects button ROIs (A/B/C/D by default) on baseline frame.
-3) For each button ROI, user samples:
-   - plastic color patch
-   - print color patch
-4) For every frame, compute print mask per button ROI with no specular rejection
-   and no morphological cleanup, then report non-zero pixels and % drop from baseline.
+1) Pick video + settings (PyQt6 form by default, CLI fallback).
+2) Open first frame and select A/B/C/D ROIs using v24-style ROI selector.
+3) Select plastic and print color patches for each button ROI.
+4) Process all frames and report nnz + drop% per button.
 
 Outputs
 - wear_metrics.csv
@@ -21,10 +18,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from datetime import datetime
+import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -38,6 +36,19 @@ class ButtonCalibration:
     baseline_nnz: int = 0
 
 
+@dataclass
+class WearConfig:
+    video_path: Path
+    out_dir: Path
+    buttons: List[str]
+    print_tol: float
+    plastic_tol: float
+    wear_threshold_pct: float
+    max_frames: int
+    save_overlay: bool
+
+
+# ---------------- ROI helpers (v24-style behavior) ----------------
 def _roi_bounds(roi_like, shape):
     if isinstance(roi_like, dict):
         rshape = roi_like.get("shape", "rect")
@@ -88,26 +99,26 @@ def _sanitize_roi(roi_like, shape):
     return (x, y, w, h)
 
 
-def _draw_roi(frame: np.ndarray, roi_like, color=(255, 0, 0), label: Optional[str] = None):
+def _draw_roi(frame: np.ndarray, roi_like, color=(255, 0, 0), label: Optional[str] = None, thick: int = 2):
     roi = _sanitize_roi(roi_like, frame.shape)
     if isinstance(roi, dict):
         if roi.get("shape") == "circle":
-            cv2.circle(frame, (roi["cx"], roi["cy"]), roi["r"], color, 1)
+            cv2.circle(frame, (roi["cx"], roi["cy"]), roi["r"], color, thick)
             lx, ly = roi["cx"] - roi["r"], roi["cy"] - roi["r"]
         elif roi.get("shape") == "poly":
             pts = np.array(roi.get("points", []), dtype=np.int32)
-            cv2.polylines(frame, [pts], True, color, 1)
+            cv2.polylines(frame, [pts], True, color, thick)
             lx, ly = int(pts[:, 0].min()), int(pts[:, 1].min())
         else:
             x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
-            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, thick)
             lx, ly = x, y
     else:
         x, y, w, h = roi
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, thick)
         lx, ly = x, y
     if label:
-        cv2.putText(frame, label, (lx + 2, max(14, ly - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.putText(frame, label, (lx + 2, max(18, ly - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
 
 def _roi_mask_from_spec(shape, roi_like):
@@ -144,7 +155,9 @@ def _select_rois(frame: np.ndarray, buttons: List[str]) -> Dict[str, object]:
     actions = {}
     current_idx = 0
     roi_targets = list(buttons)
-    status_msg = "Draw ROI then Next; select all buttons then Lock All"
+    status_msg = "Draw ROI then Next; when all done click Lock All (or press L)."
+
+    help_line = "Keys: N=Next, L=Lock All, Enter=Finalize poly, Backspace=Undo poly, Esc/Q=Cancel"
 
     def _is_valid_roi(roi):
         if not roi:
@@ -166,23 +179,23 @@ def _select_rois(frame: np.ndarray, buttons: List[str]) -> Dict[str, object]:
         nonlocal actions
         actions = {}
         items = [
-            ("rect", "Rectangle", 140),
-            ("circle", "Circle", 120),
-            ("poly", "Polygon", 130),
-            ("next", "Next Button", 150),
-            ("lock", "Lock All", 120),
+            ("rect", "Rectangle", 160),
+            ("circle", "Circle", 140),
+            ("poly", "Polygon", 150),
+            ("next", "Next Button", 180),
+            ("lock", "Lock All", 140),
         ]
-        x0, y0 = 20, 50
+        x0, y0 = 20, 40
         for key, title, w in items:
-            h = 34
+            h = 42
             x1, y1 = x0 + w, y0 + h
             active = key == shape_mode and key in ("rect", "circle", "poly")
             fill = (46, 204, 113) if active else ((192, 57, 43) if key == "lock" else (44, 62, 80))
             cv2.rectangle(canvas, (x0, y0), (x1, y1), fill, -1)
-            cv2.rectangle(canvas, (x0, y0), (x1, y1), (236, 240, 241), 1)
-            cv2.putText(canvas, title, (x0 + 8, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+            cv2.rectangle(canvas, (x0, y0), (x1, y1), (236, 240, 241), 2)
+            cv2.putText(canvas, title, (x0 + 10, y0 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
             actions[key] = (x0, y0, x1, y1)
-            x0 += w + 8
+            x0 += w + 10
 
     def _hit_button(x, y):
         for key, (x0, y0, x1, y1) in actions.items():
@@ -280,29 +293,31 @@ def _select_rois(frame: np.ndarray, buttons: List[str]) -> Dict[str, object]:
     while True:
         canvas = frame.copy()
         _draw_buttons(canvas)
-        cv2.putText(canvas, f"Target: {_target_btn()} | mode={shape_mode}", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 2)
-        cv2.putText(canvas, status_msg, (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        cv2.rectangle(canvas, (16, 94), (canvas.shape[1] - 16, 170), (20, 20, 20), -1)
+        cv2.putText(canvas, f"Target: {_target_btn()} | mode={shape_mode}", (24, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.84, (240, 240, 240), 2)
+        cv2.putText(canvas, status_msg, (24, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (220, 220, 220), 2)
+        cv2.putText(canvas, help_line, (24, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (180, 220, 255), 1)
 
         for b, r in selected.items():
-            _draw_roi(canvas, r, color=(80, 220, 120), label=b)
+            _draw_roi(canvas, r, color=(80, 220, 120), label=b, thick=2)
 
         if shape_mode == "poly" and poly_pts:
             for i, p in enumerate(poly_pts):
-                cv2.circle(canvas, p, 3, (0, 215, 255), -1)
+                cv2.circle(canvas, p, 5, (0, 215, 255), -1)
                 if i > 0:
-                    cv2.line(canvas, poly_pts[i - 1], p, (0, 215, 255), 1)
+                    cv2.line(canvas, poly_pts[i - 1], p, (0, 215, 255), 2)
         elif working_roi is not None:
-            _draw_roi(canvas, working_roi, color=(0, 215, 255), label=f"{_target_btn()}*")
+            _draw_roi(canvas, working_roi, color=(0, 215, 255), label=f"{_target_btn()}*", thick=2)
         elif start_pt is not None and drag_pt is not None and shape_mode in ("rect", "circle"):
             x0, y0 = start_pt
             x1, y1 = drag_pt
             if shape_mode == "rect":
-                cv2.rectangle(canvas, (x0, y0), (x1, y1), (0, 215, 255), 1)
+                cv2.rectangle(canvas, (x0, y0), (x1, y1), (0, 215, 255), 2)
             else:
                 cx = int((x0 + x1) / 2)
                 cy = int((y0 + y1) / 2)
                 r = int(max(abs(x1 - x0), abs(y1 - y0)) / 2)
-                cv2.circle(canvas, (cx, cy), r, (0, 215, 255), 1)
+                cv2.circle(canvas, (cx, cy), r, (0, 215, 255), 2)
 
         cv2.imshow(win, canvas)
         key = cv2.waitKey(20) & 0xFF
@@ -316,7 +331,15 @@ def _select_rois(frame: np.ndarray, buttons: List[str]) -> Dict[str, object]:
                 working_roi = None
                 status_msg = f"{_target_btn()} polygon points: {len(poly_pts)}"
             continue
-        if key in (27, ord("q")):
+        if key in (ord("n"), ord("N")):
+            if _commit_current_btn():
+                current_idx = (current_idx + 1) % len(roi_targets)
+                start_pt = None
+                drag_pt = None
+                poly_pts = []
+                working_roi = selected.get(_target_btn())
+            continue
+        if key in (27, ord("q"), ord("Q")):
             cv2.destroyWindow(win)
             raise RuntimeError("ROI selection canceled")
         if key in (ord("l"), ord("L")):
@@ -327,6 +350,7 @@ def _select_rois(frame: np.ndarray, buttons: List[str]) -> Dict[str, object]:
     return {b: _sanitize_roi(selected[b], frame.shape) for b in roi_targets}
 
 
+# ---------------- Calibration and wear computation ----------------
 def _mean_lab_from_patch(frame: np.ndarray, title: str) -> np.ndarray:
     x, y, w, h = cv2.selectROI(title, frame, False, False)
     cv2.destroyWindow(title)
@@ -356,8 +380,7 @@ def _compute_print_mask(crop_bgr: np.ndarray, plastic_lab: np.ndarray, print_lab
     d_print = np.linalg.norm(lab - print_lab.reshape(1, 1, 3).astype(np.float32), axis=2)
     d_plastic = np.linalg.norm(lab - plastic_lab.reshape(1, 1, 3).astype(np.float32), axis=2)
 
-    # Wear mask logic: print-like pixels are 1, plastic-like are 0.
-    # No specular rejection and no morphology cleanup by design.
+    # Wear logic constraints: no specular rejection, no morphology cleanup.
     print_like = d_print <= float(print_tol)
     plastic_like = d_plastic <= float(plastic_tol)
     closer_to_print = d_print < d_plastic
@@ -365,44 +388,18 @@ def _compute_print_mask(crop_bgr: np.ndarray, plastic_lab: np.ndarray, print_lab
     return (mask.astype(np.uint8) * 255)
 
 
-def _pick_video_path() -> Optional[Path]:
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.update()
-        path = filedialog.askopenfilename(
-            title="Select inspection video",
-            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")],
-        )
-        root.destroy()
-        if path:
-            return Path(path)
-    except Exception:
-        pass
-
-    try:
-        txt = input("Enter video path: ").strip()
-    except Exception:
-        txt = ""
-    return Path(txt) if txt else None
-
-
 def _default_output_dir(video_path: Path) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     return Path("inspection_output") / "post_process" / "print_wear_detect" / f"{video_path.stem}_{ts}"
 
 
-def run(video_path: Path, out_dir: Path, buttons: List[str], print_tol: float,
-        plastic_tol: float, wear_threshold_pct: float, max_frames: int,
-        save_overlay: bool) -> None:
+def run(config: WearConfig) -> None:
+    out_dir = config.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cap = cv2.VideoCapture(str(video_path))
+    cap = cv2.VideoCapture(str(config.video_path))
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
+        raise RuntimeError(f"Could not open video: {config.video_path}")
 
     ok, frame0 = cap.read()
     if not ok or frame0 is None:
@@ -410,14 +407,14 @@ def run(video_path: Path, out_dir: Path, buttons: List[str], print_tol: float,
         raise RuntimeError("Could not read first frame from video")
 
     print("Select button ROIs on baseline frame...")
-    rois = _select_rois(frame0, buttons)
+    rois = _select_rois(frame0, config.buttons)
     print("Select plastic/print patches for each button ROI...")
     calib = _collect_calibration(frame0, rois)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     fps = cap.get(cv2.CAP_PROP_FPS) or 15.0
     writer = None
-    if save_overlay:
+    if config.save_overlay:
         writer = cv2.VideoWriter(str(out_dir / "wear_overlay.mp4"), fourcc, float(max(1.0, fps)),
                                  (frame0.shape[1], frame0.shape[0]))
 
@@ -429,13 +426,13 @@ def run(video_path: Path, out_dir: Path, buttons: List[str], print_tol: float,
         ok, frame = cap.read()
         if not ok or frame is None:
             break
-        if max_frames > 0 and frame_idx >= max_frames:
+        if config.max_frames > 0 and frame_idx >= config.max_frames:
             break
 
         rec = {"frame_idx": frame_idx, "time_s": frame_idx / float(max(fps, 1e-6))}
         overlay = frame.copy()
 
-        for btn in buttons:
+        for btn in config.buttons:
             c = calib[btn]
             roi_mask, (x, y, w, h) = _roi_mask_from_spec(frame.shape, c.roi)
             crop = frame[y:y + h, x:x + w]
@@ -443,28 +440,28 @@ def run(video_path: Path, out_dir: Path, buttons: List[str], print_tol: float,
             if crop.size == 0 or local_roi.size == 0 or np.count_nonzero(local_roi) == 0:
                 nnz = 0
             else:
-                mask = _compute_print_mask(crop, c.plastic_lab, c.print_lab, print_tol, plastic_tol)
+                mask = _compute_print_mask(crop, c.plastic_lab, c.print_lab, config.print_tol, config.plastic_tol)
                 nnz = int(np.count_nonzero((mask > 0) & local_roi))
 
             if frame_idx == 0:
                 c.baseline_nnz = max(1, nnz)
 
             drop_pct = max(0.0, (float(c.baseline_nnz) - float(nnz)) / float(max(c.baseline_nnz, 1)) * 100.0)
-            verdict = "FAIL" if drop_pct >= wear_threshold_pct else "PASS"
+            verdict = "FAIL" if drop_pct >= config.wear_threshold_pct else "PASS"
 
             rec[f"nnz_{btn}"] = nnz
             rec[f"drop_pct_{btn}"] = round(drop_pct, 4)
             rec[f"wear_{btn}"] = verdict
 
-            _draw_roi(overlay, c.roi, color=(255, 220, 0), label=btn)
+            _draw_roi(overlay, c.roi, color=(255, 220, 0), label=btn, thick=2)
             cv2.putText(
                 overlay,
                 f"{btn} nnz={nnz} drop={drop_pct:.1f}% {verdict}",
                 (x + 4, max(16, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                0.65,
                 (0, 255, 255) if verdict == "PASS" else (0, 0, 255),
-                1,
+                2,
             )
 
         rows.append(rec)
@@ -479,7 +476,7 @@ def run(video_path: Path, out_dir: Path, buttons: List[str], print_tol: float,
 
     csv_path = out_dir / "wear_metrics.csv"
     fieldnames = ["frame_idx", "time_s"]
-    for btn in buttons:
+    for btn in config.buttons:
         fieldnames += [f"nnz_{btn}", f"drop_pct_{btn}", f"wear_{btn}"]
 
     with csv_path.open("w", newline="") as f:
@@ -488,28 +485,206 @@ def run(video_path: Path, out_dir: Path, buttons: List[str], print_tol: float,
         w.writerows(rows)
 
     summary = {
-        "video": str(video_path),
-        "buttons": buttons,
-        "print_tol": print_tol,
-        "plastic_tol": plastic_tol,
-        "wear_threshold_pct": wear_threshold_pct,
-        "baseline_nnz": {btn: int(calib[btn].baseline_nnz) for btn in buttons},
+        "video": str(config.video_path),
+        "buttons": config.buttons,
+        "print_tol": config.print_tol,
+        "plastic_tol": config.plastic_tol,
+        "wear_threshold_pct": config.wear_threshold_pct,
+        "baseline_nnz": {btn: int(calib[btn].baseline_nnz) for btn in config.buttons},
         "frames_processed": frame_idx,
         "csv": str(csv_path),
-        "overlay_video": str(out_dir / "wear_overlay.mp4") if save_overlay else "",
+        "overlay_video": str(out_dir / "wear_overlay.mp4") if config.save_overlay else "",
     }
     (out_dir / "wear_summary.json").write_text(json.dumps(summary, indent=2))
 
     print(f"Done. Processed {frame_idx} frames")
     print(f"CSV: {csv_path}")
     print(f"Summary: {out_dir / 'wear_summary.json'}")
-    if save_overlay:
+    if config.save_overlay:
         print(f"Overlay: {out_dir / 'wear_overlay.mp4'}")
+
+
+# ---------------- PyQt6 settings UI ----------------
+def _collect_config_pyqt6(initial: WearConfig) -> Optional[WearConfig]:
+    try:
+        from PyQt6.QtWidgets import (
+            QApplication,
+            QWidget,
+            QVBoxLayout,
+            QHBoxLayout,
+            QLabel,
+            QLineEdit,
+            QPushButton,
+            QFileDialog,
+            QDoubleSpinBox,
+            QSpinBox,
+            QCheckBox,
+            QMessageBox,
+        )
+    except Exception:
+        return None
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    class SettingsWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Print Wear Post-Process (PyQt6)")
+            self.result: Optional[WearConfig] = None
+
+            root = QVBoxLayout(self)
+
+            root.addWidget(QLabel("Video file"))
+            row_video = QHBoxLayout()
+            self.video_edit = QLineEdit(str(initial.video_path) if str(initial.video_path) else "")
+            btn_video = QPushButton("Browse")
+            row_video.addWidget(self.video_edit)
+            row_video.addWidget(btn_video)
+            root.addLayout(row_video)
+
+            root.addWidget(QLabel("Output directory"))
+            row_out = QHBoxLayout()
+            self.out_edit = QLineEdit(str(initial.out_dir) if str(initial.out_dir) else "")
+            btn_out = QPushButton("Browse")
+            row_out.addWidget(self.out_edit)
+            row_out.addWidget(btn_out)
+            root.addLayout(row_out)
+
+            root.addWidget(QLabel("Buttons (space-separated)"))
+            self.buttons_edit = QLineEdit(" ".join(initial.buttons))
+            root.addWidget(self.buttons_edit)
+
+            row_num1 = QHBoxLayout()
+            row_num1.addWidget(QLabel("Print tol"))
+            self.print_tol = QDoubleSpinBox()
+            self.print_tol.setRange(1.0, 255.0)
+            self.print_tol.setValue(float(initial.print_tol))
+            row_num1.addWidget(self.print_tol)
+
+            row_num1.addWidget(QLabel("Plastic tol"))
+            self.plastic_tol = QDoubleSpinBox()
+            self.plastic_tol.setRange(1.0, 255.0)
+            self.plastic_tol.setValue(float(initial.plastic_tol))
+            row_num1.addWidget(self.plastic_tol)
+            root.addLayout(row_num1)
+
+            row_num2 = QHBoxLayout()
+            row_num2.addWidget(QLabel("Wear threshold %"))
+            self.wear_thr = QDoubleSpinBox()
+            self.wear_thr.setRange(0.0, 100.0)
+            self.wear_thr.setValue(float(initial.wear_threshold_pct))
+            row_num2.addWidget(self.wear_thr)
+
+            row_num2.addWidget(QLabel("Max frames (0=all)"))
+            self.max_frames = QSpinBox()
+            self.max_frames.setRange(0, 10_000_000)
+            self.max_frames.setValue(int(initial.max_frames))
+            row_num2.addWidget(self.max_frames)
+            root.addLayout(row_num2)
+
+            self.save_overlay = QCheckBox("Save overlay video")
+            self.save_overlay.setChecked(bool(initial.save_overlay))
+            root.addWidget(self.save_overlay)
+
+            help_lbl = QLabel("Workflow: pick settings -> Start -> ROI selector -> patch selectors -> processing")
+            root.addWidget(help_lbl)
+
+            row_btn = QHBoxLayout()
+            btn_start = QPushButton("Start")
+            btn_cancel = QPushButton("Cancel")
+            row_btn.addWidget(btn_start)
+            row_btn.addWidget(btn_cancel)
+            root.addLayout(row_btn)
+
+            def browse_video():
+                path, _ = QFileDialog.getOpenFileName(self, "Select inspection video", "", "Video files (*.mp4 *.avi *.mov *.mkv);;All files (*.*)")
+                if path:
+                    self.video_edit.setText(path)
+                    if not self.out_edit.text().strip():
+                        self.out_edit.setText(str(_default_output_dir(Path(path))))
+
+            def browse_out():
+                path = QFileDialog.getExistingDirectory(self, "Select output directory", "")
+                if path:
+                    self.out_edit.setText(path)
+
+            def on_cancel():
+                self.result = None
+                self.close()
+
+            def on_start():
+                video_txt = self.video_edit.text().strip()
+                if not video_txt:
+                    QMessageBox.warning(self, "Missing video", "Please select a video file.")
+                    return
+                video_path = Path(video_txt)
+                if not video_path.exists():
+                    QMessageBox.warning(self, "Video not found", f"Video path does not exist:\n{video_path}")
+                    return
+
+                buttons = [b.strip().upper() for b in self.buttons_edit.text().split() if b.strip()]
+                if not buttons:
+                    QMessageBox.warning(self, "Missing buttons", "Enter at least one button label.")
+                    return
+
+                out_txt = self.out_edit.text().strip()
+                out_dir = Path(out_txt) if out_txt else _default_output_dir(video_path)
+
+                self.result = WearConfig(
+                    video_path=video_path,
+                    out_dir=out_dir,
+                    buttons=buttons,
+                    print_tol=float(self.print_tol.value()),
+                    plastic_tol=float(self.plastic_tol.value()),
+                    wear_threshold_pct=float(self.wear_thr.value()),
+                    max_frames=int(self.max_frames.value()),
+                    save_overlay=bool(self.save_overlay.isChecked()),
+                )
+                self.close()
+
+            btn_video.clicked.connect(browse_video)
+            btn_out.clicked.connect(browse_out)
+            btn_cancel.clicked.connect(on_cancel)
+            btn_start.clicked.connect(on_start)
+
+    win = SettingsWindow()
+    win.resize(760, 360)
+    win.show()
+    app.exec()
+    return win.result
+
+
+def _collect_config_cli(args) -> WearConfig:
+    video_txt = str(args.video).strip()
+    if not video_txt:
+        video_txt = input("Enter video path: ").strip()
+    if not video_txt:
+        raise SystemExit("No video selected")
+
+    video_path = Path(video_txt)
+    if not video_path.exists():
+        raise SystemExit(f"Video not found: {video_path}")
+
+    out_dir = Path(args.out_dir) if str(args.out_dir).strip() else _default_output_dir(video_path)
+    buttons = [str(b).strip().upper() for b in args.buttons if str(b).strip()]
+    if not buttons:
+        raise SystemExit("No buttons configured")
+
+    return WearConfig(
+        video_path=video_path,
+        out_dir=out_dir,
+        buttons=buttons,
+        print_tol=float(args.print_tol),
+        plastic_tol=float(args.plastic_tol),
+        wear_threshold_pct=float(args.wear_threshold_pct),
+        max_frames=int(args.max_frames),
+        save_overlay=not bool(args.no_overlay),
+    )
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Post-process wear detection on inspection video")
-    p.add_argument("--video", default="", help="Path to input raw/labeled video (optional; prompts if omitted)")
+    p.add_argument("--video", default="", help="Path to input raw/labeled video")
     p.add_argument("--out-dir", default="", help="Output folder (default: inspection_output/post_process/print_wear_detect/<video>_<timestamp>)")
     p.add_argument("--buttons", nargs="+", default=["A", "B", "C", "D"], help="Buttons to process")
     p.add_argument("--print-tol", type=float, default=32.0, help="LAB distance tolerance for print color")
@@ -517,26 +692,30 @@ def main() -> None:
     p.add_argument("--wear-threshold-pct", type=float, default=10.0, help="Fail threshold for nnz drop %")
     p.add_argument("--max-frames", type=int, default=0, help="Limit frames processed (0 = all)")
     p.add_argument("--no-overlay", action="store_true", help="Disable overlay video output")
+    p.add_argument("--cli", action="store_true", help="Use CLI config flow instead of PyQt6 settings UI")
     args = p.parse_args()
 
-    video_path = Path(args.video) if str(args.video).strip() else _pick_video_path()
-    if video_path is None or not str(video_path):
-        raise SystemExit("No video selected")
-    if not video_path.exists():
-        raise SystemExit(f"Video not found: {video_path}")
-
-    out_dir = Path(args.out_dir) if str(args.out_dir).strip() else _default_output_dir(video_path)
-
-    run(
-        video_path=video_path,
-        out_dir=out_dir,
-        buttons=[str(b).strip().upper() for b in args.buttons],
+    initial = WearConfig(
+        video_path=Path(args.video) if str(args.video).strip() else Path(),
+        out_dir=Path(args.out_dir) if str(args.out_dir).strip() else Path(),
+        buttons=[str(b).strip().upper() for b in args.buttons if str(b).strip()],
         print_tol=float(args.print_tol),
         plastic_tol=float(args.plastic_tol),
         wear_threshold_pct=float(args.wear_threshold_pct),
         max_frames=int(args.max_frames),
         save_overlay=not bool(args.no_overlay),
     )
+
+    config: Optional[WearConfig] = None
+    if not args.cli:
+        config = _collect_config_pyqt6(initial)
+        if config is None:
+            print("[wear_post_process] PyQt6 not available or dialog canceled; falling back to CLI.")
+
+    if config is None:
+        config = _collect_config_cli(args)
+
+    run(config)
 
 
 if __name__ == "__main__":
