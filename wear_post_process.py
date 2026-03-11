@@ -22,7 +22,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 import cv2
 import numpy as np
@@ -46,6 +46,7 @@ class WearConfig:
     wear_threshold_pct: float
     max_frames: int
     save_overlay: bool
+    use_qt_interactions: bool = True
 
 
 # ---------------- ROI helpers (v24-style behavior) ----------------
@@ -429,6 +430,295 @@ def _compute_print_mask(crop_bgr: np.ndarray, plastic_lab: np.ndarray, print_lab
     return (mask.astype(np.uint8) * 255)
 
 
+def _collect_rois_and_calibration_pyqt6(frame0: np.ndarray, buttons: List[str]) -> Optional[tuple[Dict[str, object], Dict[str, ButtonCalibration]]]:
+    try:
+        from PyQt6.QtCore import Qt, QPoint
+        from PyQt6.QtGui import QImage, QPixmap
+        from PyQt6.QtWidgets import QApplication, QDialog, QHBoxLayout, QVBoxLayout, QPushButton, QLabel, QWidget, QMessageBox
+    except Exception:
+        return None
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    def bgr_to_pix(bgr: np.ndarray) -> QPixmap:
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(qimg.copy())
+
+    class Canvas(QLabel):
+        def __init__(self, dlg):
+            super().__init__()
+            self.dlg = dlg
+            self.setMouseTracking(True)
+            self.start: Optional[QPoint] = None
+            self.drag: Optional[QPoint] = None
+
+        def mousePressEvent(self, e):
+            if e.button() != Qt.MouseButton.LeftButton:
+                return
+            x, y = int(e.position().x()), int(e.position().y())
+            self.dlg.on_mouse_down(x, y)
+            self.start = QPoint(x, y)
+            self.drag = QPoint(x, y)
+            self.dlg.render()
+
+        def mouseMoveEvent(self, e):
+            if self.start is None:
+                return
+            self.drag = QPoint(int(e.position().x()), int(e.position().y()))
+            self.dlg.on_mouse_drag(self.drag.x(), self.drag.y())
+            self.dlg.render()
+
+        def mouseReleaseEvent(self, e):
+            if self.start is None:
+                return
+            x, y = int(e.position().x()), int(e.position().y())
+            self.dlg.on_mouse_up(x, y)
+            self.start = None
+            self.drag = None
+            self.dlg.render()
+
+    class Dlg(QDialog):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle('Wear ROI + Patch Selector (PyQt6)')
+            self.frame = frame0.copy()
+            self.buttons = list(buttons)
+            self.target_idx = 0
+            self.mode = 'rect'  # rect/circle/poly/patch_plastic/patch_print
+            self.poly_pts: List[tuple[int,int]] = []
+            self.working: Optional[dict] = None
+            self.rois: Dict[str, object] = {}
+            self.patches: Dict[str, Dict[str, Any]] = {b: {'plastic': None, 'print': None} for b in self.buttons}
+            self.result = None
+            self.last_down: Optional[tuple[int,int]] = None
+            self.last_drag: Optional[tuple[int,int]] = None
+
+            root = QHBoxLayout(self)
+            self.canvas = Canvas(self)
+            self.canvas.setFixedSize(self.frame.shape[1], self.frame.shape[0])
+            root.addWidget(self.canvas)
+
+            side = QVBoxLayout()
+            self.status = QLabel('Draw ROI then Next; after all ROIs click Lock All.')
+            side.addWidget(self.status)
+            row1 = QHBoxLayout()
+            self.btn_rect = QPushButton('Rectangle')
+            self.btn_circle = QPushButton('Circle')
+            self.btn_poly = QPushButton('Polygon')
+            row1.addWidget(self.btn_rect); row1.addWidget(self.btn_circle); row1.addWidget(self.btn_poly)
+            side.addLayout(row1)
+
+            row2 = QHBoxLayout()
+            self.btn_poly_done = QPushButton('Finalize Poly')
+            self.btn_next = QPushButton('Next')
+            self.btn_lock = QPushButton('Lock All')
+            row2.addWidget(self.btn_poly_done); row2.addWidget(self.btn_next); row2.addWidget(self.btn_lock)
+            side.addLayout(row2)
+
+            self.btn_pick_plastic = QPushButton('Pick Plastic')
+            self.btn_pick_print = QPushButton('Pick Print')
+            self.btn_start = QPushButton('Start Analysis')
+            self.btn_cancel = QPushButton('Cancel')
+            side.addWidget(self.btn_pick_plastic)
+            side.addWidget(self.btn_pick_print)
+            side.addWidget(self.btn_start)
+            side.addWidget(self.btn_cancel)
+
+            self.swatches = {}
+            for b in self.buttons:
+                lb = QLabel(f'{b}: plastic / print')
+                lb.setStyleSheet('background:#111;color:#eee;padding:4px;')
+                side.addWidget(lb)
+                self.swatches[b] = lb
+
+            side.addStretch(1)
+            root.addLayout(side)
+
+            self.btn_rect.clicked.connect(lambda: self._set_mode('rect'))
+            self.btn_circle.clicked.connect(lambda: self._set_mode('circle'))
+            self.btn_poly.clicked.connect(lambda: self._set_mode('poly'))
+            self.btn_poly_done.clicked.connect(self._finalize_poly)
+            self.btn_next.clicked.connect(self._next)
+            self.btn_lock.clicked.connect(self._lock_all)
+            self.btn_pick_plastic.clicked.connect(lambda: self._set_mode('patch_plastic'))
+            self.btn_pick_print.clicked.connect(lambda: self._set_mode('patch_print'))
+            self.btn_start.clicked.connect(self._start)
+            self.btn_cancel.clicked.connect(self.reject)
+            self.btn_start.setEnabled(False)
+            self.render()
+
+        def _target(self):
+            return self.buttons[self.target_idx]
+
+        def _set_mode(self, m):
+            self.mode = m
+            self.status.setText(f'Target {self._target()} | mode={m}')
+
+        def _is_valid(self, roi):
+            if not roi:
+                return False
+            if roi.get('shape') == 'rect':
+                return roi.get('w',0) >= 4 and roi.get('h',0) >= 4
+            if roi.get('shape') == 'circle':
+                return roi.get('r',0) >= 3
+            if roi.get('shape') == 'poly':
+                return len(roi.get('points',[])) >= 3
+            return False
+
+        def _finalize_poly(self):
+            if len(self.poly_pts) >= 3:
+                self.working = {'shape':'poly','points':self.poly_pts.copy()}
+                self.status.setText(f'{self._target()} polygon ready')
+            else:
+                self.status.setText('Polygon needs >=3 points')
+            self.render()
+
+        def _commit(self):
+            if self.mode == 'poly':
+                self._finalize_poly()
+            if not self._is_valid(self.working or {}):
+                self.status.setText(f'Draw valid ROI for {self._target()}')
+                return False
+            self.rois[self._target()] = _sanitize_roi(self.working, self.frame.shape)
+            self.status.setText(f'Saved ROI for {self._target()}')
+            return True
+
+        def _next(self):
+            if self._commit():
+                self.target_idx = (self.target_idx + 1) % len(self.buttons)
+                self.working = self.rois.get(self._target())
+                self.poly_pts = []
+            self.render()
+
+        def _lock_all(self):
+            if self.working and self._is_valid(self.working):
+                self._commit()
+            missing = [b for b in self.buttons if b not in self.rois]
+            if missing:
+                self.status.setText('Missing ROI: ' + ','.join(missing))
+                self.render()
+                return
+            self.status.setText('ROIs locked. Pick plastic and print patches for each button.')
+            self.render()
+
+        def _all_patches_done(self):
+            for b in self.buttons:
+                if self.patches[b]['plastic'] is None or self.patches[b]['print'] is None:
+                    return False
+            return True
+
+        def _start(self):
+            if not self._all_patches_done():
+                QMessageBox.warning(self, 'Incomplete', 'Select plastic and print patches for all buttons.')
+                return
+            calib = {}
+            for b in self.buttons:
+                roi = self.rois[b]
+                calib[b] = ButtonCalibration(roi=roi, plastic_lab=self.patches[b]['plastic'], print_lab=self.patches[b]['print'])
+            self.result = (self.rois, calib)
+            self.accept()
+
+        def _update_swatch(self, b):
+            p = self.patches[b]['plastic']
+            q = self.patches[b]['print']
+            ptxt = 'set' if p is not None else 'unset'
+            qtxt = 'set' if q is not None else 'unset'
+            self.swatches[b].setText(f'{b}: plastic={ptxt} | print={qtxt}')
+            if p is not None and q is not None:
+                self.swatches[b].setStyleSheet('background:#163;color:#fff;padding:4px;')
+            else:
+                self.swatches[b].setStyleSheet('background:#111;color:#eee;padding:4px;')
+
+        def on_mouse_down(self, x, y):
+            self.last_down = (x, y)
+            self.last_drag = (x, y)
+            if self.mode == 'poly':
+                self.poly_pts.append((x, y))
+
+        def on_mouse_drag(self, x, y):
+            self.last_drag = (x, y)
+
+        def _select_patch_point_rect(self, x0,y0,x1,y1):
+            rx, ry = min(x0,x1), min(y0,y1)
+            rw, rh = abs(x1-x0), abs(y1-y0)
+            if rw <= 0 or rh <= 0:
+                self.status.setText('Patch invalid size.')
+                return
+            btn = self._target()
+            roi = self.rois.get(btn)
+            if roi is None:
+                self.status.setText(f'Lock ROI for {btn} first.')
+                return
+            roi_mask, _ = _roi_mask_from_spec(self.frame.shape, roi)
+            pmask = roi_mask[ry:ry+rh, rx:rx+rw] > 0
+            if pmask.size == 0 or int(np.count_nonzero(pmask)) <= 0:
+                self.status.setText('Patch must overlap active ROI shape.')
+                return
+            if (np.count_nonzero(pmask) / float(max(pmask.size,1))) < 0.5:
+                self.status.setText('Patch overlap too low (<50%).')
+                return
+            patch = self.frame[ry:ry+rh, rx:rx+rw]
+            patch_lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB)
+            vals = patch_lab[pmask]
+            if vals.size == 0:
+                self.status.setText('No valid ROI pixels in patch.')
+                return
+            mean_lab = vals.reshape(-1,3).mean(axis=0)
+            kind = 'plastic' if self.mode == 'patch_plastic' else 'print'
+            self.patches[btn][kind] = mean_lab
+            self._update_swatch(btn)
+            self.status.setText(f'{btn}: {kind} patch captured.')
+            self.btn_start.setEnabled(self._all_patches_done())
+
+        def on_mouse_up(self, x, y):
+            if self.last_down is None:
+                return
+            x0,y0 = self.last_down
+            if self.mode == 'rect':
+                rx, ry = min(x0, x), min(y0, y)
+                rw, rh = abs(x - x0), abs(y - y0)
+                self.working = {'shape':'rect','x':rx,'y':ry,'w':rw,'h':rh}
+                self.status.setText(f'{self._target()} ROI ready')
+            elif self.mode == 'circle':
+                cx = int((x0 + x) / 2)
+                cy = int((y0 + y) / 2)
+                r = int(max(abs(x - x0), abs(y - y0)) / 2)
+                self.working = {'shape':'circle','cx':cx,'cy':cy,'r':r}
+                self.status.setText(f'{self._target()} ROI ready')
+            elif self.mode in ('patch_plastic','patch_print'):
+                self._select_patch_point_rect(x0,y0,x,y)
+
+        def render(self):
+            canvas = self.frame.copy()
+            for b,r in self.rois.items():
+                _draw_roi(canvas, r, color=(80,220,120), label=b, thick=2)
+            if self.mode == 'poly' and self.poly_pts:
+                for i,p in enumerate(self.poly_pts):
+                    cv2.circle(canvas, p, 5, (0,215,255), -1)
+                    if i > 0:
+                        cv2.line(canvas, self.poly_pts[i-1], p, (0,215,255), 2)
+            elif self.working is not None and self.mode in ('rect','circle','poly'):
+                _draw_roi(canvas, self.working, color=(0,215,255), label=f'{self._target()}*', thick=2)
+            if self.last_down and self.last_drag and self.mode in ('rect','circle','patch_plastic','patch_print'):
+                x0,y0 = self.last_down
+                x1,y1 = self.last_drag
+                if self.mode in ('rect','patch_plastic','patch_print'):
+                    cv2.rectangle(canvas, (x0,y0), (x1,y1), (0,215,255), 2)
+                else:
+                    cx = int((x0+x1)/2); cy = int((y0+y1)/2); r = int(max(abs(x1-x0),abs(y1-y0))/2)
+                    cv2.circle(canvas, (cx,cy), r, (0,215,255), 2)
+
+            self.canvas.setPixmap(bgr_to_pix(canvas))
+
+    dlg = Dlg()
+    dlg.resize(min(1800, frame0.shape[1] + 420), min(1100, frame0.shape[0] + 80))
+    if dlg.exec() == QDialog.DialogCode.Accepted:
+        return dlg.result
+    return None
+
+
 def _default_output_dir(video_path: Path) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     return Path("inspection_output") / "post_process" / "print_wear_detect" / f"{video_path.stem}_{ts}"
@@ -448,9 +738,19 @@ def run(config: WearConfig) -> None:
         raise RuntimeError("Could not read first frame from video")
 
     print("Select button ROIs on baseline frame...")
-    rois = _select_rois(frame0, config.buttons)
-    print("Select plastic/print patches for each button ROI...")
-    calib = _collect_calibration(frame0, rois)
+    rois = None
+    calib = None
+    if config.use_qt_interactions:
+        qt_out = _collect_rois_and_calibration_pyqt6(frame0, config.buttons)
+        if qt_out is not None:
+            rois, calib = qt_out
+        else:
+            print("[wear_post_process] PyQt6 ROI/Patch interaction unavailable; using OpenCV selection.")
+
+    if rois is None or calib is None:
+        rois = _select_rois(frame0, config.buttons)
+        print("Select plastic/print patches for each button ROI...")
+        calib = _collect_calibration(frame0, rois)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     fps = cap.get(cv2.CAP_PROP_FPS) or 15.0
@@ -720,6 +1020,7 @@ def _collect_config_cli(args) -> WearConfig:
         wear_threshold_pct=float(args.wear_threshold_pct),
         max_frames=int(args.max_frames),
         save_overlay=not bool(args.no_overlay),
+        use_qt_interactions=not bool(args.opencv_ui),
     )
 
 
@@ -734,6 +1035,7 @@ def main() -> None:
     p.add_argument("--max-frames", type=int, default=0, help="Limit frames processed (0 = all)")
     p.add_argument("--no-overlay", action="store_true", help="Disable overlay video output")
     p.add_argument("--cli", action="store_true", help="Use CLI config flow instead of PyQt6 settings UI")
+    p.add_argument("--opencv-ui", action="store_true", help="Force OpenCV ROI+patch windows instead of integrated PyQt6 selector")
     args = p.parse_args()
 
     initial = WearConfig(
@@ -745,6 +1047,7 @@ def main() -> None:
         wear_threshold_pct=float(args.wear_threshold_pct),
         max_frames=int(args.max_frames),
         save_overlay=not bool(args.no_overlay),
+        use_qt_interactions=not bool(args.opencv_ui),
     )
 
     config: Optional[WearConfig] = None
