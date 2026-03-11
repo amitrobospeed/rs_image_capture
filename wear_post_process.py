@@ -853,129 +853,461 @@ def run(config: WearConfig, preselected_rois: Optional[Dict[str, object]] = None
 def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
     try:
         from PyQt6.QtCore import Qt
-        from PyQt6.QtGui import QImage, QPixmap, QColor
+        from PyQt6.QtGui import QImage, QPixmap, QColor, QMouseEvent
         from PyQt6.QtWidgets import (
             QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
             QFileDialog, QDoubleSpinBox, QSpinBox, QCheckBox, QMessageBox, QTabWidget,
-            QFrame
+            QFrame, QSlider
         )
     except Exception:
         return None
 
     app = QApplication.instance() or QApplication(sys.argv)
 
-    def bgr_to_pix(bgr: np.ndarray, max_w: int, max_h: int):
+    def to_qpix_bgr(bgr: np.ndarray) -> QPixmap:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
-        pix = QPixmap.fromImage(qimg)
-        if w <= 0 or h <= 0:
-            return pix, 1.0
-        scale = min(max_w / float(w), max_h / float(h), 1.0)
-        out = pix.scaled(int(w * scale), int(h * scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        return out, scale
+        return QPixmap.fromImage(qimg)
 
     class MainWin(QWidget):
         def __init__(self):
             super().__init__()
             self.setWindowTitle('Print Wear Post-Process (PyQt6)')
-            self.resize(1460, 920)
+            self.resize(1720, 980)
+
+            # global pre state
             self.video_path = Path(str(initial.video_path)) if str(initial.video_path) else None
-            self.frame0 = None
-            self.scale = 1.0
+            self.frame0: Optional[np.ndarray] = None
+            self.pre_zoom = 1.0
+            self.pre_fit_to_view = True
+            self.pre_lock_aspect = True
+            self.pre_mouse_down: Optional[tuple[int, int]] = None
+            self.pre_mouse_drag: Optional[tuple[int, int]] = None
+            self.pre_distance_mode = False
+            self.pre_distance_pts: List[tuple[int, int]] = []
+            self.pre_last_xy: Optional[tuple[int, int]] = None
+
+            # ROI workflow state
             self.target_idx = 0
             self.mode = 'rect'
-            self.poly_pts = []
-            self.working = None
-            self.rois = {}
-            self.last_down = None
-            self.last_drag = None
-            self.patches = {b: {'plastic': None, 'print': None} for b in initial.buttons}
-            self.output_paths = {}
+            self.poly_pts: List[tuple[int, int]] = []
+            self.working: Optional[dict] = None
+            self.rois: Dict[str, object] = {}
+            self.patches: Dict[str, Dict[str, Any]] = {b: {'plastic': None, 'print': None} for b in initial.buttons}
+
+            # post viewer state
+            self.post_cap = None
+            self.post_frame_idx = 0
+            self.post_total_frames = 0
+            self.post_current_frame: Optional[np.ndarray] = None
+            self.post_zoom = 1.0
+            self.post_fit_to_view = True
+            self.post_lock_aspect = True
+            self.post_mouse_down: Optional[tuple[int, int]] = None
+            self.post_mouse_drag: Optional[tuple[int, int]] = None
+            self.post_distance_mode = False
+            self.post_distance_pts: List[tuple[int, int]] = []
+            self.post_last_xy: Optional[tuple[int, int]] = None
+
+            self.output_paths: Dict[str, str] = {}
 
             root = QVBoxLayout(self)
             self.tabs = QTabWidget()
             root.addWidget(self.tabs)
-            self.tab_pre = QWidget(); self.tab_post = QWidget()
+            self.tab_pre = QWidget()
+            self.tab_post = QWidget()
             self.tabs.addTab(self.tab_pre, 'Pre-Process')
             self.tabs.addTab(self.tab_post, 'Post-Process')
 
-            # pre tab
+            self._build_pre_tab(initial)
+            self._build_post_tab()
+            self._load_first_frame_if_possible()
+
+        # ---------- ui builders ----------
+        def _build_pre_tab(self, initial: WearConfig):
             pre = QHBoxLayout(self.tab_pre)
             left = QVBoxLayout()
-            pre.addLayout(left, 3)
+            right = QVBoxLayout()
+            pre.addLayout(left, 5)
+            pre.addLayout(right, 2)
+
             self.canvas = QLabel('Load a video to begin')
             self.canvas.setFrameStyle(QFrame.Shape.Box)
             self.canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.canvas.setMinimumSize(960, 540)
-            self.canvas.mousePressEvent = self._mouse_press
-            self.canvas.mouseMoveEvent = self._mouse_move
-            self.canvas.mouseReleaseEvent = self._mouse_release
+            self.canvas.setMinimumSize(1280, 720)
+            self.canvas.mousePressEvent = self._pre_mouse_press
+            self.canvas.mouseMoveEvent = self._pre_mouse_move
+            self.canvas.mouseReleaseEvent = self._pre_mouse_release
             left.addWidget(self.canvas)
+
+            tools = QHBoxLayout()
+            self.btn_pre_fit = QPushButton('Fit')
+            self.btn_pre_1x = QPushButton('1:1')
+            self.btn_pre_zoom_in = QPushButton('Zoom +')
+            self.btn_pre_zoom_out = QPushButton('Zoom -')
+            self.btn_pre_aspect = QPushButton('Lock Aspect: ON')
+            self.btn_pre_distance = QPushButton('Distance: OFF')
+            for b in [self.btn_pre_fit, self.btn_pre_1x, self.btn_pre_zoom_in, self.btn_pre_zoom_out, self.btn_pre_aspect, self.btn_pre_distance]:
+                tools.addWidget(b)
+            left.addLayout(tools)
+
+            self.pre_xy_lbl = QLabel('XY: -,-   Dist: -')
+            left.addWidget(self.pre_xy_lbl)
             self.status = QLabel('Select video, then draw ROI and select patches in this same window.')
             left.addWidget(self.status)
 
-            right = QVBoxLayout(); pre.addLayout(right, 1)
+            self.btn_pre_fit.clicked.connect(self._pre_fit)
+            self.btn_pre_1x.clicked.connect(self._pre_1x)
+            self.btn_pre_zoom_in.clicked.connect(lambda: self._pre_zoom_by(1.2))
+            self.btn_pre_zoom_out.clicked.connect(lambda: self._pre_zoom_by(1/1.2))
+            self.btn_pre_aspect.clicked.connect(self._pre_toggle_aspect)
+            self.btn_pre_distance.clicked.connect(self._pre_toggle_distance)
+
             right.addWidget(QLabel('Video file'))
-            r = QHBoxLayout(); self.video_edit = QLineEdit(str(self.video_path) if self.video_path else ''); b=QPushButton('Browse'); r.addWidget(self.video_edit); r.addWidget(b); right.addLayout(r)
+            rv = QHBoxLayout(); self.video_edit = QLineEdit(str(self.video_path) if self.video_path else ''); b = QPushButton('Browse'); rv.addWidget(self.video_edit); rv.addWidget(b); right.addLayout(rv)
             b.clicked.connect(self._browse_video)
 
             right.addWidget(QLabel('Output directory'))
-            r2 = QHBoxLayout(); self.out_edit = QLineEdit(str(initial.out_dir) if str(initial.out_dir) else ''); b2=QPushButton('Browse'); r2.addWidget(self.out_edit); r2.addWidget(b2); right.addLayout(r2)
+            ro = QHBoxLayout(); self.out_edit = QLineEdit(str(initial.out_dir) if str(initial.out_dir) else ''); b2 = QPushButton('Browse'); ro.addWidget(self.out_edit); ro.addWidget(b2); right.addLayout(ro)
             b2.clicked.connect(self._browse_out)
 
             right.addWidget(QLabel('Buttons (space-separated)'))
             self.buttons_edit = QLineEdit(' '.join(initial.buttons)); right.addWidget(self.buttons_edit)
 
-            n1 = QHBoxLayout(); n1.addWidget(QLabel('Print tol')); self.print_tol=QDoubleSpinBox(); self.print_tol.setRange(1,255); self.print_tol.setValue(float(initial.print_tol)); n1.addWidget(self.print_tol); n1.addWidget(QLabel('Plastic tol')); self.plastic_tol=QDoubleSpinBox(); self.plastic_tol.setRange(1,255); self.plastic_tol.setValue(float(initial.plastic_tol)); n1.addWidget(self.plastic_tol); right.addLayout(n1)
-            n2 = QHBoxLayout(); n2.addWidget(QLabel('Wear % (+/-)')); self.wear_thr=QDoubleSpinBox(); self.wear_thr.setRange(0,100); self.wear_thr.setValue(float(initial.wear_threshold_pct)); n2.addWidget(self.wear_thr); n2.addWidget(QLabel('Max frames')); self.max_frames=QSpinBox(); self.max_frames.setRange(0,10_000_000); self.max_frames.setValue(int(initial.max_frames)); n2.addWidget(self.max_frames); right.addLayout(n2)
+            n1 = QHBoxLayout(); n1.addWidget(QLabel('Print tol')); self.print_tol = QDoubleSpinBox(); self.print_tol.setRange(1,255); self.print_tol.setValue(float(initial.print_tol)); n1.addWidget(self.print_tol); n1.addWidget(QLabel('Plastic tol')); self.plastic_tol = QDoubleSpinBox(); self.plastic_tol.setRange(1,255); self.plastic_tol.setValue(float(initial.plastic_tol)); n1.addWidget(self.plastic_tol); right.addLayout(n1)
+            n2 = QHBoxLayout(); n2.addWidget(QLabel('Wear % (+/-)')); self.wear_thr = QDoubleSpinBox(); self.wear_thr.setRange(0,100); self.wear_thr.setValue(float(initial.wear_threshold_pct)); n2.addWidget(self.wear_thr); n2.addWidget(QLabel('Max frames')); self.max_frames = QSpinBox(); self.max_frames.setRange(0,10_000_000); self.max_frames.setValue(int(initial.max_frames)); n2.addWidget(self.max_frames); right.addLayout(n2)
             self.save_overlay = QCheckBox('Save overlay video'); self.save_overlay.setChecked(bool(initial.save_overlay)); right.addWidget(self.save_overlay)
 
-            m1=QHBoxLayout();
-            for txt,mode in [('Rectangle','rect'),('Circle','circle'),('Polygon','poly')]:
-                btn=QPushButton(txt); btn.clicked.connect(lambda _=False,m=mode:self._set_mode(m)); m1.addWidget(btn)
+            m1 = QHBoxLayout()
+            for txt, mode in [('Rectangle','rect'),('Circle','circle'),('Polygon','poly')]:
+                btn = QPushButton(txt); btn.clicked.connect(lambda _=False, m=mode: self._set_mode(m)); m1.addWidget(btn)
             right.addLayout(m1)
-            m2=QHBoxLayout();
-            bn=QPushButton('Finalize Poly'); bn.clicked.connect(self._finalize_poly); m2.addWidget(bn)
-            bx=QPushButton('Next'); bx.clicked.connect(self._next); m2.addWidget(bx)
-            bl=QPushButton('Lock All'); bl.clicked.connect(self._lock_all); m2.addWidget(bl)
-            right.addLayout(m2)
-            m3=QHBoxLayout(); bp=QPushButton('Pick Plastic'); bp.clicked.connect(lambda: self._set_mode('patch_plastic')); m3.addWidget(bp); bq=QPushButton('Pick Print'); bq.clicked.connect(lambda: self._set_mode('patch_print')); m3.addWidget(bq); right.addLayout(m3)
+            m2 = QHBoxLayout(); bn = QPushButton('Finalize Poly'); bn.clicked.connect(self._finalize_poly); m2.addWidget(bn); bx = QPushButton('Next'); bx.clicked.connect(self._next); m2.addWidget(bx); bl = QPushButton('Lock All'); bl.clicked.connect(self._lock_all); m2.addWidget(bl); right.addLayout(m2)
+            m3 = QHBoxLayout(); bp = QPushButton('Pick Plastic'); bp.clicked.connect(lambda: self._set_mode('patch_plastic')); m3.addWidget(bp); bq = QPushButton('Pick Print'); bq.clicked.connect(lambda: self._set_mode('patch_print')); m3.addWidget(bq); right.addLayout(m3)
 
             self.swatch_rows = {}
             for bname in initial.buttons:
                 row = QHBoxLayout()
-                lbl = QLabel(f'{bname}:')
-                lbl.setFixedWidth(30)
-                row.addWidget(lbl)
+                lbl = QLabel(f'{bname}:'); lbl.setFixedWidth(30)
                 s1 = QLabel(); s1.setFixedSize(20,20); s1.setStyleSheet('background:#333;border:1px solid #999;')
                 s2 = QLabel(); s2.setFixedSize(20,20); s2.setStyleSheet('background:#333;border:1px solid #999;')
                 txt = QLabel('plastic/print unset'); txt.setFixedWidth(120)
-                row.addWidget(s1); row.addWidget(s2); row.addWidget(txt)
+                row.addWidget(lbl); row.addWidget(s1); row.addWidget(s2); row.addWidget(txt)
                 right.addLayout(row)
-                self.swatch_rows[bname]=(s1,s2,txt)
+                self.swatch_rows[bname] = (s1, s2, txt)
 
-            acts=QHBoxLayout()
-            cbtn=QPushButton('Cancel'); cbtn.clicked.connect(self._cancel)
-            sbtn=QPushButton('Start Analysis'); sbtn.clicked.connect(self._start_analysis); self.start_btn=sbtn
-            acts.addWidget(cbtn); acts.addWidget(sbtn); right.addLayout(acts)
+            acts = QHBoxLayout(); cbtn = QPushButton('Cancel'); cbtn.clicked.connect(self._cancel); sbtn = QPushButton('Start Analysis'); sbtn.clicked.connect(self._start_analysis); acts.addWidget(cbtn); acts.addWidget(sbtn); right.addLayout(acts)
             right.addStretch(1)
 
-            # post tab
+        def _build_post_tab(self):
             post = QVBoxLayout(self.tab_post)
-            self.post_info = QLabel('No results yet.')
-            post.addWidget(self.post_info)
+            top = QHBoxLayout(); post.addLayout(top)
+            self.post_info = QLabel('No results yet.'); top.addWidget(self.post_info)
+            self.btn_post_load = QPushButton('Load Post-Processed Video'); top.addWidget(self.btn_post_load)
+            self.btn_post_load.clicked.connect(self._post_load_video)
+
+            self.post_canvas = QLabel('No post-process video loaded')
+            self.post_canvas.setFrameStyle(QFrame.Shape.Box)
+            self.post_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.post_canvas.setMinimumSize(1280, 720)
+            self.post_canvas.mousePressEvent = self._post_mouse_press
+            self.post_canvas.mouseMoveEvent = self._post_mouse_move
+            self.post_canvas.mouseReleaseEvent = self._post_mouse_release
+            post.addWidget(self.post_canvas)
+
+            ptools = QHBoxLayout()
+            self.btn_post_fit = QPushButton('Fit')
+            self.btn_post_1x = QPushButton('1:1')
+            self.btn_post_zoom_in = QPushButton('Zoom +')
+            self.btn_post_zoom_out = QPushButton('Zoom -')
+            self.btn_post_aspect = QPushButton('Lock Aspect: ON')
+            self.btn_post_distance = QPushButton('Distance: OFF')
+            for b in [self.btn_post_fit, self.btn_post_1x, self.btn_post_zoom_in, self.btn_post_zoom_out, self.btn_post_aspect, self.btn_post_distance]:
+                ptools.addWidget(b)
+            post.addLayout(ptools)
+
+            self.btn_post_fit.clicked.connect(self._post_fit)
+            self.btn_post_1x.clicked.connect(self._post_1x)
+            self.btn_post_zoom_in.clicked.connect(lambda: self._post_zoom_by(1.2))
+            self.btn_post_zoom_out.clicked.connect(lambda: self._post_zoom_by(1/1.2))
+            self.btn_post_aspect.clicked.connect(self._post_toggle_aspect)
+            self.btn_post_distance.clicked.connect(self._post_toggle_distance)
+
+            nav = QHBoxLayout()
+            self.btn_post_prev = QPushButton('Frame -')
+            self.btn_post_next = QPushButton('Frame +')
+            self.post_slider = QSlider(Qt.Orientation.Horizontal)
+            self.post_slider.setMinimum(0); self.post_slider.setMaximum(0)
+            nav.addWidget(self.btn_post_prev); nav.addWidget(self.btn_post_next); nav.addWidget(self.post_slider)
+            post.addLayout(nav)
+            self.btn_post_prev.clicked.connect(lambda: self._post_step(-1))
+            self.btn_post_next.clicked.connect(lambda: self._post_step(1))
+            self.post_slider.valueChanged.connect(self._post_slider_changed)
+
+            self.post_xy_lbl = QLabel('XY: -,-   Dist: -')
             self.post_preview = QLabel('Overlay preview path will appear here after processing.')
             self.post_preview.setWordWrap(True)
+            post.addWidget(self.post_xy_lbl)
             post.addWidget(self.post_preview)
 
-            self._load_first_frame_if_possible()
+        # ---------- shared viewer helpers ----------
+        def _display_with_view(self, frame: np.ndarray, canvas_label: QLabel, zoom: float, fit_to_view: bool, lock_aspect: bool):
+            pix = to_qpix_bgr(frame)
+            fw, fh = frame.shape[1], frame.shape[0]
+            avail_w = max(16, canvas_label.width() - 8)
+            avail_h = max(16, canvas_label.height() - 8)
+            if fit_to_view:
+                sx = avail_w / float(max(1, fw))
+                sy = avail_h / float(max(1, fh))
+                scale = min(sx, sy) if lock_aspect else min(max(sx, sy), 1.0)
+                scale = max(0.05, scale * zoom)
+            else:
+                scale = max(0.05, zoom)
+            if lock_aspect:
+                out = pix.scaled(int(fw * scale), int(fh * scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            else:
+                out = pix.scaled(int(fw * scale), int(fh * scale), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            canvas_label.setPixmap(out)
+            return scale, out.width(), out.height()
 
+        def _mouse_to_frame(self, label: QLabel, frame: np.ndarray, ex: int, ey: int):
+            pix = label.pixmap()
+            if pix is None:
+                return 0, 0
+            ox = max(0, (label.width() - pix.width()) // 2)
+            oy = max(0, (label.height() - pix.height()) // 2)
+            px = int(np.clip(ex - ox, 0, max(0, pix.width()-1)))
+            py = int(np.clip(ey - oy, 0, max(0, pix.height()-1)))
+            fx = int(px * frame.shape[1] / float(max(1, pix.width())))
+            fy = int(py * frame.shape[0] / float(max(1, pix.height())))
+            fx = int(np.clip(fx, 0, frame.shape[1]-1))
+            fy = int(np.clip(fy, 0, frame.shape[0]-1))
+            return fx, fy
+
+        # ---------- pre tab handlers ----------
+        def _pre_fit(self):
+            self.pre_fit_to_view = True
+            self.pre_zoom = 1.0
+            self.render_pre()
+
+        def _pre_1x(self):
+            self.pre_fit_to_view = False
+            self.pre_zoom = 1.0
+            self.render_pre()
+
+        def _pre_zoom_by(self, mult: float):
+            self.pre_zoom = max(0.05, min(20.0, self.pre_zoom * mult))
+            self.pre_fit_to_view = False
+            self.render_pre()
+
+        def _pre_toggle_aspect(self):
+            self.pre_lock_aspect = not self.pre_lock_aspect
+            self.btn_pre_aspect.setText('Lock Aspect: ON' if self.pre_lock_aspect else 'Lock Aspect: OFF')
+            self.render_pre()
+
+        def _pre_toggle_distance(self):
+            self.pre_distance_mode = not self.pre_distance_mode
+            self.pre_distance_pts = []
+            self.btn_pre_distance.setText('Distance: ON' if self.pre_distance_mode else 'Distance: OFF')
+            self.render_pre()
+
+        def _pre_mouse_press(self, e: QMouseEvent):
+            if self.frame0 is None or e.button() != Qt.MouseButton.LeftButton:
+                return
+            x, y = self._mouse_to_frame(self.canvas, self.frame0, int(e.position().x()), int(e.position().y()))
+            self.pre_mouse_down = (x, y)
+            self.pre_mouse_drag = (x, y)
+            if self.pre_distance_mode:
+                self.pre_distance_pts.append((x, y))
+                self.pre_distance_pts = self.pre_distance_pts[-2:]
+                self.render_pre()
+                return
+            if self.mode == 'poly':
+                self.poly_pts.append((x, y))
+            self.render_pre()
+
+        def _pre_mouse_move(self, e: QMouseEvent):
+            if self.frame0 is None:
+                return
+            x, y = self._mouse_to_frame(self.canvas, self.frame0, int(e.position().x()), int(e.position().y()))
+            self.pre_last_xy = (x, y)
+            dist_txt = '-'
+            if len(self.pre_distance_pts) == 2:
+                dx = self.pre_distance_pts[1][0] - self.pre_distance_pts[0][0]
+                dy = self.pre_distance_pts[1][1] - self.pre_distance_pts[0][1]
+                dist_txt = f'{(dx*dx+dy*dy)**0.5:.2f}px'
+            self.pre_xy_lbl.setText(f'XY: {x},{y}   Dist: {dist_txt}')
+            if self.pre_mouse_down is not None and not self.pre_distance_mode:
+                self.pre_mouse_drag = (x, y)
+                self.render_pre()
+
+        def _pre_mouse_release(self, e: QMouseEvent):
+            if self.frame0 is None or self.pre_mouse_down is None or self.pre_distance_mode:
+                self.pre_mouse_down = None
+                self.pre_mouse_drag = None
+                return
+            x, y = self._mouse_to_frame(self.canvas, self.frame0, int(e.position().x()), int(e.position().y()))
+            x0, y0 = self.pre_mouse_down
+            if self.mode == 'rect':
+                self.working = {'shape':'rect','x':min(x0,x),'y':min(y0,y),'w':abs(x-x0),'h':abs(y-y0)}
+            elif self.mode == 'circle':
+                self.working = {'shape':'circle','cx':int((x0+x)/2),'cy':int((y0+y)/2),'r':int(max(abs(x-x0),abs(y-y0))/2)}
+            elif self.mode in ('patch_plastic','patch_print'):
+                self._pick_patch(x0, y0, x, y)
+            self.pre_mouse_down = None
+            self.pre_mouse_drag = None
+            self.render_pre()
+
+        def _render_pre_frame(self):
+            if self.frame0 is None:
+                return None
+            canvas = self.frame0.copy()
+            for b, r in self.rois.items():
+                _draw_roi(canvas, r, color=(80,220,120), label=b, thick=2)
+            if self.mode == 'poly' and self.poly_pts:
+                for i, p in enumerate(self.poly_pts):
+                    cv2.circle(canvas, p, 5, (0,215,255), -1)
+                    if i > 0:
+                        cv2.line(canvas, self.poly_pts[i-1], p, (0,215,255), 2)
+            elif self.working is not None and self.mode in ('rect','circle','poly'):
+                _draw_roi(canvas, self.working, color=(0,215,255), label=f'{self._target()}*', thick=2)
+            if self.pre_mouse_down and self.pre_mouse_drag and self.mode in ('rect','circle','patch_plastic','patch_print'):
+                x0, y0 = self.pre_mouse_down
+                x1, y1 = self.pre_mouse_drag
+                if self.mode in ('rect','patch_plastic','patch_print'):
+                    cv2.rectangle(canvas, (x0,y0), (x1,y1), (0,215,255), 2)
+                else:
+                    cx, cy = int((x0+x1)/2), int((y0+y1)/2)
+                    r = int(max(abs(x1-x0), abs(y1-y0))/2)
+                    cv2.circle(canvas, (cx,cy), r, (0,215,255), 2)
+            if len(self.pre_distance_pts) == 2:
+                p0, p1 = self.pre_distance_pts
+                cv2.line(canvas, p0, p1, (255,0,255), 2)
+                cv2.circle(canvas, p0, 4, (255,0,255), -1)
+                cv2.circle(canvas, p1, 4, (255,0,255), -1)
+            return canvas
+
+        def render_pre(self):
+            img = self._render_pre_frame()
+            if img is None:
+                return
+            self._display_with_view(img, self.canvas, self.pre_zoom, self.pre_fit_to_view, self.pre_lock_aspect)
+
+        # ---------- post tab handlers ----------
+        def _post_fit(self):
+            self.post_fit_to_view = True
+            self.post_zoom = 1.0
+            self.render_post()
+
+        def _post_1x(self):
+            self.post_fit_to_view = False
+            self.post_zoom = 1.0
+            self.render_post()
+
+        def _post_zoom_by(self, mult: float):
+            self.post_zoom = max(0.05, min(20.0, self.post_zoom * mult))
+            self.post_fit_to_view = False
+            self.render_post()
+
+        def _post_toggle_aspect(self):
+            self.post_lock_aspect = not self.post_lock_aspect
+            self.btn_post_aspect.setText('Lock Aspect: ON' if self.post_lock_aspect else 'Lock Aspect: OFF')
+            self.render_post()
+
+        def _post_toggle_distance(self):
+            self.post_distance_mode = not self.post_distance_mode
+            self.post_distance_pts = []
+            self.btn_post_distance.setText('Distance: ON' if self.post_distance_mode else 'Distance: OFF')
+            self.render_post()
+
+        def _post_load_video(self):
+            path, _ = QFileDialog.getOpenFileName(self, 'Select post-processed video', '', 'Video files (*.mp4 *.avi *.mov *.mkv);;All files (*.*)')
+            if not path:
+                return
+            if self.post_cap is not None:
+                self.post_cap.release()
+            self.post_cap = cv2.VideoCapture(path)
+            if not self.post_cap.isOpened():
+                QMessageBox.warning(self, 'Open failed', f'Could not open\n{path}')
+                self.post_cap = None
+                return
+            self.post_total_frames = int(max(1, self.post_cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+            self.post_slider.setMinimum(0)
+            self.post_slider.setMaximum(max(0, self.post_total_frames - 1))
+            self.post_frame_idx = 0
+            self._post_read_frame(0)
+
+        def _post_read_frame(self, idx: int):
+            if self.post_cap is None:
+                return
+            idx = int(np.clip(idx, 0, max(0, self.post_total_frames - 1)))
+            self.post_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, f = self.post_cap.read()
+            if ok and f is not None:
+                self.post_current_frame = f
+                self.post_frame_idx = idx
+                if self.post_slider.value() != idx:
+                    self.post_slider.blockSignals(True)
+                    self.post_slider.setValue(idx)
+                    self.post_slider.blockSignals(False)
+                self.render_post()
+
+        def _post_step(self, delta: int):
+            self._post_read_frame(self.post_frame_idx + delta)
+
+        def _post_slider_changed(self, v: int):
+            self._post_read_frame(v)
+
+        def _post_mouse_press(self, e: QMouseEvent):
+            if self.post_current_frame is None or e.button() != Qt.MouseButton.LeftButton:
+                return
+            x, y = self._mouse_to_frame(self.post_canvas, self.post_current_frame, int(e.position().x()), int(e.position().y()))
+            self.post_mouse_down = (x, y)
+            self.post_mouse_drag = (x, y)
+            if self.post_distance_mode:
+                self.post_distance_pts.append((x, y))
+                self.post_distance_pts = self.post_distance_pts[-2:]
+            self.render_post()
+
+        def _post_mouse_move(self, e: QMouseEvent):
+            if self.post_current_frame is None:
+                return
+            x, y = self._mouse_to_frame(self.post_canvas, self.post_current_frame, int(e.position().x()), int(e.position().y()))
+            self.post_last_xy = (x, y)
+            dist_txt = '-'
+            if len(self.post_distance_pts) == 2:
+                dx = self.post_distance_pts[1][0] - self.post_distance_pts[0][0]
+                dy = self.post_distance_pts[1][1] - self.post_distance_pts[0][1]
+                dist_txt = f'{(dx*dx+dy*dy)**0.5:.2f}px'
+            self.post_xy_lbl.setText(f'XY: {x},{y}   Dist: {dist_txt}   Frame: {self.post_frame_idx}')
+            if self.post_mouse_down is not None and not self.post_distance_mode:
+                self.post_mouse_drag = (x, y)
+                self.render_post()
+
+        def _post_mouse_release(self, _e: QMouseEvent):
+            self.post_mouse_down = None
+            self.post_mouse_drag = None
+
+        def render_post(self):
+            if self.post_current_frame is None:
+                return
+            img = self.post_current_frame.copy()
+            if len(self.post_distance_pts) == 2:
+                p0, p1 = self.post_distance_pts
+                cv2.line(img, p0, p1, (255,0,255), 2)
+                cv2.circle(img, p0, 4, (255,0,255), -1)
+                cv2.circle(img, p1, 4, (255,0,255), -1)
+            if self.post_mouse_down and self.post_mouse_drag and self.post_distance_mode:
+                cv2.line(img, self.post_mouse_down, self.post_mouse_drag, (255,0,255), 1)
+            self._display_with_view(img, self.post_canvas, self.post_zoom, self.post_fit_to_view, self.post_lock_aspect)
+
+        # ---------- existing workflow ----------
         def _buttons(self):
             return [b.strip().upper() for b in self.buttons_edit.text().split() if b.strip()]
 
         def _target(self):
-            btns=self._buttons()
+            btns = self._buttons()
             if not btns:
                 return 'A'
             self.target_idx = min(self.target_idx, len(btns)-1)
@@ -1012,70 +1344,31 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
                 self.frame0 = f
                 for b in self._buttons():
                     self.patches.setdefault(b, {'plastic':None,'print':None})
-                self.render()
-
-        def _to_frame_coords(self, x, y):
-            if self.frame0 is None or self.scale <= 0:
-                return 0, 0
-            px = self.canvas.pixmap()
-            if px is None:
-                return 0,0
-            ox = max(0, (self.canvas.width() - px.width()) // 2)
-            oy = max(0, (self.canvas.height() - px.height()) // 2)
-            x = np.clip(x - ox, 0, px.width()-1)
-            y = np.clip(y - oy, 0, px.height()-1)
-            fx = int(x / self.scale)
-            fy = int(y / self.scale)
-            h,w=self.frame0.shape[:2]
-            return int(np.clip(fx,0,w-1)), int(np.clip(fy,0,h-1))
-
-        def _mouse_press(self, e):
-            if self.frame0 is None or e.button()!=Qt.MouseButton.LeftButton:
-                return
-            x,y=self._to_frame_coords(int(e.position().x()), int(e.position().y()))
-            self.last_down=(x,y); self.last_drag=(x,y)
-            if self.mode=='poly':
-                self.poly_pts.append((x,y))
-            self.render()
-
-        def _mouse_move(self, e):
-            if self.last_down is None or self.frame0 is None:
-                return
-            x,y=self._to_frame_coords(int(e.position().x()), int(e.position().y()))
-            self.last_drag=(x,y); self.render()
-
-        def _mouse_release(self, e):
-            if self.last_down is None or self.frame0 is None:
-                return
-            x,y=self._to_frame_coords(int(e.position().x()), int(e.position().y()))
-            x0,y0=self.last_down
-            if self.mode=='rect':
-                self.working={'shape':'rect','x':min(x0,x),'y':min(y0,y),'w':abs(x-x0),'h':abs(y-y0)}
-            elif self.mode=='circle':
-                self.working={'shape':'circle','cx':int((x0+x)/2),'cy':int((y0+y)/2),'r':int(max(abs(x-x0),abs(y-y0))/2)}
-            elif self.mode in ('patch_plastic','patch_print'):
-                self._pick_patch(x0,y0,x,y)
-            self.last_down=None; self.last_drag=None
-            self.render()
+                self.render_pre()
 
         def _is_valid(self, roi):
-            if not roi: return False
-            s=roi.get('shape')
-            if s=='rect': return roi.get('w',0)>=4 and roi.get('h',0)>=4
-            if s=='circle': return roi.get('r',0)>=3
-            if s=='poly': return len(roi.get('points',[]))>=3
+            if not roi:
+                return False
+            s = roi.get('shape')
+            if s == 'rect':
+                return roi.get('w', 0) >= 4 and roi.get('h', 0) >= 4
+            if s == 'circle':
+                return roi.get('r', 0) >= 3
+            if s == 'poly':
+                return len(roi.get('points', [])) >= 3
             return False
 
         def _finalize_poly(self):
-            if len(self.poly_pts)>=3:
-                self.working={'shape':'poly','points':self.poly_pts.copy()}
+            if len(self.poly_pts) >= 3:
+                self.working = {'shape':'poly','points':self.poly_pts.copy()}
                 self.status.setText(f'{self._target()} polygon ready')
             else:
                 self.status.setText('Polygon needs >=3 points')
-            self.render()
+            self.render_pre()
 
         def _commit(self):
-            if self.mode=='poly': self._finalize_poly()
+            if self.mode == 'poly':
+                self._finalize_poly()
             if self.frame0 is None or not self._is_valid(self.working or {}):
                 self.status.setText(f'Draw valid ROI for {self._target()}')
                 return False
@@ -1083,121 +1376,137 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             return True
 
         def _next(self):
-            btns=self._buttons()
-            if not btns: return
+            btns = self._buttons()
+            if not btns:
+                return
             if self._commit():
-                self.target_idx=(self.target_idx+1)%len(btns)
-                self.working=self.rois.get(self._target())
-                self.poly_pts=[]
+                self.target_idx = (self.target_idx + 1) % len(btns)
+                self.working = self.rois.get(self._target())
+                self.poly_pts = []
                 self.status.setText(f'Now edit/select ROI for {self._target()}')
-            self.render()
+            self.render_pre()
 
         def _lock_all(self):
-            if self.working and self._is_valid(self.working): self._commit()
-            missing=[b for b in self._buttons() if b not in self.rois]
+            if self.working and self._is_valid(self.working):
+                self._commit()
+            missing = [b for b in self._buttons() if b not in self.rois]
             if missing:
-                self.status.setText('Missing ROI: '+','.join(missing)); self.render(); return
+                self.status.setText('Missing ROI: ' + ','.join(missing))
+                self.render_pre()
+                return
             self.status.setText('ROIs locked. Pick plastic/print patches per button.')
 
-        def _pick_patch(self,x0,y0,x1,y1):
-            if self.frame0 is None: return
-            rx,ry=min(x0,x1),min(y0,y1); rw,rh=abs(x1-x0),abs(y1-y0)
-            if rw<=0 or rh<=0: self.status.setText('Patch invalid size'); return
-            btn=self._target(); roi=self.rois.get(btn)
-            if roi is None: self.status.setText(f'Lock ROI for {btn} first.'); return
-            roi_mask,_=_roi_mask_from_spec(self.frame0.shape, roi)
-            pmask=roi_mask[ry:ry+rh, rx:rx+rw] > 0
-            if pmask.size==0 or int(np.count_nonzero(pmask))<=0:
-                self.status.setText('Patch must overlap active ROI shape.'); return
-            if (np.count_nonzero(pmask)/float(max(pmask.size,1))) < 0.5:
-                self.status.setText('Patch overlap too low (<50%).'); return
-            patch=self.frame0[ry:ry+rh, rx:rx+rw]
-            vals=cv2.cvtColor(patch, cv2.COLOR_BGR2LAB)[pmask]
-            if vals.size==0: self.status.setText('No valid ROI pixels in patch.'); return
-            mean_lab=vals.reshape(-1,3).mean(axis=0)
-            kind='plastic' if self.mode=='patch_plastic' else 'print'
-            self.patches.setdefault(btn, {'plastic':None,'print':None})[kind]=mean_lab
+        def _pick_patch(self, x0, y0, x1, y1):
+            if self.frame0 is None:
+                return
+            rx, ry = min(x0, x1), min(y0, y1)
+            rw, rh = abs(x1-x0), abs(y1-y0)
+            if rw <= 0 or rh <= 0:
+                self.status.setText('Patch invalid size')
+                return
+            btn = self._target()
+            roi = self.rois.get(btn)
+            if roi is None:
+                self.status.setText(f'Lock ROI for {btn} first.')
+                return
+            roi_mask, _ = _roi_mask_from_spec(self.frame0.shape, roi)
+            pmask = roi_mask[ry:ry+rh, rx:rx+rw] > 0
+            if pmask.size == 0 or int(np.count_nonzero(pmask)) <= 0:
+                self.status.setText('Patch must overlap active ROI shape.')
+                return
+            if (np.count_nonzero(pmask) / float(max(pmask.size,1))) < 0.5:
+                self.status.setText('Patch overlap too low (<50%).')
+                return
+            patch = self.frame0[ry:ry+rh, rx:rx+rw]
+            vals = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB)[pmask]
+            if vals.size == 0:
+                self.status.setText('No valid ROI pixels in patch.')
+                return
+            mean_lab = vals.reshape(-1,3).mean(axis=0)
+            kind = 'plastic' if self.mode == 'patch_plastic' else 'print'
+            self.patches.setdefault(btn, {'plastic':None,'print':None})[kind] = mean_lab
             self._update_swatch(btn)
             self.status.setText(f'{btn}: {kind} patch captured.')
 
-        def _update_swatch(self,b):
-            s1,s2,txt=self.swatch_rows[b]
-            pv=self.patches.get(b,{}).get('plastic')
-            qv=self.patches.get(b,{}).get('print')
+        def _update_swatch(self, b):
+            s1, s2, txt = self.swatch_rows[b]
+            pv = self.patches.get(b, {}).get('plastic')
+            qv = self.patches.get(b, {}).get('print')
             def lab_to_css(v):
-                if v is None: return '#333333'
-                arr=np.array([[v]],dtype=np.uint8)
-                bgr=cv2.cvtColor(arr, cv2.COLOR_LAB2BGR)[0,0]
-                return QColor(int(bgr[2]),int(bgr[1]),int(bgr[0])).name()
+                if v is None:
+                    return '#333333'
+                arr = np.array([[v]], dtype=np.uint8)
+                bgr = cv2.cvtColor(arr, cv2.COLOR_LAB2BGR)[0,0]
+                return QColor(int(bgr[2]), int(bgr[1]), int(bgr[0])).name()
             s1.setStyleSheet(f'background:{lab_to_css(pv)};border:1px solid #999;')
             s2.setStyleSheet(f'background:{lab_to_css(qv)};border:1px solid #999;')
             txt.setText(f'P:{"set" if pv is not None else "-"} Q:{"set" if qv is not None else "-"}')
 
         def _cancel(self):
+            if self.post_cap is not None:
+                self.post_cap.release()
             self.close()
 
-        def _render_frame(self):
-            if self.frame0 is None:
-                return None
-            canvas=self.frame0.copy()
-            for b,r in self.rois.items():
-                _draw_roi(canvas,r,color=(80,220,120),label=b,thick=2)
-            if self.mode=='poly' and self.poly_pts:
-                for i,p in enumerate(self.poly_pts):
-                    cv2.circle(canvas,p,5,(0,215,255),-1)
-                    if i>0: cv2.line(canvas,self.poly_pts[i-1],p,(0,215,255),2)
-            elif self.working is not None and self.mode in ('rect','circle','poly'):
-                _draw_roi(canvas,self.working,color=(0,215,255),label=f'{self._target()}*',thick=2)
-            if self.last_down and self.last_drag and self.mode in ('rect','circle','patch_plastic','patch_print'):
-                x0,y0=self.last_down; x1,y1=self.last_drag
-                if self.mode in ('rect','patch_plastic','patch_print'):
-                    cv2.rectangle(canvas,(x0,y0),(x1,y1),(0,215,255),2)
-                else:
-                    cx=int((x0+x1)/2); cy=int((y0+y1)/2); r=int(max(abs(x1-x0),abs(y1-y0))/2)
-                    cv2.circle(canvas,(cx,cy),r,(0,215,255),2)
-            return canvas
-
-        def render(self):
-            img=self._render_frame()
-            if img is None: return
-            pix,sc=bgr_to_pix(img, max(640,self.canvas.width()-8), max(360,self.canvas.height()-8))
-            self.scale=sc
-            self.canvas.setPixmap(pix)
-
         def _start_analysis(self):
-            video_txt=self.video_edit.text().strip()
+            video_txt = self.video_edit.text().strip()
             if not video_txt:
-                QMessageBox.warning(self,'Missing video','Please select a video file.'); return
-            vp=Path(video_txt)
+                QMessageBox.warning(self, 'Missing video', 'Please select a video file.')
+                return
+            vp = Path(video_txt)
             if not vp.exists():
-                QMessageBox.warning(self, 'Video not found', f'Video path does not exist:\n{vp}')
+                QMessageBox.warning(self, 'Video not found', f'Video path does not exist\n{vp}')
                 return
             if self.frame0 is None:
-                QMessageBox.warning(self,'No frame','Could not read first frame.'); return
-            btns=self._buttons()
+                QMessageBox.warning(self, 'No frame', 'Could not read first frame.')
+                return
+            btns = self._buttons()
             if not btns:
-                QMessageBox.warning(self,'Missing buttons','Enter at least one button label.'); return
-            missing=[b for b in btns if b not in self.rois]
+                QMessageBox.warning(self, 'Missing buttons', 'Enter at least one button label.')
+                return
+            missing = [b for b in btns if b not in self.rois]
             if missing:
-                QMessageBox.warning(self,'Missing ROI','Create ROIs for: '+', '.join(missing)); return
+                QMessageBox.warning(self, 'Missing ROI', 'Create ROIs for: ' + ', '.join(missing))
+                return
             for b in btns:
-                pp=self.patches.get(b,{}).get('plastic'); qq=self.patches.get(b,{}).get('print')
+                pp = self.patches.get(b, {}).get('plastic')
+                qq = self.patches.get(b, {}).get('print')
                 if pp is None or qq is None:
-                    QMessageBox.warning(self,'Missing patch',f'Select plastic+print patches for {b}.'); return
+                    QMessageBox.warning(self, 'Missing patch', f'Select plastic+print patches for {b}.')
+                    return
 
             out_base = Path(self.out_edit.text().strip()) if self.out_edit.text().strip() else _default_output_dir(vp)
-            ts=datetime.now().strftime('%Y%m%d_%H%M%S')
-            out_dir=out_base / f'run_{ts}'
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            out_dir = out_base / f'run_{ts}'
             out_dir.mkdir(parents=True, exist_ok=True)
-            cfg=WearConfig(video_path=vp,out_dir=out_dir,buttons=btns,print_tol=float(self.print_tol.value()),plastic_tol=float(self.plastic_tol.value()),wear_threshold_pct=float(self.wear_thr.value()),max_frames=int(self.max_frames.value()),save_overlay=bool(self.save_overlay.isChecked()),use_qt_interactions=True)
-            calib={b: ButtonCalibration(roi=self.rois[b], plastic_lab=self.patches[b]['plastic'], print_lab=self.patches[b]['print']) for b in btns}
+            cfg = WearConfig(
+                video_path=vp,
+                out_dir=out_dir,
+                buttons=btns,
+                print_tol=float(self.print_tol.value()),
+                plastic_tol=float(self.plastic_tol.value()),
+                wear_threshold_pct=float(self.wear_thr.value()),
+                max_frames=int(self.max_frames.value()),
+                save_overlay=bool(self.save_overlay.isChecked()),
+                use_qt_interactions=True,
+            )
+            calib = {b: ButtonCalibration(roi=self.rois[b], plastic_lab=self.patches[b]['plastic'], print_lab=self.patches[b]['print']) for b in btns}
             try:
                 paths = run(cfg, preselected_rois=self.rois, preselected_calib=calib)
             except Exception as ex:
-                QMessageBox.critical(self,'Processing failed',str(ex)); return
-            self.output_paths=paths
+                QMessageBox.critical(self, 'Processing failed', str(ex))
+                return
+            self.output_paths = paths
             self.post_info.setText('Processing complete. Outputs created.')
             self.post_preview.setText('\n'.join([f'{k}: {v}' for k, v in paths.items()]))
+            overlay = paths.get('overlay','')
+            if overlay and Path(overlay).exists():
+                if self.post_cap is not None:
+                    self.post_cap.release()
+                self.post_cap = cv2.VideoCapture(overlay)
+                if self.post_cap.isOpened():
+                    self.post_total_frames = int(max(1, self.post_cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+                    self.post_slider.setMaximum(max(0, self.post_total_frames - 1))
+                    self._post_read_frame(0)
             self.tabs.setCurrentWidget(self.tab_post)
 
     win = MainWin()
