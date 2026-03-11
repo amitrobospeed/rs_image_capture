@@ -875,6 +875,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             super().__init__()
             self.setWindowTitle('Print Wear Post-Process (PyQt6)')
             self.resize(1720, 980)
+            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
             # global pre state
             self.video_path = Path(str(initial.video_path)) if str(initial.video_path) else None
@@ -895,6 +896,11 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.working: Optional[dict] = None
             self.rois: Dict[str, object] = {}
             self.patches: Dict[str, Dict[str, Any]] = {b: {'plastic': None, 'print': None} for b in initial.buttons}
+            self.roi_selection_active = False
+            self.roi_locked = False
+            self.patch_selection_active = False
+            self.patch_sequence: List[tuple[str, str]] = []
+            self.patch_step_idx = 0
 
             # post viewer state
             self.post_cap = None
@@ -979,12 +985,43 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             n2 = QHBoxLayout(); n2.addWidget(QLabel('Wear % (+/-)')); self.wear_thr = QDoubleSpinBox(); self.wear_thr.setRange(0,100); self.wear_thr.setValue(float(initial.wear_threshold_pct)); n2.addWidget(self.wear_thr); n2.addWidget(QLabel('Max frames')); self.max_frames = QSpinBox(); self.max_frames.setRange(0,10_000_000); self.max_frames.setValue(int(initial.max_frames)); n2.addWidget(self.max_frames); right.addLayout(n2)
             self.save_overlay = QCheckBox('Save overlay video'); self.save_overlay.setChecked(bool(initial.save_overlay)); right.addWidget(self.save_overlay)
 
+            right.addWidget(QLabel('ROI Selection'))
+            roi_flow = QHBoxLayout()
+            self.btn_roi_start = QPushButton('Start ROI Selection')
+            self.btn_roi_lock = QPushButton('End/Save ROIs')
+            roi_flow.addWidget(self.btn_roi_start)
+            roi_flow.addWidget(self.btn_roi_lock)
+            right.addLayout(roi_flow)
+
             m1 = QHBoxLayout()
             for txt, mode in [('Rectangle','rect'),('Circle','circle'),('Polygon','poly')]:
                 btn = QPushButton(txt); btn.clicked.connect(lambda _=False, m=mode: self._set_mode(m)); m1.addWidget(btn)
             right.addLayout(m1)
-            m2 = QHBoxLayout(); bn = QPushButton('Finalize Poly'); bn.clicked.connect(self._finalize_poly); m2.addWidget(bn); bx = QPushButton('Next'); bx.clicked.connect(self._next); m2.addWidget(bx); bl = QPushButton('Lock All'); bl.clicked.connect(self._lock_all); m2.addWidget(bl); right.addLayout(m2)
-            m3 = QHBoxLayout(); bp = QPushButton('Pick Plastic'); bp.clicked.connect(lambda: self._set_mode('patch_plastic')); m3.addWidget(bp); bq = QPushButton('Pick Print'); bq.clicked.connect(lambda: self._set_mode('patch_print')); m3.addWidget(bq); right.addLayout(m3)
+            m2 = QHBoxLayout(); bn = QPushButton('Finalize Poly'); bn.clicked.connect(self._finalize_poly); m2.addWidget(bn); bx = QPushButton('ROI Next'); bx.clicked.connect(self._next); m2.addWidget(bx); right.addLayout(m2)
+
+            right.addWidget(QLabel('Patch Selection'))
+            patch_flow = QHBoxLayout()
+            self.btn_patch_start = QPushButton('Start Patch Selection')
+            self.btn_patch_end = QPushButton('End/Save Patches')
+            patch_flow.addWidget(self.btn_patch_start)
+            patch_flow.addWidget(self.btn_patch_end)
+            right.addLayout(patch_flow)
+
+            m3 = QHBoxLayout()
+            self.btn_patch_prev = QPushButton('Patch Prev')
+            self.btn_patch_next = QPushButton('Patch Next')
+            m3.addWidget(self.btn_patch_prev)
+            m3.addWidget(self.btn_patch_next)
+            right.addLayout(m3)
+
+            self.patch_step_lbl = QLabel('Patch step: inactive')
+            right.addWidget(self.patch_step_lbl)
+            self.btn_roi_start.clicked.connect(self._start_roi_selection)
+            self.btn_roi_lock.clicked.connect(self._lock_all)
+            self.btn_patch_start.clicked.connect(self._start_patch_selection)
+            self.btn_patch_end.clicked.connect(self._end_patch_selection)
+            self.btn_patch_prev.clicked.connect(lambda: self._step_patch(-1))
+            self.btn_patch_next.clicked.connect(lambda: self._step_patch(1))
 
             self.swatch_rows = {}
             for bname in initial.buttons:
@@ -1075,8 +1112,8 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             pix = label.pixmap()
             if pix is None:
                 return 0, 0
-            ox = max(0, (label.width() - pix.width()) // 2)
-            oy = max(0, (label.height() - pix.height()) // 2)
+            ox = (label.width() - pix.width()) // 2
+            oy = (label.height() - pix.height()) // 2
             px = int(np.clip(ex - ox, 0, max(0, pix.width()-1)))
             py = int(np.clip(ey - oy, 0, max(0, pix.height()-1)))
             fx = int(px * frame.shape[1] / float(max(1, pix.width())))
@@ -1115,13 +1152,26 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
         def _pre_mouse_press(self, e: QMouseEvent):
             if self.frame0 is None or e.button() != Qt.MouseButton.LeftButton:
                 return
+            self.setFocus()
             x, y = self._mouse_to_frame(self.canvas, self.frame0, int(e.position().x()), int(e.position().y()))
             self.pre_mouse_down = (x, y)
             self.pre_mouse_drag = (x, y)
             if self.pre_distance_mode:
                 self.pre_distance_pts.append((x, y))
                 self.pre_distance_pts = self.pre_distance_pts[-2:]
+                dist_txt = '-'
+                if len(self.pre_distance_pts) == 2:
+                    dx = self.pre_distance_pts[1][0] - self.pre_distance_pts[0][0]
+                    dy = self.pre_distance_pts[1][1] - self.pre_distance_pts[0][1]
+                    dist_txt = f'{(dx*dx+dy*dy)**0.5:.2f}px'
+                self.pre_xy_lbl.setText(f'XY: {x},{y}   Dist: {dist_txt}')
                 self.render_pre()
+                return
+            if self.mode in ('rect', 'circle', 'poly') and not self.roi_selection_active:
+                self.status.setText('Start ROI Selection first.')
+                return
+            if self.mode in ('patch_plastic', 'patch_print') and not self.patch_selection_active:
+                self.status.setText('Start Patch Selection first.')
                 return
             if self.mode == 'poly':
                 self.poly_pts.append((x, y))
@@ -1268,6 +1318,12 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             if self.post_distance_mode:
                 self.post_distance_pts.append((x, y))
                 self.post_distance_pts = self.post_distance_pts[-2:]
+                dist_txt = '-'
+                if len(self.post_distance_pts) == 2:
+                    dx = self.post_distance_pts[1][0] - self.post_distance_pts[0][0]
+                    dy = self.post_distance_pts[1][1] - self.post_distance_pts[0][1]
+                    dist_txt = f'{(dx*dx+dy*dy)**0.5:.2f}px'
+                self.post_xy_lbl.setText(f'XY: {x},{y}   Dist: {dist_txt}   Frame: {self.post_frame_idx}')
             self.render_post()
 
         def _post_mouse_move(self, e: QMouseEvent):
@@ -1314,8 +1370,71 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             return btns[self.target_idx]
 
         def _set_mode(self, m):
+            if not self.roi_selection_active and m in ('rect', 'circle', 'poly'):
+                self.status.setText('Click Start ROI Selection first.')
+                return
+            if not self.patch_selection_active and m in ('patch_plastic', 'patch_print'):
+                self.status.setText('Click Start Patch Selection first.')
+                return
             self.mode = m
             self.status.setText(f'Target {self._target()} | mode={m}')
+
+        def keyPressEvent(self, event):
+            if event.key() == Qt.Key.Key_Backspace and self.roi_selection_active and self.mode == 'poly' and self.poly_pts:
+                self.poly_pts.pop()
+                self.status.setText(f'{self._target()} polygon point removed')
+                self.render_pre()
+                return
+            super().keyPressEvent(event)
+
+        def _start_roi_selection(self):
+            if self.frame0 is None:
+                self.status.setText('Load video first.')
+                return
+            self.roi_selection_active = True
+            self.roi_locked = False
+            self.patch_selection_active = False
+            self.btn_roi_lock.setText('End/Save ROIs')
+            self.status.setText('ROI selection started. Draw ROI and use ROI Next.')
+
+        def _start_patch_selection(self):
+            if not self.roi_locked:
+                self.status.setText('Save/Lock ROIs before patch selection.')
+                return
+            btns = self._buttons()
+            missing = [b for b in btns if b not in self.rois]
+            if missing:
+                self.status.setText('Missing ROI: ' + ', '.join(missing))
+                return
+            self.patch_sequence = []
+            for b in btns:
+                self.patch_sequence.append((b, 'plastic'))
+                self.patch_sequence.append((b, 'print'))
+            self.patch_step_idx = 0
+            self.patch_selection_active = True
+            self._apply_patch_step()
+
+        def _end_patch_selection(self):
+            self.patch_selection_active = False
+            self.patch_step_lbl.setText('Patch step: inactive')
+            self.status.setText('Patch selection ended/saved.')
+
+        def _step_patch(self, delta: int):
+            if not self.patch_selection_active or not self.patch_sequence:
+                return
+            self.patch_step_idx = int(np.clip(self.patch_step_idx + delta, 0, len(self.patch_sequence) - 1))
+            self._apply_patch_step()
+
+        def _apply_patch_step(self):
+            if not self.patch_selection_active or not self.patch_sequence:
+                return
+            btn, kind = self.patch_sequence[self.patch_step_idx]
+            btns = self._buttons()
+            if btn in btns:
+                self.target_idx = btns.index(btn)
+            self.mode = 'patch_plastic' if kind == 'plastic' else 'patch_print'
+            self.patch_step_lbl.setText(f'Patch step {self.patch_step_idx + 1}/{len(self.patch_sequence)}: {btn} {kind}')
+            self.status.setText(f'Select {kind} patch for {btn}. Use Patch Prev/Next to edit.')
 
         def _browse_video(self):
             path, _ = QFileDialog.getOpenFileName(self, 'Select inspection video', '', 'Video files (*.mp4 *.avi *.mov *.mkv);;All files (*.*)')
@@ -1376,6 +1495,9 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             return True
 
         def _next(self):
+            if not self.roi_selection_active:
+                self.status.setText('Start ROI Selection first.')
+                return
             btns = self._buttons()
             if not btns:
                 return
@@ -1387,6 +1509,15 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.render_pre()
 
         def _lock_all(self):
+            if not self.roi_selection_active and not self.roi_locked:
+                self.status.setText('Start ROI Selection first.')
+                return
+            if self.roi_locked:
+                self.roi_locked = False
+                self.roi_selection_active = True
+                self.btn_roi_lock.setText('End/Save ROIs')
+                self.status.setText('ROIs unlocked for editing.')
+                return
             if self.working and self._is_valid(self.working):
                 self._commit()
             missing = [b for b in self._buttons() if b not in self.rois]
@@ -1394,9 +1525,15 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
                 self.status.setText('Missing ROI: ' + ','.join(missing))
                 self.render_pre()
                 return
-            self.status.setText('ROIs locked. Pick plastic/print patches per button.')
+            self.roi_locked = True
+            self.roi_selection_active = False
+            self.btn_roi_lock.setText('Unlock ROIs')
+            self.status.setText('ROIs locked. Start Patch Selection to guide patch capture.')
 
         def _pick_patch(self, x0, y0, x1, y1):
+            if not self.patch_selection_active:
+                self.status.setText('Start Patch Selection first.')
+                return
             if self.frame0 is None:
                 return
             rx, ry = min(x0, x1), min(y0, y1)
@@ -1427,6 +1564,9 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.patches.setdefault(btn, {'plastic':None,'print':None})[kind] = mean_lab
             self._update_swatch(btn)
             self.status.setText(f'{btn}: {kind} patch captured.')
+            if self.patch_selection_active and self.patch_step_idx < len(self.patch_sequence) - 1:
+                self.patch_step_idx += 1
+                self._apply_patch_step()
 
         def _update_swatch(self, b):
             s1, s2, txt = self.swatch_rows[b]
