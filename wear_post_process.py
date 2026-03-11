@@ -942,6 +942,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.canvas.setFrameStyle(QFrame.Shape.Box)
             self.canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.canvas.setMinimumSize(1280, 720)
+            self.canvas.setMouseTracking(True)
             self.canvas.mousePressEvent = self._pre_mouse_press
             self.canvas.mouseMoveEvent = self._pre_mouse_move
             self.canvas.mouseReleaseEvent = self._pre_mouse_release
@@ -1047,6 +1048,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.post_canvas.setFrameStyle(QFrame.Shape.Box)
             self.post_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.post_canvas.setMinimumSize(1280, 720)
+            self.post_canvas.setMouseTracking(True)
             self.post_canvas.mousePressEvent = self._post_mouse_press
             self.post_canvas.mouseMoveEvent = self._post_mouse_move
             self.post_canvas.mouseReleaseEvent = self._post_mouse_release
