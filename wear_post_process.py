@@ -772,6 +772,7 @@ def run(config: WearConfig, preselected_rois: Optional[Dict[str, object]] = None
 
         rec = {"frame_idx": frame_idx, "time_s": frame_idx / float(max(fps, 1e-6))}
         overlay = frame.copy()
+        table_rows = []
 
         for btn in config.buttons:
             c = calib[btn]
@@ -795,17 +796,36 @@ def run(config: WearConfig, preselected_rois: Optional[Dict[str, object]] = None
             rec[f"delta_pct_{btn}"] = round(delta_pct, 4)
             rec[f"abs_delta_pct_{btn}"] = round(abs_delta_pct, 4)
             rec[f"wear_{btn}"] = verdict
+            table_rows.append((btn, nnz, delta_pct, verdict))
 
             _draw_roi(overlay, c.roi, color=(255, 220, 0), label=btn, thick=2)
-            cv2.putText(
-                overlay,
-                f"{btn} nnz={nnz} Δ={delta_pct:+.1f}% {verdict}",
-                (x + 4, max(16, y - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 255) if verdict == "PASS" else (0, 0, 255),
-                2,
-            )
+
+        # Tabulate per-ROI metrics in top-left to avoid crowding near ROIs.
+        panel_x, panel_y = 16, 16
+        col_w = [70, 90, 100, 90]  # ROI, nnz, Wear %, Result
+        row_h = 24
+        table_w = sum(col_w) + 20
+        table_h = row_h * (len(table_rows) + 2) + 8
+        bg = overlay.copy()
+        cv2.rectangle(bg, (panel_x, panel_y), (panel_x + table_w, panel_y + table_h), (20, 20, 20), -1)
+        cv2.addWeighted(bg, 0.55, overlay, 0.45, 0, overlay)
+        cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + table_w, panel_y + table_h), (180, 180, 180), 1)
+
+        headers = ["ROI", "nnz", "Wear %", "Result"]
+        x = panel_x + 10
+        for i, htxt in enumerate(headers):
+            cv2.putText(overlay, htxt, (x, panel_y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (240, 240, 240), 1)
+            x += col_w[i]
+        cv2.line(overlay, (panel_x + 6, panel_y + row_h), (panel_x + table_w - 6, panel_y + row_h), (120, 120, 120), 1)
+
+        for ridx, (btn, nnz, delta_pct, verdict) in enumerate(table_rows, start=1):
+            y = panel_y + row_h * (ridx + 0) + 18
+            color = (180, 255, 180) if verdict == "PASS" else (120, 120, 255)
+            x = panel_x + 10
+            vals = [str(btn), str(nnz), f"{delta_pct:+.1f}", verdict]
+            for cidx, txt in enumerate(vals):
+                cv2.putText(overlay, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color if cidx == 3 else (230, 230, 230), 1)
+                x += col_w[cidx]
 
         rows.append(rec)
         if writer is not None:
@@ -901,6 +921,8 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.patch_selection_active = False
             self.patch_sequence: List[tuple[str, str]] = []
             self.patch_step_idx = 0
+            self.roi_line_thickness = 2
+            self.poly_point_radius = 5
 
             # post viewer state
             self.post_cap = None
@@ -970,6 +992,17 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.btn_pre_zoom_out.clicked.connect(lambda: self._pre_zoom_by(1/1.2))
             self.btn_pre_aspect.clicked.connect(self._pre_toggle_aspect)
             self.btn_pre_distance.clicked.connect(self._pre_toggle_distance)
+
+            vrow = QHBoxLayout()
+            vrow.addWidget(QLabel('ROI Line'))
+            self.roi_line_spin = QSpinBox(); self.roi_line_spin.setRange(1, 12); self.roi_line_spin.setValue(self.roi_line_thickness)
+            vrow.addWidget(self.roi_line_spin)
+            vrow.addWidget(QLabel('Poly Dot'))
+            self.poly_dot_spin = QSpinBox(); self.poly_dot_spin.setRange(1, 30); self.poly_dot_spin.setValue(self.poly_point_radius)
+            vrow.addWidget(self.poly_dot_spin)
+            left.addLayout(vrow)
+            self.roi_line_spin.valueChanged.connect(lambda v: self._set_roi_visuals(v, None))
+            self.poly_dot_spin.valueChanged.connect(lambda v: self._set_roi_visuals(None, v))
 
             right.addWidget(QLabel('Video file'))
             rv = QHBoxLayout(); self.video_edit = QLineEdit(str(self.video_path) if self.video_path else ''); b = QPushButton('Browse'); rv.addWidget(self.video_edit); rv.addWidget(b); right.addLayout(rv)
@@ -1150,6 +1183,13 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.btn_pre_distance.setText('Distance: ON' if self.pre_distance_mode else 'Distance: OFF')
             self.render_pre()
 
+        def _set_roi_visuals(self, line_thick: Optional[int], point_radius: Optional[int]):
+            if line_thick is not None:
+                self.roi_line_thickness = int(line_thick)
+            if point_radius is not None:
+                self.poly_point_radius = int(point_radius)
+            self.render_pre()
+
         def _pre_mouse_press(self, e: QMouseEvent):
             if self.frame0 is None or e.button() != Qt.MouseButton.LeftButton:
                 return
@@ -1213,23 +1253,23 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
                 return None
             canvas = self.frame0.copy()
             for b, r in self.rois.items():
-                _draw_roi(canvas, r, color=(80,220,120), label=b, thick=2)
+                _draw_roi(canvas, r, color=(80,220,120), label=b, thick=self.roi_line_thickness)
             if self.mode == 'poly' and self.poly_pts:
                 for i, p in enumerate(self.poly_pts):
-                    cv2.circle(canvas, p, 5, (0,215,255), -1)
+                    cv2.circle(canvas, p, self.poly_point_radius, (0,215,255), -1)
                     if i > 0:
-                        cv2.line(canvas, self.poly_pts[i-1], p, (0,215,255), 2)
+                        cv2.line(canvas, self.poly_pts[i-1], p, (0,215,255), self.roi_line_thickness)
             elif self.working is not None and self.mode in ('rect','circle','poly'):
-                _draw_roi(canvas, self.working, color=(0,215,255), label=f'{self._target()}*', thick=2)
+                _draw_roi(canvas, self.working, color=(0,215,255), label=f'{self._target()}*', thick=self.roi_line_thickness)
             if self.pre_mouse_down and self.pre_mouse_drag and self.mode in ('rect','circle','patch_plastic','patch_print'):
                 x0, y0 = self.pre_mouse_down
                 x1, y1 = self.pre_mouse_drag
                 if self.mode in ('rect','patch_plastic','patch_print'):
-                    cv2.rectangle(canvas, (x0,y0), (x1,y1), (0,215,255), 2)
+                    cv2.rectangle(canvas, (x0,y0), (x1,y1), (0,215,255), self.roi_line_thickness)
                 else:
                     cx, cy = int((x0+x1)/2), int((y0+y1)/2)
                     r = int(max(abs(x1-x0), abs(y1-y0))/2)
-                    cv2.circle(canvas, (cx,cy), r, (0,215,255), 2)
+                    cv2.circle(canvas, (cx,cy), r, (0,215,255), self.roi_line_thickness)
             if len(self.pre_distance_pts) == 2:
                 p0, p1 = self.pre_distance_pts
                 cv2.line(canvas, p0, p1, (255,0,255), 2)
