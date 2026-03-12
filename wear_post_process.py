@@ -877,7 +877,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
         from PyQt6.QtWidgets import (
             QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
             QFileDialog, QDoubleSpinBox, QSpinBox, QCheckBox, QMessageBox, QTabWidget,
-            QFrame, QSlider
+            QFrame, QSlider, QComboBox
         )
     except Exception:
         return None
@@ -1030,6 +1030,16 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             roi_flow.addWidget(self.btn_roi_lock)
             right.addLayout(roi_flow)
 
+            roi_edit = QHBoxLayout()
+            self.roi_select_combo = QComboBox(); self.roi_select_combo.setMinimumWidth(90)
+            self.btn_roi_delete = QPushButton('Delete ROI')
+            self.btn_roi_redraw = QPushButton('Redraw ROI')
+            roi_edit.addWidget(QLabel('ROI'))
+            roi_edit.addWidget(self.roi_select_combo)
+            roi_edit.addWidget(self.btn_roi_delete)
+            roi_edit.addWidget(self.btn_roi_redraw)
+            right.addLayout(roi_edit)
+
             m1 = QHBoxLayout()
             for txt, mode in [('Rectangle','rect'),('Circle','circle'),('Polygon','poly')]:
                 btn = QPushButton(txt); btn.clicked.connect(lambda _=False, m=mode: self._set_mode(m)); m1.addWidget(btn)
@@ -1072,6 +1082,8 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.btn_patch_end.clicked.connect(self._end_patch_selection)
             self.btn_patch_prev.clicked.connect(lambda: self._step_patch(-1))
             self.btn_patch_next.clicked.connect(lambda: self._step_patch(1))
+            self.btn_roi_delete.clicked.connect(self._delete_selected_roi)
+            self.btn_roi_redraw.clicked.connect(self._redraw_selected_roi)
             self.button_count.valueChanged.connect(lambda _v: self._sync_button_state_ui())
             self.buttons_edit.editingFinished.connect(self._sync_button_state_ui)
 
@@ -1560,6 +1572,67 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
                     self.swatch_rows[bname] = (s1, s2, txt)
                     self._update_swatch(bname)
 
+            if hasattr(self, 'roi_select_combo'):
+                current = self.roi_select_combo.currentText().strip()
+                self.roi_select_combo.blockSignals(True)
+                self.roi_select_combo.clear()
+                self.roi_select_combo.addItems(btns)
+                if current in btns:
+                    self.roi_select_combo.setCurrentText(current)
+                self.roi_select_combo.blockSignals(False)
+
+        def _invalidate_roi_and_patches(self, btn: str):
+            if btn in self.rois:
+                self.rois.pop(btn, None)
+            self.patches[btn] = {'plastic': None, 'print': None}
+            if btn in self.swatch_rows:
+                self._update_swatch(btn)
+            if self.patch_selection_active and self.patch_sequence:
+                for idx, (b, _kind) in enumerate(self.patch_sequence):
+                    if b == btn:
+                        self.patch_step_idx = idx
+                        self._apply_patch_step()
+                        break
+
+        def _selected_roi_label(self) -> str:
+            t = self.roi_select_combo.currentText().strip() if hasattr(self, 'roi_select_combo') else ''
+            if t:
+                return t
+            return self._target()
+
+        def _delete_selected_roi(self):
+            btn = self._selected_roi_label()
+            if not btn:
+                return
+            self._invalidate_roi_and_patches(btn)
+            self.roi_locked = False
+            self.roi_selection_active = True
+            self.btn_roi_lock.setText('End/Save ROIs')
+            btns = self._buttons()
+            if btn in btns:
+                self.target_idx = btns.index(btn)
+            self.working = None
+            self.poly_pts = []
+            self.status.setText(f'{btn} ROI deleted. Redraw ROI and re-capture patches for {btn}.')
+            self.render_pre()
+
+        def _redraw_selected_roi(self):
+            btn = self._selected_roi_label()
+            if not btn:
+                return
+            self._invalidate_roi_and_patches(btn)
+            self.roi_locked = False
+            self.roi_selection_active = True
+            self.btn_roi_lock.setText('End/Save ROIs')
+            btns = self._buttons()
+            if btn in btns:
+                self.target_idx = btns.index(btn)
+            self.mode = 'rect'
+            self.working = None
+            self.poly_pts = []
+            self.status.setText(f'Redraw ROI for {btn} now. Patches for {btn} were cleared.')
+            self.render_pre()
+
         def _target(self):
             self._sync_button_state_ui()
             btns = self._buttons()
@@ -1804,19 +1877,16 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.pre_xy_lbl.setText('XY: -,-   Dist: -')
             self.patch_step_lbl.setText('Patch step: inactive')
             self.btn_roi_lock.setText('End/Save ROIs')
-            self.status.setText('Reset complete. Select video/output and click Start ROI Selection.')
-            # clear selected pre-process inputs and image
-            self.video_edit.setText('')
-            self.out_edit.setText('')
-            self.video_path = None
-            self.frame0 = None
-            self.canvas.setPixmap(QPixmap())
-            self.canvas.setText('Load a video to begin')
+            self.status.setText('Reset complete. Click Start ROI Selection to redraw ROIs.')
 
             # clear patch values and swatches
             for b in list(self.patches.keys()):
                 self.patches[b] = {'plastic': None, 'print': None}
             self._sync_button_state_ui()
+            self.working = None
+            self.poly_pts = []
+            if self.frame0 is not None:
+                self.render_pre()
 
             # clear post-process artifacts and viewer state
             if self.post_cap is not None:
