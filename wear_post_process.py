@@ -807,14 +807,14 @@ def run(config: WearConfig, preselected_rois: Optional[Dict[str, object]] = None
         table_w = sum(col_w) + 20
         table_h = row_h * (len(table_rows) + 2) + 8
         bg = overlay.copy()
-        cv2.rectangle(bg, (panel_x, panel_y), (panel_x + table_w, panel_y + table_h), (20, 20, 20), -1)
-        cv2.addWeighted(bg, 0.55, overlay, 0.45, 0, overlay)
+        cv2.rectangle(bg, (panel_x, panel_y), (panel_x + table_w, panel_y + table_h), (5, 5, 5), -1)
+        cv2.addWeighted(bg, 0.75, overlay, 0.25, 0, overlay)
         cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + table_w, panel_y + table_h), (180, 180, 180), 1)
 
         headers = ["ROI", "nnz", "Wear %", "Result"]
         x = panel_x + 10
         for i, htxt in enumerate(headers):
-            cv2.putText(overlay, htxt, (x, panel_y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (240, 240, 240), 1)
+            cv2.putText(overlay, htxt, (x, panel_y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (245, 245, 245), 2)
             x += col_w[i]
         cv2.line(overlay, (panel_x + 6, panel_y + row_h), (panel_x + table_w - 6, panel_y + row_h), (120, 120, 120), 1)
 
@@ -824,7 +824,7 @@ def run(config: WearConfig, preselected_rois: Optional[Dict[str, object]] = None
             x = panel_x + 10
             vals = [str(btn), str(nnz), f"{delta_pct:+.1f}", verdict]
             for cidx, txt in enumerate(vals):
-                cv2.putText(overlay, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color if cidx == 3 else (230, 230, 230), 1)
+                cv2.putText(overlay, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color if cidx == 3 else (240, 240, 240), 2)
                 x += col_w[cidx]
 
         rows.append(rec)
@@ -903,6 +903,10 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.pre_zoom = 1.0
             self.pre_fit_to_view = True
             self.pre_lock_aspect = True
+            self.pre_pan_mode = False
+            self.pre_pan_x = 0
+            self.pre_pan_y = 0
+            self.pre_pan_anchor: Optional[tuple[int, int, int, int]] = None
             self.pre_mouse_down: Optional[tuple[int, int]] = None
             self.pre_mouse_drag: Optional[tuple[int, int]] = None
             self.pre_distance_mode = False
@@ -932,6 +936,10 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.post_zoom = 1.0
             self.post_fit_to_view = True
             self.post_lock_aspect = True
+            self.post_pan_mode = False
+            self.post_pan_x = 0
+            self.post_pan_y = 0
+            self.post_pan_anchor: Optional[tuple[int, int, int, int]] = None
             self.post_mouse_down: Optional[tuple[int, int]] = None
             self.post_mouse_drag: Optional[tuple[int, int]] = None
             self.post_distance_mode = False
@@ -939,6 +947,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.post_last_xy: Optional[tuple[int, int]] = None
 
             self.output_paths: Dict[str, str] = {}
+            self._view_state: Dict[int, Dict[str, int]] = {}
 
             root = QVBoxLayout(self)
             self.tabs = QTabWidget()
@@ -976,8 +985,9 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.btn_pre_zoom_in = QPushButton('Zoom +')
             self.btn_pre_zoom_out = QPushButton('Zoom -')
             self.btn_pre_aspect = QPushButton('Lock Aspect: ON')
+            self.btn_pre_pan = QPushButton('Pan: OFF')
             self.btn_pre_distance = QPushButton('Distance: OFF')
-            for b in [self.btn_pre_fit, self.btn_pre_1x, self.btn_pre_zoom_in, self.btn_pre_zoom_out, self.btn_pre_aspect, self.btn_pre_distance]:
+            for b in [self.btn_pre_fit, self.btn_pre_1x, self.btn_pre_zoom_in, self.btn_pre_zoom_out, self.btn_pre_aspect, self.btn_pre_pan, self.btn_pre_distance]:
                 tools.addWidget(b)
             left.addLayout(tools)
 
@@ -991,18 +1001,8 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.btn_pre_zoom_in.clicked.connect(lambda: self._pre_zoom_by(1.2))
             self.btn_pre_zoom_out.clicked.connect(lambda: self._pre_zoom_by(1/1.2))
             self.btn_pre_aspect.clicked.connect(self._pre_toggle_aspect)
+            self.btn_pre_pan.clicked.connect(self._pre_toggle_pan)
             self.btn_pre_distance.clicked.connect(self._pre_toggle_distance)
-
-            vrow = QHBoxLayout()
-            vrow.addWidget(QLabel('ROI Line'))
-            self.roi_line_spin = QSpinBox(); self.roi_line_spin.setRange(1, 12); self.roi_line_spin.setValue(self.roi_line_thickness)
-            vrow.addWidget(self.roi_line_spin)
-            vrow.addWidget(QLabel('Poly Dot'))
-            self.poly_dot_spin = QSpinBox(); self.poly_dot_spin.setRange(1, 30); self.poly_dot_spin.setValue(self.poly_point_radius)
-            vrow.addWidget(self.poly_dot_spin)
-            left.addLayout(vrow)
-            self.roi_line_spin.valueChanged.connect(lambda v: self._set_roi_visuals(v, None))
-            self.poly_dot_spin.valueChanged.connect(lambda v: self._set_roi_visuals(None, v))
 
             right.addWidget(QLabel('Video file'))
             rv = QHBoxLayout(); self.video_edit = QLineEdit(str(self.video_path) if self.video_path else ''); b = QPushButton('Browse'); rv.addWidget(self.video_edit); rv.addWidget(b); right.addLayout(rv)
@@ -1034,6 +1034,19 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             for txt, mode in [('Rectangle','rect'),('Circle','circle'),('Polygon','poly')]:
                 btn = QPushButton(txt); btn.clicked.connect(lambda _=False, m=mode: self._set_mode(m)); m1.addWidget(btn)
             right.addLayout(m1)
+
+            vis_row = QHBoxLayout()
+            vis_row.addWidget(QLabel('ROI Line'))
+            self.roi_line_spin = QSpinBox(); self.roi_line_spin.setRange(1, 12); self.roi_line_spin.setValue(self.roi_line_thickness); self.roi_line_spin.setFixedWidth(52)
+            vis_row.addWidget(self.roi_line_spin)
+            vis_row.addWidget(QLabel('Poly Dot'))
+            self.poly_dot_spin = QSpinBox(); self.poly_dot_spin.setRange(1, 30); self.poly_dot_spin.setValue(self.poly_point_radius); self.poly_dot_spin.setFixedWidth(52)
+            vis_row.addWidget(self.poly_dot_spin)
+            vis_row.addStretch(1)
+            right.addLayout(vis_row)
+            self.roi_line_spin.valueChanged.connect(lambda v: self._set_roi_visuals(v, None))
+            self.poly_dot_spin.valueChanged.connect(lambda v: self._set_roi_visuals(None, v))
+
             m2 = QHBoxLayout(); bn = QPushButton('Finalize Poly'); bn.clicked.connect(self._finalize_poly); m2.addWidget(bn); bx = QPushButton('ROI Next'); bx.clicked.connect(self._next); m2.addWidget(bx); right.addLayout(m2)
 
             right.addWidget(QLabel('Patch Selection'))
@@ -1093,8 +1106,9 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.btn_post_zoom_in = QPushButton('Zoom +')
             self.btn_post_zoom_out = QPushButton('Zoom -')
             self.btn_post_aspect = QPushButton('Lock Aspect: ON')
+            self.btn_post_pan = QPushButton('Pan: OFF')
             self.btn_post_distance = QPushButton('Distance: OFF')
-            for b in [self.btn_post_fit, self.btn_post_1x, self.btn_post_zoom_in, self.btn_post_zoom_out, self.btn_post_aspect, self.btn_post_distance]:
+            for b in [self.btn_post_fit, self.btn_post_1x, self.btn_post_zoom_in, self.btn_post_zoom_out, self.btn_post_aspect, self.btn_post_pan, self.btn_post_distance]:
                 ptools.addWidget(b)
             post.addLayout(ptools)
 
@@ -1103,6 +1117,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.btn_post_zoom_in.clicked.connect(lambda: self._post_zoom_by(1.2))
             self.btn_post_zoom_out.clicked.connect(lambda: self._post_zoom_by(1/1.2))
             self.btn_post_aspect.clicked.connect(self._post_toggle_aspect)
+            self.btn_post_pan.clicked.connect(self._post_toggle_pan)
             self.btn_post_distance.clicked.connect(self._post_toggle_distance)
 
             nav = QHBoxLayout()
@@ -1123,8 +1138,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             post.addWidget(self.post_preview)
 
         # ---------- shared viewer helpers ----------
-        def _display_with_view(self, frame: np.ndarray, canvas_label: QLabel, zoom: float, fit_to_view: bool, lock_aspect: bool):
-            pix = to_qpix_bgr(frame)
+        def _display_with_view(self, frame: np.ndarray, canvas_label: QLabel, zoom: float, fit_to_view: bool, lock_aspect: bool, pan_x: int = 0, pan_y: int = 0):
             fw, fh = frame.shape[1], frame.shape[0]
             avail_w = max(16, canvas_label.width() - 8)
             avail_h = max(16, canvas_label.height() - 8)
@@ -1135,23 +1149,50 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
                 scale = max(0.05, scale * zoom)
             else:
                 scale = max(0.05, zoom)
-            if lock_aspect:
-                out = pix.scaled(int(fw * scale), int(fh * scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+            sw = max(1, int(round(fw * scale)))
+            sh = max(1, int(round(fh * scale)))
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            scaled = cv2.resize(frame, (sw, sh), interpolation=interp)
+
+            crop_x = int(np.clip(pan_x, 0, max(0, sw - avail_w)))
+            crop_y = int(np.clip(pan_y, 0, max(0, sh - avail_h)))
+            if sw > avail_w or sh > avail_h:
+                x1 = min(sw, crop_x + avail_w)
+                y1 = min(sh, crop_y + avail_h)
+                view = scaled[crop_y:y1, crop_x:x1]
             else:
-                out = pix.scaled(int(fw * scale), int(fh * scale), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                crop_x = 0
+                crop_y = 0
+                view = scaled
+
+            out = to_qpix_bgr(view)
             canvas_label.setPixmap(out)
+            self._view_state[id(canvas_label)] = {
+                "scale": scale,
+                "crop_x": crop_x,
+                "crop_y": crop_y,
+                "view_w": out.width(),
+                "view_h": out.height(),
+            }
             return scale, out.width(), out.height()
 
         def _mouse_to_frame(self, label: QLabel, frame: np.ndarray, ex: int, ey: int):
             pix = label.pixmap()
             if pix is None:
                 return 0, 0
+            view = self._view_state.get(id(label), {})
+            scale = float(view.get("scale", 1.0))
+            crop_x = int(view.get("crop_x", 0))
+            crop_y = int(view.get("crop_y", 0))
             ox = (label.width() - pix.width()) // 2
             oy = (label.height() - pix.height()) // 2
             px = int(np.clip(ex - ox, 0, max(0, pix.width()-1)))
             py = int(np.clip(ey - oy, 0, max(0, pix.height()-1)))
-            fx = int(px * frame.shape[1] / float(max(1, pix.width())))
-            fy = int(py * frame.shape[0] / float(max(1, pix.height())))
+            sx = crop_x + px
+            sy = crop_y + py
+            fx = int(sx / max(1e-6, scale))
+            fy = int(sy / max(1e-6, scale))
             fx = int(np.clip(fx, 0, frame.shape[1]-1))
             fy = int(np.clip(fy, 0, frame.shape[0]-1))
             return fx, fy
@@ -1160,11 +1201,15 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
         def _pre_fit(self):
             self.pre_fit_to_view = True
             self.pre_zoom = 1.0
+            self.pre_pan_x = 0
+            self.pre_pan_y = 0
             self.render_pre()
 
         def _pre_1x(self):
             self.pre_fit_to_view = False
             self.pre_zoom = 1.0
+            self.pre_pan_x = 0
+            self.pre_pan_y = 0
             self.render_pre()
 
         def _pre_zoom_by(self, mult: float):
@@ -1177,10 +1222,23 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.btn_pre_aspect.setText('Lock Aspect: ON' if self.pre_lock_aspect else 'Lock Aspect: OFF')
             self.render_pre()
 
+        def _pre_toggle_pan(self):
+            self.pre_pan_mode = not self.pre_pan_mode
+            self.pre_pan_anchor = None
+            self.btn_pre_pan.setText('Pan: ON' if self.pre_pan_mode else 'Pan: OFF')
+            if self.pre_pan_mode:
+                self.pre_distance_mode = False
+                self.btn_pre_distance.setText('Distance: OFF')
+            self.render_pre()
+
         def _pre_toggle_distance(self):
             self.pre_distance_mode = not self.pre_distance_mode
             self.pre_distance_pts = []
             self.btn_pre_distance.setText('Distance: ON' if self.pre_distance_mode else 'Distance: OFF')
+            if self.pre_distance_mode:
+                self.pre_pan_mode = False
+                self.pre_pan_anchor = None
+                self.btn_pre_pan.setText('Pan: OFF')
             self.render_pre()
 
         def _set_roi_visuals(self, line_thick: Optional[int], point_radius: Optional[int]):
@@ -1195,6 +1253,10 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
                 return
             self.setFocus()
             x, y = self._mouse_to_frame(self.canvas, self.frame0, int(e.position().x()), int(e.position().y()))
+            if self.pre_pan_mode:
+                self.pre_pan_anchor = (int(e.position().x()), int(e.position().y()), int(self.pre_pan_x), int(self.pre_pan_y))
+                self.pre_xy_lbl.setText(f'XY: {x},{y}   Dist: -')
+                return
             self.pre_mouse_down = (x, y)
             self.pre_mouse_drag = (x, y)
             if self.pre_distance_mode:
@@ -1227,11 +1289,22 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
                 dy = self.pre_distance_pts[1][1] - self.pre_distance_pts[0][1]
                 dist_txt = f'{(dx*dx+dy*dy)**0.5:.2f}px'
             self.pre_xy_lbl.setText(f'XY: {x},{y}   Dist: {dist_txt}')
+            if self.pre_pan_mode and self.pre_pan_anchor is not None:
+                ax, ay, px0, py0 = self.pre_pan_anchor
+                dx = int(e.position().x()) - ax
+                dy = int(e.position().y()) - ay
+                self.pre_pan_x = px0 - dx
+                self.pre_pan_y = py0 - dy
+                self.render_pre()
+                return
             if self.pre_mouse_down is not None and not self.pre_distance_mode:
                 self.pre_mouse_drag = (x, y)
                 self.render_pre()
 
         def _pre_mouse_release(self, e: QMouseEvent):
+            if self.pre_pan_mode:
+                self.pre_pan_anchor = None
+                return
             if self.frame0 is None or self.pre_mouse_down is None or self.pre_distance_mode:
                 self.pre_mouse_down = None
                 self.pre_mouse_drag = None
@@ -1281,17 +1354,24 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             img = self._render_pre_frame()
             if img is None:
                 return
-            self._display_with_view(img, self.canvas, self.pre_zoom, self.pre_fit_to_view, self.pre_lock_aspect)
+            _, vw, vh = self._display_with_view(img, self.canvas, self.pre_zoom, self.pre_fit_to_view, self.pre_lock_aspect, self.pre_pan_x, self.pre_pan_y)
+            view = self._view_state.get(id(self.canvas), {})
+            self.pre_pan_x = int(view.get('crop_x', 0))
+            self.pre_pan_y = int(view.get('crop_y', 0))
 
         # ---------- post tab handlers ----------
         def _post_fit(self):
             self.post_fit_to_view = True
             self.post_zoom = 1.0
+            self.post_pan_x = 0
+            self.post_pan_y = 0
             self.render_post()
 
         def _post_1x(self):
             self.post_fit_to_view = False
             self.post_zoom = 1.0
+            self.post_pan_x = 0
+            self.post_pan_y = 0
             self.render_post()
 
         def _post_zoom_by(self, mult: float):
@@ -1304,10 +1384,23 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.btn_post_aspect.setText('Lock Aspect: ON' if self.post_lock_aspect else 'Lock Aspect: OFF')
             self.render_post()
 
+        def _post_toggle_pan(self):
+            self.post_pan_mode = not self.post_pan_mode
+            self.post_pan_anchor = None
+            self.btn_post_pan.setText('Pan: ON' if self.post_pan_mode else 'Pan: OFF')
+            if self.post_pan_mode:
+                self.post_distance_mode = False
+                self.btn_post_distance.setText('Distance: OFF')
+            self.render_post()
+
         def _post_toggle_distance(self):
             self.post_distance_mode = not self.post_distance_mode
             self.post_distance_pts = []
             self.btn_post_distance.setText('Distance: ON' if self.post_distance_mode else 'Distance: OFF')
+            if self.post_distance_mode:
+                self.post_pan_mode = False
+                self.post_pan_anchor = None
+                self.btn_post_pan.setText('Pan: OFF')
             self.render_post()
 
         def _post_load_video(self):
@@ -1352,6 +1445,10 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             if self.post_current_frame is None or e.button() != Qt.MouseButton.LeftButton:
                 return
             x, y = self._mouse_to_frame(self.post_canvas, self.post_current_frame, int(e.position().x()), int(e.position().y()))
+            if self.post_pan_mode:
+                self.post_pan_anchor = (int(e.position().x()), int(e.position().y()), int(self.post_pan_x), int(self.post_pan_y))
+                self.post_xy_lbl.setText(f'XY: {x},{y}   Dist: -   Frame: {self.post_frame_idx}')
+                return
             self.post_mouse_down = (x, y)
             self.post_mouse_drag = (x, y)
             if self.post_distance_mode:
@@ -1376,11 +1473,22 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
                 dy = self.post_distance_pts[1][1] - self.post_distance_pts[0][1]
                 dist_txt = f'{(dx*dx+dy*dy)**0.5:.2f}px'
             self.post_xy_lbl.setText(f'XY: {x},{y}   Dist: {dist_txt}   Frame: {self.post_frame_idx}')
+            if self.post_pan_mode and self.post_pan_anchor is not None:
+                ax, ay, px0, py0 = self.post_pan_anchor
+                dx = int(e.position().x()) - ax
+                dy = int(e.position().y()) - ay
+                self.post_pan_x = px0 - dx
+                self.post_pan_y = py0 - dy
+                self.render_post()
+                return
             if self.post_mouse_down is not None and not self.post_distance_mode:
                 self.post_mouse_drag = (x, y)
                 self.render_post()
 
         def _post_mouse_release(self, _e: QMouseEvent):
+            if self.post_pan_mode:
+                self.post_pan_anchor = None
+                return
             self.post_mouse_down = None
             self.post_mouse_drag = None
 
@@ -1395,7 +1503,10 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
                 cv2.circle(img, p1, 4, (255,0,255), -1)
             if self.post_mouse_down and self.post_mouse_drag and self.post_distance_mode:
                 cv2.line(img, self.post_mouse_down, self.post_mouse_drag, (255,0,255), 1)
-            self._display_with_view(img, self.post_canvas, self.post_zoom, self.post_fit_to_view, self.post_lock_aspect)
+            self._display_with_view(img, self.post_canvas, self.post_zoom, self.post_fit_to_view, self.post_lock_aspect, self.post_pan_x, self.post_pan_y)
+            view = self._view_state.get(id(self.post_canvas), {})
+            self.post_pan_x = int(view.get('crop_x', 0))
+            self.post_pan_y = int(view.get('crop_y', 0))
 
         # ---------- existing workflow ----------
         def _buttons(self):
@@ -1685,6 +1796,11 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.pre_mouse_drag = None
             self.pre_distance_pts = []
             self.pre_last_xy = None
+            self.pre_pan_x = 0
+            self.pre_pan_y = 0
+            self.pre_pan_anchor = None
+            self.pre_pan_mode = False
+            self.btn_pre_pan.setText('Pan: OFF')
             self.pre_xy_lbl.setText('XY: -,-   Dist: -')
             self.patch_step_lbl.setText('Patch step: inactive')
             self.btn_roi_lock.setText('End/Save ROIs')
@@ -1713,6 +1829,11 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.post_mouse_drag = None
             self.post_distance_pts = []
             self.post_last_xy = None
+            self.post_pan_x = 0
+            self.post_pan_y = 0
+            self.post_pan_anchor = None
+            self.post_pan_mode = False
+            self.btn_post_pan.setText('Pan: OFF')
             self.post_xy_lbl.setText('XY: -,-   Dist: -')
             self.post_slider.blockSignals(True)
             self.post_slider.setMinimum(0)
