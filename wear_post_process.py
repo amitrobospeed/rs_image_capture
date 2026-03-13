@@ -1012,17 +1012,17 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             ro = QHBoxLayout(); self.out_edit = QLineEdit(str(initial.out_dir) if str(initial.out_dir) else ''); b2 = QPushButton('Browse'); ro.addWidget(self.out_edit); ro.addWidget(b2); right.addLayout(ro)
             b2.clicked.connect(self._browse_out)
 
+            n1 = QHBoxLayout(); n1.addWidget(QLabel('Print tol')); self.print_tol = QDoubleSpinBox(); self.print_tol.setRange(1,255); self.print_tol.setValue(float(initial.print_tol)); n1.addWidget(self.print_tol); n1.addWidget(QLabel('Plastic tol')); self.plastic_tol = QDoubleSpinBox(); self.plastic_tol.setRange(1,255); self.plastic_tol.setValue(float(initial.plastic_tol)); n1.addWidget(self.plastic_tol); right.addLayout(n1)
+            n2 = QHBoxLayout(); n2.addWidget(QLabel('Wear % (+/-)')); self.wear_thr = QDoubleSpinBox(); self.wear_thr.setRange(0,100); self.wear_thr.setValue(float(initial.wear_threshold_pct)); n2.addWidget(self.wear_thr); n2.addWidget(QLabel('Max frames')); self.max_frames = QSpinBox(); self.max_frames.setRange(0,10_000_000); self.max_frames.setValue(int(initial.max_frames)); n2.addWidget(self.max_frames); right.addLayout(n2)
+            self.save_overlay = QCheckBox('Save overlay video'); self.save_overlay.setChecked(bool(initial.save_overlay)); right.addWidget(self.save_overlay)
+
+            right.addWidget(QLabel('ROI Selection'))
             right.addWidget(QLabel('Number of ROIs to test (1-15)'))
             self.button_count = QSpinBox(); self.button_count.setRange(1, 15); self.button_count.setValue(max(1, min(15, len(initial.buttons) if initial.buttons else 4))); right.addWidget(self.button_count)
 
             right.addWidget(QLabel('ROI labels (comma-separated; e.g. 1,2,3 or A,B,C,D)'))
             self.buttons_edit = QLineEdit(','.join(initial.buttons)); right.addWidget(self.buttons_edit)
 
-            n1 = QHBoxLayout(); n1.addWidget(QLabel('Print tol')); self.print_tol = QDoubleSpinBox(); self.print_tol.setRange(1,255); self.print_tol.setValue(float(initial.print_tol)); n1.addWidget(self.print_tol); n1.addWidget(QLabel('Plastic tol')); self.plastic_tol = QDoubleSpinBox(); self.plastic_tol.setRange(1,255); self.plastic_tol.setValue(float(initial.plastic_tol)); n1.addWidget(self.plastic_tol); right.addLayout(n1)
-            n2 = QHBoxLayout(); n2.addWidget(QLabel('Wear % (+/-)')); self.wear_thr = QDoubleSpinBox(); self.wear_thr.setRange(0,100); self.wear_thr.setValue(float(initial.wear_threshold_pct)); n2.addWidget(self.wear_thr); n2.addWidget(QLabel('Max frames')); self.max_frames = QSpinBox(); self.max_frames.setRange(0,10_000_000); self.max_frames.setValue(int(initial.max_frames)); n2.addWidget(self.max_frames); right.addLayout(n2)
-            self.save_overlay = QCheckBox('Save overlay video'); self.save_overlay.setChecked(bool(initial.save_overlay)); right.addWidget(self.save_overlay)
-
-            right.addWidget(QLabel('ROI Selection'))
             roi_flow = QHBoxLayout()
             self.btn_roi_start = QPushButton('Start ROI Selection')
             self.roi_select_combo = QComboBox(); self.roi_select_combo.setMinimumWidth(90)
