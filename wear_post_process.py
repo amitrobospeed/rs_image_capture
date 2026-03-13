@@ -893,7 +893,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
     class MainWin(QWidget):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle('Print Wear Post-Process (PyQt6)')
+            self.setWindowTitle('Print wear detection')
             self.resize(1720, 980)
             self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
@@ -1012,10 +1012,10 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             ro = QHBoxLayout(); self.out_edit = QLineEdit(str(initial.out_dir) if str(initial.out_dir) else ''); b2 = QPushButton('Browse'); ro.addWidget(self.out_edit); ro.addWidget(b2); right.addLayout(ro)
             b2.clicked.connect(self._browse_out)
 
-            right.addWidget(QLabel('Number of buttons to test (1-15)'))
+            right.addWidget(QLabel('Number of ROIs to test (1-15)'))
             self.button_count = QSpinBox(); self.button_count.setRange(1, 15); self.button_count.setValue(max(1, min(15, len(initial.buttons) if initial.buttons else 4))); right.addWidget(self.button_count)
 
-            right.addWidget(QLabel('Button labels (comma-separated; e.g. 1,2,3 or A,B,C,D)'))
+            right.addWidget(QLabel('ROI labels (comma-separated; e.g. 1,2,3 or A,B,C,D)'))
             self.buttons_edit = QLineEdit(','.join(initial.buttons)); right.addWidget(self.buttons_edit)
 
             n1 = QHBoxLayout(); n1.addWidget(QLabel('Print tol')); self.print_tol = QDoubleSpinBox(); self.print_tol.setRange(1,255); self.print_tol.setValue(float(initial.print_tol)); n1.addWidget(self.print_tol); n1.addWidget(QLabel('Plastic tol')); self.plastic_tol = QDoubleSpinBox(); self.plastic_tol.setRange(1,255); self.plastic_tol.setValue(float(initial.plastic_tol)); n1.addWidget(self.plastic_tol); right.addLayout(n1)
@@ -1025,37 +1025,33 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             right.addWidget(QLabel('ROI Selection'))
             roi_flow = QHBoxLayout()
             self.btn_roi_start = QPushButton('Start ROI Selection')
-            self.btn_roi_lock = QPushButton('End/Save ROIs')
+            self.roi_select_combo = QComboBox(); self.roi_select_combo.setMinimumWidth(90)
+            self.btn_roi_lock = QPushButton('End/Save ROI')
             roi_flow.addWidget(self.btn_roi_start)
+            roi_flow.addWidget(QLabel('ROI'))
+            roi_flow.addWidget(self.roi_select_combo)
             roi_flow.addWidget(self.btn_roi_lock)
             right.addLayout(roi_flow)
 
             roi_edit = QHBoxLayout()
-            self.roi_select_combo = QComboBox(); self.roi_select_combo.setMinimumWidth(90)
+            roi_edit.addWidget(QLabel('ROI Line'))
+            self.roi_line_spin = QSpinBox(); self.roi_line_spin.setRange(1, 12); self.roi_line_spin.setValue(self.roi_line_thickness); self.roi_line_spin.setFixedWidth(52)
+            roi_edit.addWidget(self.roi_line_spin)
+            roi_edit.addWidget(QLabel('Poly Dot'))
+            self.poly_dot_spin = QSpinBox(); self.poly_dot_spin.setRange(1, 30); self.poly_dot_spin.setValue(self.poly_point_radius); self.poly_dot_spin.setFixedWidth(52)
+            roi_edit.addWidget(self.poly_dot_spin)
             self.btn_roi_delete = QPushButton('Delete ROI')
             self.btn_roi_redraw = QPushButton('Redraw ROI')
-            roi_edit.addWidget(QLabel('ROI'))
-            roi_edit.addWidget(self.roi_select_combo)
             roi_edit.addWidget(self.btn_roi_delete)
             roi_edit.addWidget(self.btn_roi_redraw)
             right.addLayout(roi_edit)
+            self.roi_line_spin.valueChanged.connect(lambda v: self._set_roi_visuals(v, None))
+            self.poly_dot_spin.valueChanged.connect(lambda v: self._set_roi_visuals(None, v))
 
             m1 = QHBoxLayout()
             for txt, mode in [('Rectangle','rect'),('Circle','circle'),('Polygon','poly')]:
                 btn = QPushButton(txt); btn.clicked.connect(lambda _=False, m=mode: self._set_mode(m)); m1.addWidget(btn)
             right.addLayout(m1)
-
-            vis_row = QHBoxLayout()
-            vis_row.addWidget(QLabel('ROI Line'))
-            self.roi_line_spin = QSpinBox(); self.roi_line_spin.setRange(1, 12); self.roi_line_spin.setValue(self.roi_line_thickness); self.roi_line_spin.setFixedWidth(52)
-            vis_row.addWidget(self.roi_line_spin)
-            vis_row.addWidget(QLabel('Poly Dot'))
-            self.poly_dot_spin = QSpinBox(); self.poly_dot_spin.setRange(1, 30); self.poly_dot_spin.setValue(self.poly_point_radius); self.poly_dot_spin.setFixedWidth(52)
-            vis_row.addWidget(self.poly_dot_spin)
-            vis_row.addStretch(1)
-            right.addLayout(vis_row)
-            self.roi_line_spin.valueChanged.connect(lambda v: self._set_roi_visuals(v, None))
-            self.poly_dot_spin.valueChanged.connect(lambda v: self._set_roi_visuals(None, v))
 
             m2 = QHBoxLayout(); bn = QPushButton('Finalize Poly'); bn.clicked.connect(self._finalize_poly); m2.addWidget(bn); bx = QPushButton('ROI Next'); bx.clicked.connect(self._next); m2.addWidget(bx); right.addLayout(m2)
 
@@ -1607,13 +1603,13 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self._invalidate_roi_and_patches(btn)
             self.roi_locked = False
             self.roi_selection_active = True
-            self.btn_roi_lock.setText('End/Save ROIs')
+            self.btn_roi_lock.setText('End/Save ROI')
             btns = self._buttons()
             if btn in btns:
                 self.target_idx = btns.index(btn)
             self.working = None
             self.poly_pts = []
-            self.status.setText(f'{btn} ROI deleted. Redraw ROI and re-capture patches for {btn}.')
+            self.status.setText(f'{btn} ROI deleted. Draw ROI and re-capture patches for {btn}.')
             self.render_pre()
 
         def _redraw_selected_roi(self):
@@ -1623,14 +1619,14 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self._invalidate_roi_and_patches(btn)
             self.roi_locked = False
             self.roi_selection_active = True
-            self.btn_roi_lock.setText('End/Save ROIs')
+            self.btn_roi_lock.setText('End/Save ROI')
             btns = self._buttons()
             if btn in btns:
                 self.target_idx = btns.index(btn)
             self.mode = 'rect'
             self.working = None
             self.poly_pts = []
-            self.status.setText(f'Redraw ROI for {btn} now. Patches for {btn} were cleared.')
+            self.status.setText(f'Draw ROI for {btn} now. Patches for {btn} were cleared.')
             self.render_pre()
 
         def _target(self):
@@ -1666,7 +1662,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.roi_selection_active = True
             self.roi_locked = False
             self.patch_selection_active = False
-            self.btn_roi_lock.setText('End/Save ROIs')
+            self.btn_roi_lock.setText('End/Save ROI')
             self.status.setText('ROI selection started. Draw ROI and use ROI Next.')
 
         def _start_patch_selection(self):
@@ -1787,7 +1783,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             if self.roi_locked:
                 self.roi_locked = False
                 self.roi_selection_active = True
-                self.btn_roi_lock.setText('End/Save ROIs')
+                self.btn_roi_lock.setText('End/Save ROI')
                 self.status.setText('ROIs unlocked for editing.')
                 return
             if self.working and self._is_valid(self.working):
@@ -1876,7 +1872,7 @@ def _run_pyqt6_shell(initial: WearConfig) -> Optional[bool]:
             self.btn_pre_pan.setText('Pan: OFF')
             self.pre_xy_lbl.setText('XY: -,-   Dist: -')
             self.patch_step_lbl.setText('Patch step: inactive')
-            self.btn_roi_lock.setText('End/Save ROIs')
+            self.btn_roi_lock.setText('End/Save ROI')
             self.status.setText('Reset complete. Click Start ROI Selection to redraw ROIs.')
 
             # clear patch values and swatches
