@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
 import time
 from typing import Any
 
@@ -9,13 +7,9 @@ from dorna2 import Dorna
 
 DORNA_HOST = "192.168.1.24"
 DORNA_PORT = 443
-
-TARGET_CYCLES = 20
-STATUS_POLL_S = 0.02
-START_TIMEOUT_S = 20.0
-FINISH_TIMEOUT_S = 180.0
 MOTOR_SETTLE_S = 1.0
-GENERATED_CMDS_PATH = Path(__file__).with_name("zipper_cycle_cmds.txt")
+STATUS_POLL_S = 0.02
+FINISH_TIMEOUT_S = 60.0
 
 MOVE_DEFAULTS = {
     "cmd": "lmove",
@@ -34,9 +28,7 @@ WAYPOINTS = {
     "D": {"x": 386.783937, "y": 175.752657, "z": 169.835723, "a": 176.116134, "b": -33.260301, "c": 6.145552},
 }
 
-# One logical zipper cycle. The last B->A transition is created automatically when the
-# next cycle starts or when we append the explicit terminal A for the final stop.
-CYCLE_PATTERN = ["A", "B", "C", "D", "C", "B"]
+TEST_PATH = ["A", "B", "C", "D"]
 
 
 def _extract_stat(resp: Any) -> int | None:
@@ -79,7 +71,7 @@ def _wait_until_idle(robot: Dorna, timeout_s: float) -> bool:
     return False
 
 
-def _make_lmove(name: str, *, terminal: bool = False) -> dict[str, Any]:
+def _build_move(name: str, *, terminal: bool = False) -> dict[str, Any]:
     move = dict(MOVE_DEFAULTS)
     move.update(WAYPOINTS[name])
     if terminal:
@@ -88,65 +80,40 @@ def _make_lmove(name: str, *, terminal: bool = False) -> dict[str, Any]:
     return move
 
 
-def _build_cycle_buffer(cycles: int) -> list[dict[str, Any]]:
-    if cycles <= 0:
-        return []
-
-    moves: list[dict[str, Any]] = []
-    for _cycle_idx in range(cycles):
-        for waypoint_name in CYCLE_PATTERN:
-            moves.append(_make_lmove(waypoint_name))
-
-    # Explicitly return to A so the final cycle closes the contour cleanly before stop.
-    moves.append(_make_lmove("A", terminal=True))
-    return moves
-
-
-def _write_cmds_file(moves: list[dict[str, Any]], path: Path) -> None:
-    path.write_text(
-        "\n".join(json.dumps(move, separators=(",", ":")) for move in moves) + "\n",
-        encoding="utf-8",
-    )
-
-
-def run_cycle_script(robot: Dorna, *, cycles: int, cmds_path: Path = GENERATED_CMDS_PATH) -> None:
-    moves = _build_cycle_buffer(cycles)
-    if not moves:
-        print("No cycles requested. Nothing to do.")
-        return
-
-    _write_cmds_file(moves, cmds_path)
-    print(f"[Cycle] Wrote {len(moves)} moves to {cmds_path}")
-
-    print("[Cycle] Enabling motors")
+def run_blending_test(robot: Dorna) -> None:
+    print("[Simple] Enabling motors")
     robot.play(-1, {"cmd": "motor", "motor": 1})
     time.sleep(MOTOR_SETTLE_S)
 
-    print("[Cycle] Waiting for idle before play_script")
-    if not _wait_until_idle(robot, START_TIMEOUT_S):
-        raise TimeoutError("Robot did not report idle before play_script start")
+    print("[Simple] Waiting for idle before sending test path")
+    if not _wait_until_idle(robot, timeout_s=10.0):
+        raise TimeoutError("Robot did not become idle before test start")
 
-    t0 = time.perf_counter()
-    robot.play_script(str(cmds_path))
-    dt = time.perf_counter() - t0
-    print(f"[Cycle] play_script submitted in {dt:.4f}s for {cycles} cycles")
+    print("[Simple] Sending minimal contour A -> B -> C -> D")
+    for index, name in enumerate(TEST_PATH):
+        terminal = index == len(TEST_PATH) - 1
+        move = _build_move(name, terminal=terminal)
+        t0 = time.perf_counter()
+        robot.play(-1, move)
+        dt = time.perf_counter() - t0
+        print(f"[Simple] Submitted {name} in {dt:.4f}s terminal={terminal} move={move}")
 
-    print("[Cycle] Waiting for robot to finish generated command script")
-    if not _wait_until_idle(robot, FINISH_TIMEOUT_S):
-        raise TimeoutError("Timed out waiting for zipper cycle script to finish")
+    print("[Simple] All moves submitted; waiting for final idle")
+    if not _wait_until_idle(robot, timeout_s=FINISH_TIMEOUT_S):
+        raise TimeoutError("Robot did not finish simple blending test before timeout")
 
-    print(f"[Cycle] Done. Completed {cycles} requested cycles")
+    print("[Simple] Test complete")
 
 
-def main(robot: Dorna) -> None:
-    run_cycle_script(robot, cycles=TARGET_CYCLES)
+def main() -> None:
+    robot = Dorna()
+    try:
+        print(f"[Simple] Connecting to {DORNA_HOST}:{DORNA_PORT}")
+        robot.connect(host=DORNA_HOST, port=DORNA_PORT)
+        run_blending_test(robot)
+    finally:
+        robot.close()
 
 
 if __name__ == "__main__":
-    robot = Dorna()
-    try:
-        robot.connect(host=DORNA_HOST, port=DORNA_PORT)
-        time.sleep(1.0)
-        main(robot)
-    finally:
-        robot.close()
+    main()
