@@ -1,61 +1,174 @@
-from dorna2 import Dorna
+from __future__ import annotations
+
+from pathlib import Path
 import time
+from typing import Any
 
-CYCLES = 20
+from dorna2 import Dorna
 
-def build_sequence(cycles):
+from zipper_script import (
+    DORNA_HOST,
+    DORNA_PORT,
+    FINISH_TIMEOUT_S,
+    MOTOR_SETTLE_S,
+    START_TIMEOUT_S,
+    STATUS_POLL_S,
+    _extract_stat,
+)
 
-    cmd_list = []
+TARGET_CYCLES = 20
+DWELL_S = 0.5
+LOOP_FORWARD_CMDS_PATH = Path(__file__).with_name("cmds_cycle_forward.txt")
+REVERSE_CMDS_PATH = Path(__file__).with_name("cmds_reverse.txt")
+PROBLEM_KEYWORDS = ("alarm", "error", "err", "fault", "protect", "emergency")
+MESSAGE_KEYS = ("msg", "message", "detail", "reason")
+A_START_POSE = {
+    "x": 386.777475,
+    "y": -104.275356,
+    "z": 169.734268,
+    "a": 176.101107,
+    "b": -33.250912,
+    "c": 6.131734,
+}
+A_START_JMOVE = {
+    "cmd": "jmove",
+    "rel": 0,
+    "vel": 100,
+    "acc": 800,
+    "jerk": 1000,
+    **A_START_POSE,
+}
 
-    for _ in range(cycles):
 
-        # A → B → C → D
-        cmd_list.append('{"cmd":"lmove","rel":0,"x":386.777475,"y":-104.275356,"z":169.734268,"a":176.101107,"b":-33.250912,"c":6.131734,"vel":100,"acc":800,"jerk":1000,"cont":1,"corner":100}')
-        cmd_list.append('{"cmd":"lmove","rel":0,"x":266.843852,"y":-104.206306,"z":169.708871,"a":176.111387,"b":-33.251148,"c":6.142103,"vel":100,"acc":800,"jerk":1000,"cont":1,"corner":100}')
-        cmd_list.append('{"cmd":"lmove","rel":0,"x":266.711805,"y":175.773619,"z":169.707272,"a":176.107832,"b":-33.244479,"c":6.112397,"vel":100,"acc":800,"jerk":1000,"cont":1,"corner":100}')
-        cmd_list.append('{"cmd":"lmove","rel":0,"x":386.783937,"y":175.752657,"z":169.835723,"a":176.116134,"b":-33.260301,"c":6.145552,"vel":100,"acc":800,"jerk":1000,"cont":1,"corner":100}')
-
-        # D → C → B
-        cmd_list.append('{"cmd":"lmove","rel":0,"x":266.711805,"y":175.773619,"z":169.707272,"a":176.107832,"b":-33.244479,"c":6.112397,"vel":100,"acc":800,"jerk":1000,"cont":1,"corner":100}')
-        cmd_list.append('{"cmd":"lmove","rel":0,"x":266.843852,"y":-104.206306,"z":169.708871,"a":176.111387,"b":-33.251148,"c":6.142103,"vel":100,"acc":800,"jerk":1000,"cont":1,"corner":100}')
-
-    return cmd_list
+def _value_is_problem(value: Any) -> bool:
+    if value in (None, False, 0, 0.0, "", "0"):
+        return False
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        return lowered not in {"0", "false", "none", "null", "ok", "idle", "ready", "no_alarm", "no alarm"}
+    return bool(value)
 
 
-def main(robot):
+def _find_problem(resp: Any, path: str = "root") -> str | None:
+    if isinstance(resp, dict):
+        for key, value in resp.items():
+            key_lower = str(key).lower()
+            child_path = f"{path}.{key}"
+            if any(token in key_lower for token in PROBLEM_KEYWORDS) and _value_is_problem(value):
+                return f"{child_path}={value!r}"
+            if key_lower in MESSAGE_KEYS and isinstance(value, str):
+                lowered = value.lower()
+                if any(token in lowered for token in PROBLEM_KEYWORDS):
+                    return f"{child_path}={value!r}"
+            nested_problem = _find_problem(value, child_path)
+            if nested_problem:
+                return nested_problem
+    elif isinstance(resp, list):
+        for idx, item in enumerate(resp):
+            nested_problem = _find_problem(item, f"{path}[{idx}]")
+            if nested_problem:
+                return nested_problem
+    return None
 
+
+def _query_robot_status(robot: Dorna) -> tuple[int | None, str | None, Any]:
+    resp = robot.play(-1, {"cmd": "stat"})
+    stat = _extract_stat(resp)
+    problem = _find_problem(resp)
+    return stat, problem, resp
+
+
+def _wait_until_healthy_idle(robot: Dorna, timeout_s: float, *, label: str) -> None:
+    deadline = time.time() + timeout_s
+    last_stat = None
+    while time.time() < deadline:
+        try:
+            stat, problem, resp = _query_robot_status(robot)
+        except Exception as exc:
+            raise RuntimeError(f"{label}: failed to query robot status: {exc}") from exc
+
+        if problem:
+            raise RuntimeError(f"{label}: robot reported problem {problem}; raw={resp!r}")
+        if stat == -1:
+            return
+
+        last_stat = stat
+        time.sleep(STATUS_POLL_S)
+
+    raise TimeoutError(f"{label}: timed out waiting for healthy idle (last_stat={last_stat})")
+
+
+def _move_to_a_start(robot: Dorna) -> None:
+    print("[Cycle] Moving to A start pose with jmove")
+    _wait_until_healthy_idle(robot, START_TIMEOUT_S, label="Pre-check before jmove to A")
+    robot.play(-1, A_START_JMOVE)
+    _wait_until_healthy_idle(robot, FINISH_TIMEOUT_S, label="Waiting for jmove to A")
+    print("[Cycle] Reached A start pose")
+
+
+def _run_named_script(robot: Dorna, script_path: Path, *, cycle_index: int, total_cycles: int, label: str) -> None:
+    if not script_path.exists():
+        raise FileNotFoundError(f"Command script not found: {script_path}")
+
+    _wait_until_healthy_idle(robot, START_TIMEOUT_S, label=f"Pre-check before {label} cycle {cycle_index}")
+
+    t0 = time.perf_counter()
+    robot.play_script(str(script_path))
+    submit_dt = time.perf_counter() - t0
+    print(f"[Cycle] Submitted {label} for cycle {cycle_index}/{total_cycles} in {submit_dt:.4f}s")
+
+    _wait_until_healthy_idle(robot, FINISH_TIMEOUT_S, label=f"Waiting for {label} cycle {cycle_index}")
+    print(f"[Cycle] Completed {label} for cycle {cycle_index}/{total_cycles}")
+
+
+def run_cycle_script(robot: Dorna, *, cycles: int) -> None:
+    if cycles <= 0:
+        print("No cycles requested. Nothing to do.")
+        return
+    if not LOOP_FORWARD_CMDS_PATH.exists():
+        raise FileNotFoundError(f"Loop forward command script not found: {LOOP_FORWARD_CMDS_PATH}")
+    if not REVERSE_CMDS_PATH.exists():
+        raise FileNotFoundError(f"Reverse command script not found: {REVERSE_CMDS_PATH}")
+
+    print("[Cycle] Enabling motors")
     robot.play(-1, {"cmd": "motor", "motor": 1})
-    time.sleep(1)
+    time.sleep(MOTOR_SETTLE_S)
 
-    print("Building full sequence...")
+    _wait_until_healthy_idle(robot, START_TIMEOUT_S, label="Pre-start readiness")
+    _move_to_a_start(robot)
+    print(
+        f"[Cycle] Robot ready. Starting cycles with jmove-to-A, "
+        f"loop-pass {LOOP_FORWARD_CMDS_PATH.name}, reverse {REVERSE_CMDS_PATH.name}"
+    )
 
-    sequence = build_sequence(CYCLES)
+    for cycle_index in range(1, cycles + 1):
+        _run_named_script(robot, LOOP_FORWARD_CMDS_PATH, cycle_index=cycle_index, total_cycles=cycles, label="forward path (loop B→C→D)")
+        print(f"[Cycle] Dwelling at D for {DWELL_S:.1f}s")
+        time.sleep(DWELL_S)
+        _wait_until_healthy_idle(robot, START_TIMEOUT_S, label=f"Post-D dwell check cycle {cycle_index}")
 
-    print("Sending full sequence...")
+        _run_named_script(robot, REVERSE_CMDS_PATH, cycle_index=cycle_index, total_cycles=cycles, label="reverse path (C→B→A)")
+        print(f"[Cycle] Dwelling at A for {DWELL_S:.1f}s")
+        time.sleep(DWELL_S)
+        _wait_until_healthy_idle(robot, START_TIMEOUT_S, label=f"Post-A dwell check cycle {cycle_index}")
 
-    # 🔥 THIS WORKS in Dorna2
-    for cmd in sequence:
-        robot.play(-1, eval(cmd))
+        print(f"[Cycle] Completed full cycle {cycle_index}/{cycles}")
 
-    print("Sequence sent")
+    print(
+        f"[Cycle] Done. Completed {cycles} requested cycles using jmove-to-A + "
+        f"{LOOP_FORWARD_CMDS_PATH.name} + {REVERSE_CMDS_PATH.name}"
+    )
 
-    # wait for completion
-    while True:
-        stat = robot.play(-1, {"cmd": "stat"})
-        if stat["stat"] == 0:
-            break
-        time.sleep(0.05)
 
-    print("Done")
+def main(robot: Dorna) -> None:
+    run_cycle_script(robot, cycles=TARGET_CYCLES)
 
 
 if __name__ == "__main__":
     robot = Dorna()
     try:
-        robot.connect(host="192.168.1.24", port=443)
-        time.sleep(1)
-
+        robot.connect(host=DORNA_HOST, port=DORNA_PORT)
+        time.sleep(1.0)
         main(robot)
-
     finally:
         robot.close()
