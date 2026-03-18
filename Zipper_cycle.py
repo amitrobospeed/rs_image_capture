@@ -55,6 +55,9 @@ def _wait_until_idle(robot: Dorna, timeout_s: float) -> bool:
         time.sleep(STATUS_POLL_S)
     return False
 
+def _build_cycle_buffer(cycles: int) -> list[dict[str, Any]]:
+    if cycles <= 0:
+        return []
 
 def run_cycle_script(robot: Dorna, *, cycles: int, cmds_path: Path = CMDS_PATH) -> None:
     if cycles <= 0:
