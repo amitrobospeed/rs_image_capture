@@ -8,11 +8,10 @@ from dorna2 import Dorna
 
 DORNA_HOST = "192.168.1.24"
 DORNA_PORT = 443
-TARGET_CYCLES = 20
-STATUS_POLL_S = 0.02
-START_TIMEOUT_S = 20.0
-CYCLE_TIMEOUT_S = 60.0
 MOTOR_SETTLE_S = 1.0
+STATUS_POLL_S = 0.02
+START_TIMEOUT_S = 10.0
+FINISH_TIMEOUT_S = 60.0
 CMDS_PATH = Path(__file__).with_name("cmds.txt")
 
 
@@ -56,44 +55,39 @@ def _wait_until_idle(robot: Dorna, timeout_s: float) -> bool:
     return False
 
 
-def run_cycle_script(robot: Dorna, *, cycles: int, cmds_path: Path = CMDS_PATH) -> None:
-    if cycles <= 0:
-        print("No cycles requested. Nothing to do.")
-        return
-    if not cmds_path.exists():
-        raise FileNotFoundError(f"Command script not found: {cmds_path}")
+def run_script_test(robot: Dorna) -> None:
+    if not CMDS_PATH.exists():
+        raise FileNotFoundError(f"Command script not found: {CMDS_PATH}")
 
-    print("[Cycle] Enabling motors")
+    print("[Script] Enabling motors")
     robot.play(-1, {"cmd": "motor", "motor": 1})
     time.sleep(MOTOR_SETTLE_S)
 
-    print(f"[Cycle] Waiting for idle before first play_script: {cmds_path}")
-    if not _wait_until_idle(robot, START_TIMEOUT_S):
-        raise TimeoutError("Robot did not report idle before cycle start")
+    print(f"[Script] Waiting for idle before play_script: {CMDS_PATH}")
+    if not _wait_until_idle(robot, timeout_s=START_TIMEOUT_S):
+        raise TimeoutError("Robot did not become idle before play_script test")
 
-    for cycle_index in range(1, cycles + 1):
-        t0 = time.perf_counter()
-        robot.play_script(str(cmds_path))
-        submit_dt = time.perf_counter() - t0
-        print(f"[Cycle] Submitted cycle {cycle_index}/{cycles} in {submit_dt:.4f}s")
+    t0 = time.perf_counter()
+    robot.play_script(str(CMDS_PATH))
+    dt = time.perf_counter() - t0
+    print(f"[Script] play_script submitted in {dt:.4f}s")
 
-        if not _wait_until_idle(robot, CYCLE_TIMEOUT_S):
-            raise TimeoutError(f"Timed out waiting for cycle {cycle_index} to finish")
+    print("[Script] Waiting for final idle after cmds.txt")
+    if not _wait_until_idle(robot, timeout_s=FINISH_TIMEOUT_S):
+        raise TimeoutError("Robot did not finish cmds.txt before timeout")
 
-        print(f"[Cycle] Completed cycle {cycle_index}/{cycles}")
-
-    print(f"[Cycle] Done. Completed {cycles} requested cycles using {cmds_path.name}")
+    print("[Script] Test complete")
 
 
-def main(robot: Dorna) -> None:
-    run_cycle_script(robot, cycles=TARGET_CYCLES)
+def main() -> None:
+    robot = Dorna()
+    try:
+        print(f"[Script] Connecting to {DORNA_HOST}:{DORNA_PORT}")
+        robot.connect(host=DORNA_HOST, port=DORNA_PORT)
+        run_script_test(robot)
+    finally:
+        robot.close()
 
 
 if __name__ == "__main__":
-    robot = Dorna()
-    try:
-        robot.connect(host=DORNA_HOST, port=DORNA_PORT)
-        time.sleep(1.0)
-        main(robot)
-    finally:
-        robot.close()
+    main()
