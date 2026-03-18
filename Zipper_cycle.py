@@ -7,7 +7,6 @@ from typing import Any
 from dorna2 import Dorna
 
 from zipper_script import (
-    CMDS_PATH,
     DORNA_HOST,
     DORNA_PORT,
     FINISH_TIMEOUT_S,
@@ -19,10 +18,26 @@ from zipper_script import (
 
 TARGET_CYCLES = 20
 DWELL_S = 0.5
-REVERSE_CMDS_PATH = Path(__file__).with_name("cmds_reverse.txt")
 LOOP_FORWARD_CMDS_PATH = Path(__file__).with_name("cmds_cycle_forward.txt")
+REVERSE_CMDS_PATH = Path(__file__).with_name("cmds_reverse.txt")
 PROBLEM_KEYWORDS = ("alarm", "error", "err", "fault", "protect", "emergency")
 MESSAGE_KEYS = ("msg", "message", "detail", "reason")
+A_START_POSE = {
+    "x": 386.777475,
+    "y": -104.275356,
+    "z": 169.734268,
+    "a": 176.101107,
+    "b": -33.250912,
+    "c": 6.131734,
+}
+A_START_JMOVE = {
+    "cmd": "jmove",
+    "rel": 0,
+    "vel": 100,
+    "acc": 800,
+    "jerk": 1000,
+    **A_START_POSE,
+}
 
 
 def _value_is_problem(value: Any) -> bool:
@@ -83,6 +98,14 @@ def _wait_until_healthy_idle(robot: Dorna, timeout_s: float, *, label: str) -> N
     raise TimeoutError(f"{label}: timed out waiting for healthy idle (last_stat={last_stat})")
 
 
+def _move_to_a_start(robot: Dorna) -> None:
+    print("[Cycle] Moving to A start pose with jmove")
+    _wait_until_healthy_idle(robot, START_TIMEOUT_S, label="Pre-check before jmove to A")
+    robot.play(-1, A_START_JMOVE)
+    _wait_until_healthy_idle(robot, FINISH_TIMEOUT_S, label="Waiting for jmove to A")
+    print("[Cycle] Reached A start pose")
+
+
 def _run_named_script(robot: Dorna, script_path: Path, *, cycle_index: int, total_cycles: int, label: str) -> None:
     if not script_path.exists():
         raise FileNotFoundError(f"Command script not found: {script_path}")
@@ -98,18 +121,10 @@ def _run_named_script(robot: Dorna, script_path: Path, *, cycle_index: int, tota
     print(f"[Cycle] Completed {label} for cycle {cycle_index}/{total_cycles}")
 
 
-def _forward_script_for_cycle(cycle_index: int) -> tuple[Path, str]:
-    if cycle_index == 1:
-        return CMDS_PATH, "forward path (startup A→B→C→D)"
-    return LOOP_FORWARD_CMDS_PATH, "forward path (loop B→C→D)"
-
-
 def run_cycle_script(robot: Dorna, *, cycles: int) -> None:
     if cycles <= 0:
         print("No cycles requested. Nothing to do.")
         return
-    if not CMDS_PATH.exists():
-        raise FileNotFoundError(f"Forward command script not found: {CMDS_PATH}")
     if not LOOP_FORWARD_CMDS_PATH.exists():
         raise FileNotFoundError(f"Loop forward command script not found: {LOOP_FORWARD_CMDS_PATH}")
     if not REVERSE_CMDS_PATH.exists():
@@ -120,14 +135,14 @@ def run_cycle_script(robot: Dorna, *, cycles: int) -> None:
     time.sleep(MOTOR_SETTLE_S)
 
     _wait_until_healthy_idle(robot, START_TIMEOUT_S, label="Pre-start readiness")
+    _move_to_a_start(robot)
     print(
-        f"[Cycle] Robot ready. Starting cycles with first-pass {CMDS_PATH.name}, "
+        f"[Cycle] Robot ready. Starting cycles with jmove-to-A, "
         f"loop-pass {LOOP_FORWARD_CMDS_PATH.name}, reverse {REVERSE_CMDS_PATH.name}"
     )
 
     for cycle_index in range(1, cycles + 1):
-        forward_script, forward_label = _forward_script_for_cycle(cycle_index)
-        _run_named_script(robot, forward_script, cycle_index=cycle_index, total_cycles=cycles, label=forward_label)
+        _run_named_script(robot, LOOP_FORWARD_CMDS_PATH, cycle_index=cycle_index, total_cycles=cycles, label="forward path (loop B→C→D)")
         print(f"[Cycle] Dwelling at D for {DWELL_S:.1f}s")
         time.sleep(DWELL_S)
         _wait_until_healthy_idle(robot, START_TIMEOUT_S, label=f"Post-D dwell check cycle {cycle_index}")
@@ -140,8 +155,8 @@ def run_cycle_script(robot: Dorna, *, cycles: int) -> None:
         print(f"[Cycle] Completed full cycle {cycle_index}/{cycles}")
 
     print(
-        f"[Cycle] Done. Completed {cycles} requested cycles using "
-        f"{CMDS_PATH.name}/{LOOP_FORWARD_CMDS_PATH.name} + {REVERSE_CMDS_PATH.name}"
+        f"[Cycle] Done. Completed {cycles} requested cycles using jmove-to-A + "
+        f"{LOOP_FORWARD_CMDS_PATH.name} + {REVERSE_CMDS_PATH.name}"
     )
 
 
