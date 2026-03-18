@@ -1,61 +1,60 @@
-from dorna2 import Dorna
+from __future__ import annotations
+
 import time
 
-CYCLES = 20
+from dorna2 import Dorna
 
-def build_sequence(cycles):
+from zipper_script import (
+    CMDS_PATH,
+    DORNA_HOST,
+    DORNA_PORT,
+    FINISH_TIMEOUT_S,
+    MOTOR_SETTLE_S,
+    START_TIMEOUT_S,
+    _wait_until_idle,
+)
 
-    cmd_list = []
-
-    for _ in range(cycles):
-
-        # A → B → C → D
-        cmd_list.append('{"cmd":"lmove","rel":0,"x":386.777475,"y":-104.275356,"z":169.734268,"a":176.101107,"b":-33.250912,"c":6.131734,"vel":100,"acc":800,"jerk":1000,"cont":1,"corner":100}')
-        cmd_list.append('{"cmd":"lmove","rel":0,"x":266.843852,"y":-104.206306,"z":169.708871,"a":176.111387,"b":-33.251148,"c":6.142103,"vel":100,"acc":800,"jerk":1000,"cont":1,"corner":100}')
-        cmd_list.append('{"cmd":"lmove","rel":0,"x":266.711805,"y":175.773619,"z":169.707272,"a":176.107832,"b":-33.244479,"c":6.112397,"vel":100,"acc":800,"jerk":1000,"cont":1,"corner":100}')
-        cmd_list.append('{"cmd":"lmove","rel":0,"x":386.783937,"y":175.752657,"z":169.835723,"a":176.116134,"b":-33.260301,"c":6.145552,"vel":100,"acc":800,"jerk":1000,"cont":1,"corner":100}')
-
-        # D → C → B
-        cmd_list.append('{"cmd":"lmove","rel":0,"x":266.711805,"y":175.773619,"z":169.707272,"a":176.107832,"b":-33.244479,"c":6.112397,"vel":100,"acc":800,"jerk":1000,"cont":1,"corner":100}')
-        cmd_list.append('{"cmd":"lmove","rel":0,"x":266.843852,"y":-104.206306,"z":169.708871,"a":176.111387,"b":-33.251148,"c":6.142103,"vel":100,"acc":800,"jerk":1000,"cont":1,"corner":100}')
-
-    return cmd_list
+TARGET_CYCLES = 20
 
 
-def main(robot):
+def run_cycle_script(robot: Dorna, *, cycles: int) -> None:
+    if cycles <= 0:
+        print("No cycles requested. Nothing to do.")
+        return
+    if not CMDS_PATH.exists():
+        raise FileNotFoundError(f"Command script not found: {CMDS_PATH}")
 
+    print("[Cycle] Enabling motors")
     robot.play(-1, {"cmd": "motor", "motor": 1})
-    time.sleep(1)
+    time.sleep(MOTOR_SETTLE_S)
 
-    print("Building full sequence...")
+    print(f"[Cycle] Waiting for idle before first play_script: {CMDS_PATH}")
+    if not _wait_until_idle(robot, timeout_s=START_TIMEOUT_S):
+        raise TimeoutError("Robot did not become idle before cycle start")
 
-    sequence = build_sequence(CYCLES)
+    for cycle_index in range(1, cycles + 1):
+        t0 = time.perf_counter()
+        robot.play_script(str(CMDS_PATH))
+        submit_dt = time.perf_counter() - t0
+        print(f"[Cycle] Submitted cycle {cycle_index}/{cycles} in {submit_dt:.4f}s")
 
-    print("Sending full sequence...")
+        if not _wait_until_idle(robot, timeout_s=FINISH_TIMEOUT_S):
+            raise TimeoutError(f"Robot did not finish cycle {cycle_index} before timeout")
 
-    # 🔥 THIS WORKS in Dorna2
-    for cmd in sequence:
-        robot.play(-1, eval(cmd))
+        print(f"[Cycle] Completed cycle {cycle_index}/{cycles}")
 
-    print("Sequence sent")
+    print(f"[Cycle] Done. Completed {cycles} requested cycles using {CMDS_PATH.name}")
 
-    # wait for completion
-    while True:
-        stat = robot.play(-1, {"cmd": "stat"})
-        if stat["stat"] == 0:
-            break
-        time.sleep(0.05)
 
-    print("Done")
+def main(robot: Dorna) -> None:
+    run_cycle_script(robot, cycles=TARGET_CYCLES)
 
 
 if __name__ == "__main__":
     robot = Dorna()
     try:
-        robot.connect(host="192.168.1.24", port=443)
-        time.sleep(1)
-
+        robot.connect(host=DORNA_HOST, port=DORNA_PORT)
+        time.sleep(1.0)
         main(robot)
-
     finally:
         robot.close()
