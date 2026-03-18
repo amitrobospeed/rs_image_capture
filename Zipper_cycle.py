@@ -34,6 +34,9 @@ def _run_named_script(robot: Dorna, script_path: Path, *, cycle_index: int, tota
 
     print(f"[Cycle] Completed {label} for cycle {cycle_index}/{total_cycles}")
 
+from pathlib import Path
+import time
+from typing import Any
 
 def run_cycle_script(robot: Dorna, *, cycles: int) -> None:
     if cycles <= 0:
