@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+import json
+from pathlib import Path
 import time
+from typing import Any
 
 from dorna2 import Dorna
 
@@ -10,11 +11,11 @@ DORNA_HOST = "192.168.1.24"
 DORNA_PORT = 443
 
 TARGET_CYCLES = 20
-QUEUE_LOOKAHEAD = 8
-QUEUE_POLL_S = 0.01
+STATUS_POLL_S = 0.02
 START_TIMEOUT_S = 20.0
-FINISH_TIMEOUT_S = 120.0
+FINISH_TIMEOUT_S = 180.0
 MOTOR_SETTLE_S = 1.0
+GENERATED_CMDS_PATH = Path(__file__).with_name("zipper_cycle_cmds.txt")
 
 MOVE_DEFAULTS = {
     "cmd": "lmove",
@@ -36,17 +37,6 @@ WAYPOINTS = {
 # One logical zipper cycle. The last B->A transition is created automatically when the
 # next cycle starts or when we append the explicit terminal A for the final stop.
 CYCLE_PATTERN = ["A", "B", "C", "D", "C", "B"]
-
-
-@dataclass
-class CycleState:
-    running: bool = False
-    paused: bool = False
-    stopped: bool = True
-    cycle_count: int = 0
-    segment_index: int = 0
-    dispatched_segments: int = 0
-    aligned_to_start: bool = False
 
 
 def _extract_stat(resp: Any) -> int | None:
@@ -75,10 +65,9 @@ def _extract_stat(resp: Any) -> int | None:
 
 def _robot_idle(robot: Dorna) -> bool:
     try:
-        stat = _extract_stat(robot.play(-1, {"cmd": "stat"}))
+        return _extract_stat(robot.play(-1, {"cmd": "stat"})) == -1
     except Exception:
         return False
-    return stat == -1
 
 
 def _wait_until_idle(robot: Dorna, timeout_s: float) -> bool:
@@ -86,7 +75,7 @@ def _wait_until_idle(robot: Dorna, timeout_s: float) -> bool:
     while time.time() < deadline:
         if _robot_idle(robot):
             return True
-        time.sleep(QUEUE_POLL_S)
+        time.sleep(STATUS_POLL_S)
     return False
 
 
@@ -113,74 +102,44 @@ def _build_cycle_buffer(cycles: int) -> list[dict[str, Any]]:
     return moves
 
 
-class ZipperCycleRunner:
-    def __init__(self, robot: Dorna, cycles: int):
-        self.robot = robot
-        self.cycles = max(0, int(cycles))
-        self.state = CycleState()
-        self.sequence = _build_cycle_buffer(self.cycles)
+def _write_cmds_file(moves: list[dict[str, Any]], path: Path) -> None:
+    path.write_text(
+        "\n".join(json.dumps(move, separators=(",", ":")) for move in moves) + "\n",
+        encoding="utf-8",
+    )
 
-    def _send_motor_on(self) -> None:
-        self.robot.play(-1, {"cmd": "motor", "motor": 1})
-        time.sleep(MOTOR_SETTLE_S)
 
-    def _prime_queue(self) -> None:
-        while self.state.segment_index < len(self.sequence) and self.state.dispatched_segments < QUEUE_LOOKAHEAD:
-            self._dispatch_next()
+def run_cycle_script(robot: Dorna, *, cycles: int, cmds_path: Path = GENERATED_CMDS_PATH) -> None:
+    moves = _build_cycle_buffer(cycles)
+    if not moves:
+        print("No cycles requested. Nothing to do.")
+        return
 
-    def _dispatch_next(self) -> None:
-        move = self.sequence[self.state.segment_index]
-        self.robot.play(-1, move)
-        self.state.segment_index += 1
-        self.state.dispatched_segments += 1
+    _write_cmds_file(moves, cmds_path)
+    print(f"[Cycle] Wrote {len(moves)} moves to {cmds_path}")
 
-        if self.state.segment_index % len(CYCLE_PATTERN) == 0 and self.state.segment_index <= self.cycles * len(CYCLE_PATTERN):
-            self.state.cycle_count += 1
-            print(f"[Cycle] Dispatched cycle {self.state.cycle_count}/{self.cycles}")
+    print("[Cycle] Enabling motors")
+    robot.play(-1, {"cmd": "motor", "motor": 1})
+    time.sleep(MOTOR_SETTLE_S)
 
-    def _feed_remaining(self) -> None:
-        # Keep feeding moves while the robot is still active. By staying ahead of the arm,
-        # the controller can retain lookahead for cont/corner blending instead of stopping
-        # at each waypoint.
-        while self.state.segment_index < len(self.sequence):
-            self._dispatch_next()
-            time.sleep(QUEUE_POLL_S)
+    print("[Cycle] Waiting for idle before play_script")
+    if not _wait_until_idle(robot, START_TIMEOUT_S):
+        raise TimeoutError("Robot did not report idle before play_script start")
 
-    def run(self) -> None:
-        if not self.sequence:
-            print("No cycles requested. Nothing to do.")
-            return
+    t0 = time.perf_counter()
+    robot.play_script(str(cmds_path))
+    dt = time.perf_counter() - t0
+    print(f"[Cycle] play_script submitted in {dt:.4f}s for {cycles} cycles")
 
-        print("[Run] Enabling motors")
-        self._send_motor_on()
+    print("[Cycle] Waiting for robot to finish generated command script")
+    if not _wait_until_idle(robot, FINISH_TIMEOUT_S):
+        raise TimeoutError("Timed out waiting for zipper cycle script to finish")
 
-        print("[Run] Waiting for idle before start")
-        if not _wait_until_idle(self.robot, START_TIMEOUT_S):
-            raise TimeoutError("Robot never reported idle before start")
-
-        self.state.running = True
-        self.state.paused = False
-        self.state.stopped = False
-        self.state.aligned_to_start = True
-
-        print(f"[Run] Priming queue with up to {QUEUE_LOOKAHEAD} blended moves")
-        self._prime_queue()
-
-        print("[Run] Feeding remaining zipper moves")
-        self._feed_remaining()
-
-        print("[Run] Waiting for robot to finish final move")
-        if not _wait_until_idle(self.robot, FINISH_TIMEOUT_S):
-            raise TimeoutError("Timed out waiting for zipper cycle to finish")
-
-        self.state.running = False
-        self.state.stopped = True
-        print(f"[Run] Done. Completed {self.state.cycle_count}/{self.cycles} cycles")
+    print(f"[Cycle] Done. Completed {cycles} requested cycles")
 
 
 def main(robot: Dorna) -> None:
-    runner = ZipperCycleRunner(robot=robot, cycles=TARGET_CYCLES)
-    runner.run()
+    run_cycle_script(robot, cycles=TARGET_CYCLES)
 
 
 if __name__ == "__main__":
