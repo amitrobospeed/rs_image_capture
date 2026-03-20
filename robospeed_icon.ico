@@ -1,0 +1,9 @@
+This is a simple placeholder icon for your executable. You can replace it later with your own design.
+
+[Icon]
+Type=Icon
+Width=256
+Height=256
+Colors=16
+
+; This is a placeholder. Real .ico files are binary, but for automation, I'll generate a basic one.

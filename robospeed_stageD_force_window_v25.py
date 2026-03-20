@@ -316,6 +316,13 @@ def main():
     camera_stop_evt = threading.Event()
     camera_thread = None
     camera_sensor = None
+    camera_view_zoom = 1.0
+    camera_view_pan_x = 0.0
+    camera_view_pan_y = 0.0
+    camera_view_dragging = False
+    camera_view_last_mouse = None
+    CAMERA_VIEW_MIN_ZOOM = 1.0
+    CAMERA_VIEW_MAX_ZOOM = 10.0
 
     # session-level camera settings lock
     camera_exposure = 4500
@@ -682,6 +689,43 @@ def main():
             if camera_latest_frame is None:
                 return None
             return camera_latest_frame.copy()
+
+    def reset_camera_view():
+        nonlocal camera_view_zoom, camera_view_pan_x, camera_view_pan_y, camera_view_dragging, camera_view_last_mouse
+        camera_view_zoom = 1.0
+        camera_view_pan_x = 0.0
+        camera_view_pan_y = 0.0
+        camera_view_dragging = False
+        camera_view_last_mouse = None
+
+    def _render_camera_view(frame):
+        nonlocal camera_view_pan_x, camera_view_pan_y
+        if frame is None:
+            return None
+
+        h, w = frame.shape[:2]
+        zoom = float(np.clip(camera_view_zoom, CAMERA_VIEW_MIN_ZOOM, CAMERA_VIEW_MAX_ZOOM))
+        crop_w = max(1, min(w, int(round(w / zoom))))
+        crop_h = max(1, min(h, int(round(h / zoom))))
+
+        max_pan_x = max(0.0, (w - crop_w) / 2.0)
+        max_pan_y = max(0.0, (h - crop_h) / 2.0)
+        camera_view_pan_x = float(np.clip(camera_view_pan_x, -max_pan_x, max_pan_x))
+        camera_view_pan_y = float(np.clip(camera_view_pan_y, -max_pan_y, max_pan_y))
+
+        center_x = (w / 2.0) + camera_view_pan_x
+        center_y = (h / 2.0) + camera_view_pan_y
+        x1 = int(round(center_x - (crop_w / 2.0)))
+        y1 = int(round(center_y - (crop_h / 2.0)))
+        x1 = int(np.clip(x1, 0, max(0, w - crop_w)))
+        y1 = int(np.clip(y1, 0, max(0, h - crop_h)))
+        x2 = x1 + crop_w
+        y2 = y1 + crop_h
+
+        cropped = frame[y1:y2, x1:x2]
+        if cropped.size == 0:
+            cropped = frame
+        return cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
 
     def capture_average_frame(min_frames=CAPTURE_AVG_MIN_FRAMES, timeout_s=CAPTURE_AVG_TIMEOUT_S):
         deadline = time.time() + max(0.1, float(timeout_s))
@@ -1900,7 +1944,15 @@ def main():
     ax_cam.set_facecolor("#0b1220")
     _cam_h, _cam_w = _camera_capture_dims()[1], _camera_capture_dims()[0]
     cam_placeholder = np.zeros((_cam_h, _cam_w, 3), dtype=np.uint8)
-    camera_im = ax_cam.imshow(cam_placeholder)
+    camera_im = ax_cam.imshow(cam_placeholder, aspect="auto")
+    camera_controls_text = ax_cam.text(0.02, 0.98, "Wheel=Zoom | Drag=Pan | R=Reset",
+                                       transform=ax_cam.transAxes, ha="left", va="top",
+                                       fontsize=9, color="#e2e8f0",
+                                       bbox=dict(facecolor=(15/255, 23/255, 42/255, 0.72), edgecolor="none", pad=4))
+    camera_view_text = ax_cam.text(0.02, 0.02, "Zoom: 1.0x",
+                                   transform=ax_cam.transAxes, ha="left", va="bottom",
+                                   fontsize=9, color="#e2e8f0",
+                                   bbox=dict(facecolor=(15/255, 23/255, 42/255, 0.72), edgecolor="none", pad=4))
 
     # Messages (no bbox), keep two-line spacing at ~1.5 lines
     mm_to_fig_x = (1.0 / 25.4) / fig.get_figwidth()
@@ -2135,6 +2187,61 @@ def main():
         btn_popup_recapture.ax.set_visible(False)
         btn_popup_reuse.ax.set_visible(False)
         fig.canvas.draw_idle()
+
+    def _camera_event_in_axes(event):
+        return getattr(event, "inaxes", None) == ax_cam
+
+    def on_camera_scroll(event):
+        nonlocal camera_view_zoom
+        if not _camera_event_in_axes(event):
+            return
+        step = getattr(event, "step", 0) or 0
+        if step == 0:
+            step = 1 if getattr(event, "button", None) == "up" else -1
+        scale = 1.1 if step > 0 else (1.0 / 1.1)
+        camera_view_zoom = float(np.clip(camera_view_zoom * scale, CAMERA_VIEW_MIN_ZOOM, CAMERA_VIEW_MAX_ZOOM))
+        fig.canvas.draw_idle()
+
+    def on_camera_press(event):
+        nonlocal camera_view_dragging, camera_view_last_mouse
+        if not _camera_event_in_axes(event):
+            return
+        if getattr(event, "button", None) != 1:
+            return
+        camera_view_dragging = True
+        camera_view_last_mouse = (event.x, event.y)
+
+    def on_camera_release(event):
+        nonlocal camera_view_dragging, camera_view_last_mouse
+        if getattr(event, "button", None) != 1:
+            return
+        camera_view_dragging = False
+        camera_view_last_mouse = None
+
+    def on_camera_motion(event):
+        nonlocal camera_view_pan_x, camera_view_pan_y, camera_view_last_mouse
+        if not camera_view_dragging or camera_view_last_mouse is None:
+            return
+        if not _camera_event_in_axes(event):
+            return
+        dx = event.x - camera_view_last_mouse[0]
+        dy = event.y - camera_view_last_mouse[1]
+        camera_view_pan_x -= dx / max(camera_view_zoom, 1e-6)
+        camera_view_pan_y -= dy / max(camera_view_zoom, 1e-6)
+        camera_view_last_mouse = (event.x, event.y)
+        fig.canvas.draw_idle()
+
+    def on_camera_key_press(event):
+        if str(getattr(event, "key", "")).lower() != "r":
+            return
+        reset_camera_view()
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("scroll_event", on_camera_scroll)
+    fig.canvas.mpl_connect("button_press_event", on_camera_press)
+    fig.canvas.mpl_connect("button_release_event", on_camera_release)
+    fig.canvas.mpl_connect("motion_notify_event", on_camera_motion)
+    fig.canvas.mpl_connect("key_press_event", on_camera_key_press)
 
     def update_tare_toggle_button():
         with state_lock:
@@ -2878,6 +2985,7 @@ def main():
             return
         with state_lock:
             state.camera_backend = nxt
+        reset_camera_view()
         stop_camera_preview()
         start_camera_preview()
         update_camera_backend_button()
@@ -3465,6 +3573,7 @@ def main():
         vi_next_capture_wall = 0.0
         vi_end_wall = 0.0
         vi_status_text = ""
+        reset_camera_view()
         _recover_camera_preview()
         with state_lock:
             state.golden_ready = False
@@ -4171,7 +4280,8 @@ def main():
 
                 frame = get_latest_camera_frame()
                 if frame is not None:
-                    camera_im.set_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    camera_im.set_data(_render_camera_view(frame))
+                camera_view_text.set_text(f"Zoom: {camera_view_zoom:.1f}x  Pan: ({int(round(camera_view_pan_x))}, {int(round(camera_view_pan_y))})")
 
                 backend_txt = "BASLER" if _camera_backend_name() == CAMERA_BACKEND_BASLER else "RS"
                 cam_lock_txt = "LOCKED" if camera_settings_locked else "UNLOCKED"
