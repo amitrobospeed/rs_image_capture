@@ -13,10 +13,14 @@ import os
 import csv
 import sys
 import subprocess
+import importlib
+import importlib.util
 from datetime import datetime
 
 import cv2
-import pyrealsense2 as rs
+
+rs = importlib.import_module("pyrealsense2") if importlib.util.find_spec("pyrealsense2") else None
+pylon = importlib.import_module("pypylon.pylon") if importlib.util.find_spec("pypylon.pylon") else None
 
 from Phidget22.Devices.VoltageRatioInput import VoltageRatioInput
 from dorna2 import Dorna
@@ -62,8 +66,15 @@ OUTPUT_MODE_DURABILITY = "cycle_durability"
 OUTPUT_MODE_VISUAL = "cycle_visual"
 OUTPUT_MODE_MANUAL = "manual_inspection"
 OUTPUT_MODES = (OUTPUT_MODE_DURABILITY, OUTPUT_MODE_VISUAL, OUTPUT_MODE_MANUAL)
-CAMERA_WIDTH = 1920
-CAMERA_HEIGHT = 1080
+CAMERA_BACKEND_REALSENSE = "realsense"
+CAMERA_BACKEND_BASLER = "basler"
+BASLER_USER_SET = "UserSet1"
+REALSENSE_CAMERA_WIDTH = 1920
+REALSENSE_CAMERA_HEIGHT = 1080
+BASLER_CAMERA_WIDTH = 3952
+BASLER_CAMERA_HEIGHT = 2626
+CAMERA_WIDTH = REALSENSE_CAMERA_WIDTH
+CAMERA_HEIGHT = REALSENSE_CAMERA_HEIGHT
 CAMERA_FPS = 15
 TARGET_LUMA_MEAN = 95
 MAX_SAT_PCT = 3.0
@@ -263,6 +274,7 @@ class SystemState:
     insp_min_defect_w: int = INSPECTION_MIN_DEFECT_W
     insp_min_defect_h: int = INSPECTION_MIN_DEFECT_H
     insp_roi_overlap_pct: int = int(round(ROI_ANOMALY_MIN_OVERLAP_RATIO * 100.0))
+    camera_backend: str = CAMERA_BACKEND_REALSENSE
 
 
 def main():
@@ -291,6 +303,8 @@ def main():
     zero_offset = float(np.mean([bridge.getVoltageRatio() for _ in range(TARE_SAMPLES)]))
 
     state = SystemState()
+    if rs is None and pylon is not None:
+        state.camera_backend = CAMERA_BACKEND_BASLER
     state_lock = threading.RLock()
 
     # --- Camera preview (Phase 2A / Phase 3A controls) ---
@@ -465,7 +479,25 @@ def main():
         except Exception:
             return False
 
+    def _camera_backend_name():
+        with state_lock:
+            return state.camera_backend if state.camera_backend in (CAMERA_BACKEND_REALSENSE, CAMERA_BACKEND_BASLER) else CAMERA_BACKEND_REALSENSE
+
+    def _camera_capture_dims():
+        if _camera_backend_name() == CAMERA_BACKEND_BASLER:
+            return BASLER_CAMERA_WIDTH, BASLER_CAMERA_HEIGHT
+        return REALSENSE_CAMERA_WIDTH, REALSENSE_CAMERA_HEIGHT
+
+    def _camera_backend_available(backend):
+        if backend == CAMERA_BACKEND_BASLER:
+            return pylon is not None
+        if backend == CAMERA_BACKEND_REALSENSE:
+            return rs is not None
+        return False
+
     def _apply_locked_camera_settings(sensor):
+        if rs is None:
+            return
         _try_set_sensor_option(sensor, rs.option.enable_auto_exposure, 0)
         _try_set_sensor_option(sensor, rs.option.exposure, int(camera_exposure))
         _try_set_sensor_option(sensor, rs.option.gain, int(camera_gain))
@@ -474,6 +506,31 @@ def main():
         # D415 safety: force all active IR emitters off when the option is available.
         _try_set_sensor_option(sensor, rs.option.emitter_enabled, 0)
         _try_set_sensor_option(sensor, rs.option.laser_power, 0)
+
+    def _set_basler_enum(camera, name, value):
+        try:
+            getattr(camera, name).SetValue(value)
+            return True
+        except Exception:
+            return False
+
+    def _set_basler_value(camera, name, value):
+        try:
+            getattr(camera, name).SetValue(value)
+            return True
+        except Exception:
+            return False
+
+    def _apply_basler_user_set(camera):
+        if pylon is None:
+            return False
+        ok_sel = _set_basler_enum(camera, "UserSetSelector", BASLER_USER_SET)
+        try:
+            camera.UserSetLoad.Execute()
+            ok_load = True
+        except Exception:
+            ok_load = False
+        return ok_sel and ok_load
 
     def start_camera_preview():
         nonlocal camera_thread, camera_latest_frame, camera_sensor
@@ -484,9 +541,83 @@ def main():
 
         def _camera_worker():
             nonlocal camera_latest_frame, camera_sensor
+            backend = _camera_backend_name()
+            if backend == CAMERA_BACKEND_BASLER:
+                if pylon is None:
+                    _set_camera_status("camera:basler_unavailable")
+                    return
+                tl_factory = pylon.TlFactory.GetInstance()
+                devices = tl_factory.EnumerateDevices()
+                if not devices:
+                    _set_camera_status("camera:basler_not_found")
+                    return
+                camera = pylon.InstantCamera(tl_factory.CreateDevice(devices[0]))
+                converter = pylon.ImageFormatConverter()
+                converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+                converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+                try:
+                    camera.Open()
+                    user_set_ok = _apply_basler_user_set(camera)
+                    if not user_set_ok:
+                        _set_camera_status("camera:basler_userset_warn")
+                    with camera_hw_lock:
+                        camera_sensor = camera
+                    camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+                except Exception:
+                    _set_camera_status("camera:basler_open_failed")
+                    try:
+                        camera.Close()
+                    except Exception:
+                        pass
+                    return
+
+                _set_camera_status(f"camera:live:{backend}")
+                try:
+                    while not camera_stop_evt.is_set():
+                        try:
+                            grab = camera.RetrieveResult(1000, pylon.TimeoutHandling_Return)
+                        except Exception:
+                            _set_camera_status("camera:frame_timeout")
+                            time.sleep(0.05)
+                            continue
+                        if grab is None:
+                            _set_camera_status("camera:no_color_frame")
+                            continue
+                        try:
+                            if not grab.GrabSucceeded():
+                                _set_camera_status("camera:grab_failed")
+                                continue
+                            frame = converter.Convert(grab).GetArray()
+                            with camera_lock:
+                                camera_latest_frame = frame.copy()
+                        finally:
+                            try:
+                                grab.Release()
+                            except Exception:
+                                pass
+                finally:
+                    with camera_hw_lock:
+                        camera_sensor = None
+                    try:
+                        if camera.IsGrabbing():
+                            camera.StopGrabbing()
+                    except Exception:
+                        pass
+                    try:
+                        if camera.IsOpen():
+                            camera.Close()
+                    except Exception:
+                        pass
+                return
+
+            if rs is None:
+                _set_camera_status("camera:realsense_unavailable")
+                return
+
             pipeline = rs.pipeline()
             config = rs.config()
-            config.enable_stream(rs.stream.color, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.bgr8, CAMERA_FPS)
+            width, height = _camera_capture_dims()
+            config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, CAMERA_FPS)
 
             try:
                 profile = pipeline.start(config)
@@ -502,9 +633,8 @@ def main():
             except Exception:
                 _set_camera_status("camera:sensor_setup_failed")
 
-            _set_camera_status("camera:live")
+            _set_camera_status(f"camera:live:{backend}")
 
-            # warmup frames
             for _ in range(8):
                 try:
                     pipeline.wait_for_frames(1000)
@@ -528,8 +658,6 @@ def main():
                     frame = np.asanyarray(color.get_data())
                     with camera_lock:
                         camera_latest_frame = frame.copy()
-
-                    # Frame is rendered inside the matplotlib window (same app window).
             finally:
                 with camera_hw_lock:
                     camera_sensor = None
@@ -542,9 +670,12 @@ def main():
         camera_thread.start()
 
     def stop_camera_preview():
+        nonlocal camera_latest_frame
         camera_stop_evt.set()
         if camera_thread is not None:
             camera_thread.join(timeout=1.5)
+        with camera_lock:
+            camera_latest_frame = None
 
     def get_latest_camera_frame():
         with camera_lock:
@@ -571,6 +702,11 @@ def main():
 
     def run_camera_auto_tune():
         nonlocal camera_exposure, camera_gain, camera_white_balance, camera_settings_locked, camera_tuned_once
+        if _camera_backend_name() == CAMERA_BACKEND_BASLER:
+            camera_settings_locked = True
+            camera_tuned_once = True
+            set_alert("green", f"Basler backend active: using {BASLER_USER_SET}")
+            return True
         with camera_hw_lock:
             sensor = camera_sensor
         if sensor is None:
@@ -1762,7 +1898,8 @@ def main():
     ax_cam.set_xticks([])
     ax_cam.set_yticks([])
     ax_cam.set_facecolor("#0b1220")
-    cam_placeholder = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+    _cam_h, _cam_w = _camera_capture_dims()[1], _camera_capture_dims()[0]
+    cam_placeholder = np.zeros((_cam_h, _cam_w, 3), dtype=np.uint8)
     camera_im = ax_cam.imshow(cam_placeholder)
 
     # Messages (no bbox), keep two-line spacing at ~1.5 lines
@@ -1912,8 +2049,10 @@ def main():
     tb_cap_every = TextBox(fig.add_axes([content_x, cap_box_y, auto_tb_w, auto_tb_h]), "", initial=str(state.capture_every_x_cycles))
     tb_cap_retry = TextBox(fig.add_axes([retry_label_x, cap_box_y, auto_tb_w, auto_tb_h]), "", initial=str(state.auto_capture_retries))
     btn_fail_policy = Button(fig.add_axes([retry_label_x + auto_tb_w + 0.012, cap_box_y, auto_tb_w + 0.02, auto_tb_h]), "Fail:STOP", color="#991b1b", hovercolor="#7f1d1d")
+    backend_btn_y = cap_box_y - auto_tb_h - 0.010
+    btn_camera_backend = Button(fig.add_axes([content_x, backend_btn_y, 0.17, auto_tb_h]), "Camera: RS", color="#1d4ed8", hovercolor="#1e40af")
 
-    msg_row_1 = cap_box_y - (1.3 * auto_row_h)
+    msg_row_1 = backend_btn_y - (1.3 * auto_row_h)
     auto_status_1 = fig.text(content_x, msg_row_1 - (0 * auto_row_h), "", fontsize=auto_msg_font, color="#e2e8f0")
     auto_status_2 = fig.text(content_x, msg_row_1 - (1 * auto_row_h), "", fontsize=auto_msg_font, color="#e2e8f0")
     auto_status_3 = fig.text(content_x, msg_row_1 - (2 * auto_row_h), "", fontsize=auto_msg_font, color="#e2e8f0")
@@ -1947,9 +2086,9 @@ def main():
     btn_popup_reuse.ax.set_visible(False)
 
     for _btn in [btn_start, btn_pause, btn_stop, btn_home, btn_reset, btn_exit, btn_report, btn_tare_on_start, btn_auto_cap, btn_fail_policy,
-                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_vi_start, btn_vi_stop, btn_popup_recapture, btn_popup_reuse]:
+                 btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_vi_start, btn_vi_stop, btn_popup_recapture, btn_popup_reuse, btn_camera_backend]:
         _btn.label.set_color("white")
-        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_vi_start, btn_vi_stop, btn_popup_recapture, btn_popup_reuse, btn_tare_on_start, btn_auto_cap, btn_fail_policy] else 12)
+        _btn.label.set_fontsize(8 if _btn in [btn_ic_home, btn_return_test, btn_camera_tune, btn_golden_capture, btn_image_capture, btn_run_inspection, btn_re_tare, btn_cam_tune_toggle, btn_detect_contour, btn_detect_white, btn_lock_roi, btn_coating_gate, btn_baseline_q, btn_vi_start, btn_vi_stop, btn_popup_recapture, btn_popup_reuse, btn_tare_on_start, btn_auto_cap, btn_fail_policy, btn_camera_backend] else 12)
 
     for _tb in [tb_vel, tb_acc, tb_jerk, tb_cyc, tb_base]:
         _tb.label.set_color("white")
@@ -2035,6 +2174,15 @@ def main():
         else:
             btn_cam_tune_toggle.label.set_text("CamTune: OFF")
             btn_cam_tune_toggle.ax.set_facecolor("#7f1d1d")
+
+    def update_camera_backend_button():
+        backend = _camera_backend_name()
+        if backend == CAMERA_BACKEND_BASLER:
+            btn_camera_backend.label.set_text("Camera: BAS")
+            btn_camera_backend.ax.set_facecolor("#7c3aed")
+        else:
+            btn_camera_backend.label.set_text("Camera: RS")
+            btn_camera_backend.ax.set_facecolor("#1d4ed8")
 
     def update_detector_buttons():
         with state_lock:
@@ -2704,6 +2852,11 @@ def main():
         print(f"[GUI] Image Capture saved -> {out_path}")
 
     def on_camera_tune(_evt):
+        if _camera_backend_name() == CAMERA_BACKEND_BASLER:
+            ok = run_camera_auto_tune()
+            if ok:
+                print(f"[GUI] Basler using {BASLER_USER_SET}")
+            return
         ok = run_camera_auto_tune()
         if ok:
             print(f"[GUI] Camera tuned and locked exp={camera_exposure} gain={camera_gain} wb={camera_white_balance}")
@@ -2716,6 +2869,19 @@ def main():
             set_alert("#166534", "Camera tune enabled")
         else:
             set_alert("#f59e0b", "Camera tune disabled (inspection still allowed)")
+
+    def on_toggle_camera_backend(_evt):
+        current = _camera_backend_name()
+        nxt = CAMERA_BACKEND_BASLER if current == CAMERA_BACKEND_REALSENSE else CAMERA_BACKEND_REALSENSE
+        if not _camera_backend_available(nxt):
+            set_alert("red", f"Camera backend unavailable: {nxt}")
+            return
+        with state_lock:
+            state.camera_backend = nxt
+        stop_camera_preview()
+        start_camera_preview()
+        update_camera_backend_button()
+        set_alert("#7c3aed" if nxt == CAMERA_BACKEND_BASLER else "#1d4ed8", f"Camera backend set to {nxt}")
 
     def on_golden_capture(_evt, mode=OUTPUT_MODE_MANUAL):
         nonlocal golden_frame, golden_path, locked_roi, roi_locked, button_rois, area_l_roi, button_color_baselines, button_roi_locked, button_fail_history
@@ -3569,6 +3735,7 @@ def main():
     btn_tare_on_start.on_clicked(on_toggle_tare_on_start)
     btn_auto_cap.on_clicked(on_toggle_auto_cap)
     btn_cam_tune_toggle.on_clicked(on_toggle_cam_tune)
+    btn_camera_backend.on_clicked(on_toggle_camera_backend)
     btn_fail_policy.on_clicked(on_toggle_fail_policy)
     btn_detect_contour.on_clicked(on_toggle_detect_contour)
     btn_detect_white.on_clicked(on_toggle_detect_white)
@@ -3592,6 +3759,7 @@ def main():
     update_tare_toggle_button()
     update_auto_cap_button()
     update_cam_tune_toggle_button()
+    update_camera_backend_button()
     update_fail_policy_button()
     update_detector_buttons()
     update_coating_gate_button()
@@ -4005,8 +4173,9 @@ def main():
                 if frame is not None:
                     camera_im.set_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
+                backend_txt = "BASLER" if _camera_backend_name() == CAMERA_BACKEND_BASLER else "RS"
                 cam_lock_txt = "LOCKED" if camera_settings_locked else "UNLOCKED"
-                tune_state = "TUNE:ON" if camera_tune_enabled else "TUNE:OFF"
+                tune_state = f"{BASLER_USER_SET}" if _camera_backend_name() == CAMERA_BACKEND_BASLER else ("TUNE:ON" if camera_tune_enabled else "TUNE:OFF")
                 tare_txt = "Tare@Start:ON" if state.tare_on_start else "Tare@Start:OFF"
                 sched_txt = "ON" if state.auto_capture_enabled else "OFF"
                 gold_txt = "READY" if state.golden_ready else "NO"
@@ -4016,7 +4185,7 @@ def main():
                     f"State: {mode} | Mode: {robot_mode_text} | {manual_state} | {tare_txt} | Cycle: {state.cycle_count}/{state.target_cycles} | Next: {btn}-{ph} | {baseline_txt} | {alert_msg}"
                 )
                 roi_txt = f"ROI:LOCKED {list(button_rois.keys())}" if (button_roi_locked and button_rois) else (f"ROI:LOCKED {locked_roi}" if (roi_locked and locked_roi is not None) else "ROI:UNSET")
-                auto_status_1.set_text(f"Camera: {camera_txt} / {cam_lock_txt} / {tune_state}")
+                auto_status_1.set_text(f"Camera: {backend_txt} / {camera_txt} / {cam_lock_txt} / {tune_state}")
                 auto_status_2.set_text(f"AutoCap: {sched_txt} every={state.capture_every_x_cycles} next={next_cap} retries={state.auto_capture_retries}")
                 auto_status_3.set_text(f"Golden ready: {gold_txt}")
                 bq = "ON" if state.baseline_quality_enabled else "OFF"
