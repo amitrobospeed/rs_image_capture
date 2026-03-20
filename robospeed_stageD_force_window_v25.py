@@ -555,14 +555,11 @@ def main():
                 converter = pylon.ImageFormatConverter()
                 converter.OutputPixelFormat = pylon.PixelType_BGR8packed
                 converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
-                width, height = _camera_capture_dims()
                 try:
                     camera.Open()
-                    _apply_basler_user_set(camera)
-                    _set_basler_enum(camera, "PixelFormat", "BGR8")
-                    _set_basler_value(camera, "Width", int(width))
-                    _set_basler_value(camera, "Height", int(height))
-                    _set_basler_enum(camera, "AcquisitionMode", "Continuous")
+                    user_set_ok = _apply_basler_user_set(camera)
+                    if not user_set_ok:
+                        _set_camera_status("camera:basler_userset_warn")
                     with camera_hw_lock:
                         camera_sensor = camera
                     camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
