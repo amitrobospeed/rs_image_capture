@@ -43,6 +43,7 @@ import time
 import logging
 import argparse
 import threading
+from statistics import fmean
 from dataclasses import dataclass
 from typing import Optional
 
@@ -67,6 +68,18 @@ BUTTON_ORDER = ("A", "B", "C", "D")
 PHASES = ("above", "press", "retract")
 PEAK_START_THRESHOLD = 0.5
 DEVIATION_THRESHOLD = 0.50
+SAFE_START_VEL = 100
+SAFE_START_ACC = 200
+SAFE_START_JERK = 2000
+
+HOME_POSE = {
+    "x": 318.06,
+    "y": -38.16,
+    "z": 200.0,
+    "a": -173.0,
+    "b": 41.62,
+    "c": -3.53,
+}
 
 BUTTON_POSES = {
     "A": {
@@ -156,7 +169,17 @@ class InspectionCapture:
 @dataclass
 class ControllerConfig:
     motion_port     : str  = "COM3"
+    motion_host     : str  = ""
+    motion_tcp_port : int  = 443
+    motion_timeout_s: float = 20.0
     daq_port        : str  = "COM4"
+    daq_type        : str  = "auto"
+    phidget_serial_number: int = 781028
+    phidget_channel : int  = 0
+    force_calibration: float = 68000.0
+    tare_samples    : int  = 200
+    tare_warmup_s   : float = 3.0
+    force_data_interval_ms: int = 8
     camera_c1_id    : int  = 0
     camera_c2_id    : int  = 1
     sim_mode        : bool = True
@@ -171,29 +194,72 @@ class MotionDriver:
         self._connected = False
         self._params = MotionParams()
         self._sim_phase_seconds = {"above": 0.12, "press": 0.18, "retract": 0.14}
+        self._robot = None
+        self._backend = "sim" if config.sim_mode else "unconfigured"
 
     def connect(self) -> bool:
         if self._cfg.sim_mode:
             log.info("MotionDriver: simulation mode — no serial connection")
             self._connected = True
+            self._backend = "sim"
             return True
+        if self._cfg.motion_host:
+            if self._connect_dorna():
+                return True
         try:
             import serial
             self._ser = serial.Serial(self._cfg.motion_port, 115200, timeout=1)
             self._connected = True
+            self._backend = "serial"
             log.info(f"MotionDriver: connected on {self._cfg.motion_port}")
             return True
         except Exception as e:
             log.error(f"MotionDriver.connect failed: {e}")
             return False
 
+    def _connect_dorna(self) -> bool:
+        try:
+            from dorna2 import Dorna
+        except Exception as e:
+            log.warning(f"MotionDriver: dorna2 unavailable: {e}")
+            return False
+        try:
+            self._robot = Dorna()
+            self._robot.connect(host=self._cfg.motion_host, port=self._cfg.motion_tcp_port)
+            self._connected = True
+            self._backend = "dorna"
+            log.info(
+                "MotionDriver: connected to Dorna at %s:%s",
+                self._cfg.motion_host,
+                self._cfg.motion_tcp_port,
+            )
+            return True
+        except Exception as e:
+            self._robot = None
+            log.error(f"MotionDriver._connect_dorna failed: {e}")
+            return False
+
     def disconnect(self):
+        if self._backend == "dorna" and self._robot is not None:
+            try:
+                self._robot.close()
+            except Exception:
+                pass
         if not self._cfg.sim_mode and hasattr(self, "_ser"):
             self._ser.close()
         self._connected = False
 
     def home(self) -> bool:
         log.info("MotionDriver: HOME command")
+        if self._cfg.sim_mode:
+            return True
+        if self._backend == "dorna":
+            return self._move_dorna(
+                HOME_POSE,
+                vel=SAFE_START_VEL,
+                acc=SAFE_START_ACC,
+                jerk=SAFE_START_JERK,
+            )
         return True
 
     def set_params(self, params: MotionParams):
@@ -207,6 +273,14 @@ class MotionDriver:
 
     def stop(self):
         log.info("MotionDriver: STOP command")
+        if self._backend == "dorna" and self._robot is not None:
+            for cmd_name in ("halt", "stop"):
+                try:
+                    self._robot.play(-1, {"cmd": cmd_name})
+                    return
+                except Exception:
+                    continue
+            log.warning("MotionDriver: unable to issue Dorna stop command; check robot state")
 
     def record_trajectory(self):
         log.info("MotionDriver: RECORD TRAJECTORY command")
@@ -222,6 +296,15 @@ class MotionDriver:
         if self._cfg.sim_mode:
             time.sleep(self.phase_duration(phase))
             return True
+        if self._backend == "dorna":
+            vel = self._params.velocity
+            acc = self._params.acceleration
+            jerk = self._params.jerk
+            if button == "A" and phase == "above":
+                vel = min(vel, SAFE_START_VEL)
+                acc = min(acc, SAFE_START_ACC)
+                jerk = min(jerk, SAFE_START_JERK)
+            return self._move_dorna(pose, vel=vel, acc=acc, jerk=jerk)
         try:
             cmd = dict(
                 cmd="jmove",
@@ -240,7 +323,64 @@ class MotionDriver:
 
     def safe_align(self) -> bool:
         log.info("MotionDriver: SAFE ALIGN A-above")
+        if self._backend == "dorna":
+            return self._move_dorna(
+                BUTTON_POSES["A"]["above"],
+                vel=SAFE_START_VEL,
+                acc=SAFE_START_ACC,
+                jerk=SAFE_START_JERK,
+            )
         return self.move_to_pose("A", "above")
+
+    def _extract_stat(self, resp) -> Optional[int]:
+        if isinstance(resp, dict):
+            if "stat" in resp:
+                return int(resp["stat"])
+            if "union" in resp and isinstance(resp["union"], dict) and "stat" in resp["union"]:
+                return int(resp["union"]["stat"])
+            if "msgs" in resp and isinstance(resp["msgs"], list) and resp["msgs"]:
+                msg0 = resp["msgs"][0]
+                if isinstance(msg0, dict) and "stat" in msg0:
+                    return int(msg0["stat"])
+        return None
+
+    def _is_dorna_idle(self) -> bool:
+        if self._robot is None:
+            return False
+        try:
+            stat_resp = self._robot.play(-1, {"cmd": "stat"})
+            stat = self._extract_stat(stat_resp)
+            return stat == -1
+        except Exception:
+            return False
+
+    def _wait_until_idle(self, timeout_s: Optional[float] = None) -> bool:
+        deadline = time.time() + (timeout_s or self._cfg.motion_timeout_s)
+        while time.time() < deadline:
+            if self._is_dorna_idle():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _move_dorna(self, pose: dict, *, vel: int, acc: int, jerk: int) -> bool:
+        if self._robot is None:
+            return False
+        try:
+            self._robot.play(
+                -1,
+                {
+                    "cmd": "jmove",
+                    "rel": 0,
+                    "vel": int(vel),
+                    "acc": int(acc),
+                    "jerk": int(jerk),
+                    **pose,
+                },
+            )
+            return self._wait_until_idle()
+        except Exception as e:
+            log.error(f"MotionDriver._move_dorna failed: {e}")
+            return False
 
 
 class ForceDAQ:
@@ -248,21 +388,62 @@ class ForceDAQ:
         self._cfg = config
         self._connected = False
         self._t0 = time.time()
+        self._bridge = None
+        self._backend = "sim" if config.sim_mode else "unconfigured"
+        self._zero_offset = 0.0
 
     def connect(self) -> bool:
         if self._cfg.sim_mode:
             self._connected = True
+            self._backend = "sim"
             return True
+        if self._cfg.daq_type in ("auto", "phidget"):
+            if self._connect_phidget():
+                return True
         try:
             import serial
             self._ser = serial.Serial(self._cfg.daq_port, 115200, timeout=0.1)
             self._connected = True
+            self._backend = "serial"
             return True
         except Exception as e:
             log.error(f"ForceDAQ.connect failed: {e}")
             return False
 
+    def _connect_phidget(self) -> bool:
+        try:
+            from Phidget22.Devices.VoltageRatioInput import VoltageRatioInput
+        except Exception as e:
+            log.warning(f"ForceDAQ: Phidget library unavailable: {e}")
+            return False
+        try:
+            bridge = VoltageRatioInput()
+            if self._cfg.phidget_serial_number > 0:
+                bridge.setDeviceSerialNumber(self._cfg.phidget_serial_number)
+            bridge.setChannel(self._cfg.phidget_channel)
+            bridge.openWaitForAttachment(5000)
+            bridge.setDataInterval(self._cfg.force_data_interval_ms)
+            self._bridge = bridge
+            self._connected = True
+            self._backend = "phidget"
+            self.tare()
+            log.info(
+                "ForceDAQ: connected to Phidget serial=%s channel=%s",
+                self._cfg.phidget_serial_number,
+                self._cfg.phidget_channel,
+            )
+            return True
+        except Exception as e:
+            self._bridge = None
+            log.error(f"ForceDAQ._connect_phidget failed: {e}")
+            return False
+
     def disconnect(self):
+        if self._bridge is not None:
+            try:
+                self._bridge.close()
+            except Exception:
+                pass
         if not self._cfg.sim_mode and hasattr(self, "_ser"):
             self._ser.close()
 
@@ -272,7 +453,28 @@ class ForceDAQ:
             import random
             t = time.time() - self._t0
             return max(0.0, 1.1 * math.sin(2 * math.pi * 0.2 * t) + random.gauss(0, 0.015))
+        if self._backend == "phidget" and self._bridge is not None:
+            try:
+                raw = float(self._bridge.getVoltageRatio())
+                return float((raw - self._zero_offset) * self._cfg.force_calibration)
+            except Exception as e:
+                log.error(f"ForceDAQ.read_lbs phidget failed: {e}")
+                return 0.0
         return 0.0
+
+    def tare(self) -> bool:
+        if self._backend != "phidget" or self._bridge is None:
+            return True
+        try:
+            if self._cfg.tare_warmup_s > 0:
+                time.sleep(self._cfg.tare_warmup_s)
+            samples = [float(self._bridge.getVoltageRatio()) for _ in range(max(1, self._cfg.tare_samples))]
+            self._zero_offset = float(fmean(samples))
+            log.info("ForceDAQ: tare complete zero_offset=%.8f", self._zero_offset)
+            return True
+        except Exception as e:
+            log.error(f"ForceDAQ.tare failed: {e}")
+            return False
 
 
 class VisionDriver:
@@ -720,6 +922,11 @@ class RoboSpeedController(QObject):
             log.info("Test resumed")
             return
 
+        if not self._cfg.sim_mode and not self._daq.tare():
+            self._set_status(gui.C["RED"], "Tare failed", "Force DAQ tare failed; start aborted", 4.0)
+            log.error("Test start aborted: tare failed")
+            return
+
         project = self._win.txtProject.text().strip() or "Project"
         profile = self._win.txtTestProfile.text().strip() or "Profile"
         self._logger = DataLogger(project, profile)
@@ -927,7 +1134,17 @@ def _parse_args():
     p.add_argument("--sim", action="store_true", default=True, help="Simulation mode (no real hardware)")
     p.add_argument("--no-sim", action="store_false", dest="sim", help="Connect to real hardware")
     p.add_argument("--motion-port", default="COM3", help="Serial port for motion controller (default COM3)")
+    p.add_argument("--motion-host", default=os.environ.get("DORNA_HOST", ""), help="Dorna host/IP for robot motion controller")
+    p.add_argument("--motion-tcp-port", type=int, default=int(os.environ.get("DORNA_PORT", "443")), help="Dorna TCP port (default 443)")
+    p.add_argument("--motion-timeout", type=float, default=20.0, help="Seconds to wait for robot motion completion")
     p.add_argument("--daq-port", default="COM4", help="Serial port for force DAQ (default COM4)")
+    p.add_argument("--daq-type", choices=["auto", "phidget", "serial"], default="auto", help="Force DAQ backend")
+    p.add_argument("--phidget-serial", type=int, default=int(os.environ.get("PHIDGET_SERIAL", "781028")), help="Phidget serial number")
+    p.add_argument("--phidget-channel", type=int, default=int(os.environ.get("PHIDGET_CHANNEL", "0")), help="Phidget channel number")
+    p.add_argument("--force-calibration", type=float, default=float(os.environ.get("FORCE_CALIBRATION", "68000")), help="Force calibration factor lbs/ratio")
+    p.add_argument("--tare-samples", type=int, default=int(os.environ.get("FORCE_TARE_SAMPLES", "200")), help="Number of samples to average during tare")
+    p.add_argument("--tare-warmup", type=float, default=float(os.environ.get("FORCE_TARE_WARMUP_S", "3.0")), help="Warmup seconds before tare")
+    p.add_argument("--force-data-interval-ms", type=int, default=int(os.environ.get("FORCE_DATA_INTERVAL_MS", "8")), help="Phidget data interval in ms")
     p.add_argument("--cam-c1", type=int, default=0, help="OpenCV index for camera C1")
     p.add_argument("--cam-c2", type=int, default=1, help="OpenCV index for camera C2")
     return p.parse_args()
@@ -937,7 +1154,17 @@ def main():
     args = _parse_args()
     cfg = ControllerConfig(
         motion_port=args.motion_port,
+        motion_host=args.motion_host,
+        motion_tcp_port=args.motion_tcp_port,
+        motion_timeout_s=args.motion_timeout,
         daq_port=args.daq_port,
+        daq_type=args.daq_type,
+        phidget_serial_number=args.phidget_serial,
+        phidget_channel=args.phidget_channel,
+        force_calibration=args.force_calibration,
+        tare_samples=args.tare_samples,
+        tare_warmup_s=args.tare_warmup,
+        force_data_interval_ms=args.force_data_interval_ms,
         camera_c1_id=args.cam_c1,
         camera_c2_id=args.cam_c2,
         sim_mode=args.sim,

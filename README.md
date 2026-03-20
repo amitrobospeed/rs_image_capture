@@ -96,7 +96,10 @@ python robospeed_gui_main.py
 ```powershell
 python robospeed_controller.py --no-sim --motion-port COM3 --daq-port COM4
 python robospeed_controller.py --no-sim --motion-port COM3 --daq-port COM4 --cam-c1 0 --cam-c2 1
+python robospeed_controller.py --no-sim --motion-host 192.168.1.24 --daq-type phidget --phidget-serial 781028 --phidget-channel 0
 ```
+
+> Use `--motion-host` for Dorna-over-network hardware and `--daq-type phidget` for the Stage D Phidget force sensor path.
 
 ---
 
