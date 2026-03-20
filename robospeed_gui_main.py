@@ -537,6 +537,7 @@ class ForceGraph(QWidget):
         self._curve   = self._pw.plot(pen=pg.mkPen(C["FORCE_LINE"], width=2))
         self._scatter = pg.ScatterPlotItem(size=9, pen=pg.mkPen(None))
         self._pw.addItem(self._scatter)
+        self._peak_labels = []
 
         pr = QHBoxLayout(); pr.setContentsMargins(0,0,0,0)
         self._bl_lbl  = ILabel("Learning Baseline 0/30", size=8, color=C["TEXT_SUB"])
@@ -563,6 +564,7 @@ class ForceGraph(QWidget):
         self._pw.setLabel("bottom", "Time (s)" if mode=="time" else "Cycle #",
                           color=C["TEXT_SUB"], size="9pt")
         self._redraw()
+        self.set_peaks(getattr(self, "_last_peaks", []))
 
     def _redraw(self):
         if len(self._tbuf) < 2: return
@@ -599,11 +601,49 @@ class ForceGraph(QWidget):
     def set_band(self, fmin, fmax): self._band.setRegion([fmin, fmax])
 
     def set_peaks(self, peaks):
-        if peaks:
-            self._scatter.setData(
-                [p[0] for p in peaks], [p[1] for p in peaks],
-                brush=[pg.mkBrush(255,69,58) if p[3] else pg.mkBrush(48,209,88) for p in peaks])
-        else: self._scatter.clear()
+        self._last_peaks = list(peaks)
+        for item in self._peak_labels:
+            self._pw.removeItem(item)
+        self._peak_labels = []
+
+        if not peaks:
+            self._scatter.clear()
+            return
+
+        spots = []
+        for peak in peaks:
+            if isinstance(peak, dict):
+                x = peak.get("t", 0.0) if self._mode == "time" else peak.get("cycle", 0)
+                y = peak.get("y", 0.0)
+                button = peak.get("button", "?")
+                missed = bool(peak.get("missed", False))
+                anomaly = peak.get("anomaly_type", "normal")
+            else:
+                x, y = peak[0], peak[1]
+                button = peak[2] if len(peak) > 2 else "?"
+                missed = bool(peak[3]) if len(peak) > 3 else False
+                anomaly = peak[4] if len(peak) > 4 else ("missed_peak" if missed else "normal")
+
+            if missed:
+                brush = pg.mkBrush(255, 69, 58)
+                label = f"{button} MISS"
+            elif anomaly == "baseline_deviation":
+                brush = pg.mkBrush(255, 159, 10)
+                label = f"{button} DEV"
+            elif anomaly == "force_out_of_range":
+                brush = pg.mkBrush(255, 214, 10)
+                label = f"{button} OOR"
+            else:
+                brush = pg.mkBrush(48, 209, 88)
+                label = button
+
+            spots.append({"pos": (x, y), "brush": brush, "data": {"label": label}})
+            text = pg.TextItem(label, color=brush.color())
+            text.setPos(x, y + (0.08 if missed else 0.05))
+            self._pw.addItem(text)
+            self._peak_labels.append(text)
+
+        self._scatter.setData(spots)
 
     def set_progress(self, pct):
         self._bar.set_pct(pct); self._prog_pct.setText(f"{int(pct*100)} %")
@@ -1997,8 +2037,13 @@ class MainWindow(QMainWindow):
             vel=DEFAULTS["vel"], acc=DEFAULTS["acc"], jerk=DEFAULTS["jerk"],
             baseline_cycles=DEFAULTS["baseline_cycles"],
             baseline_ready=False, baseline_count=0,
+            baseline_mean={},
+            baseline_peaks={},
             force_out_of_range=dict(A=0,B=0,C=0,D=0),
             button_did_not_retract=dict(A=0,B=0,C=0,D=0),
+            current_button="—", current_phase="idle",
+            next_button="A", next_phase="above",
+            status_detail="Ready",
             alert_msg="", alert_color=None, alert_until=0.0,
         )
         self._lock = threading.RLock(); self._t0 = time.time()
@@ -2241,7 +2286,13 @@ class MainWindow(QMainWindow):
         now  = time.time()
         amsg = st["alert_msg"]   if now <= st["alert_until"] else ""
         aclr = st["alert_color"] if now <= st["alert_until"] else None
-        self.bottom.set_status(mode, st["cycle_count"], st["target_cycles"], amsg, aclr)
+        phase_txt = f"{st.get('current_button', '—')}-{st.get('current_phase', 'idle')}"
+        status_msg = amsg or st.get("status_detail", "")
+        if status_msg:
+            status_msg = f"{phase_txt} · {status_msg}"
+        else:
+            status_msg = phase_txt
+        self.bottom.set_status(mode, st["cycle_count"], st["target_cycles"], status_msg, aclr)
 
         # Correct baseline/anomaly label logic
         bl_ready = st["baseline_ready"]
@@ -2254,13 +2305,19 @@ class MainWindow(QMainWindow):
             bl_txt = "Detecting Anomalies"
         else:
             bl_txt = f"Baseline {bl_count}/{bl_max}"
-        self.bottom.set_params(f"Vel:{st['vel']}  Acc:{st['acc']}  Jerk:{st['jerk']}  |  {bl_txt}")
+        next_txt = f"Next:{st.get('next_button', 'A')}-{st.get('next_phase', 'above')}"
+        base_mean = st.get("baseline_mean", {})
+        base_parts = [f"{b}:{base_mean[b]:.2f}" for b in ("A","B","C","D") if b in base_mean]
+        base_detail = f"  |  Mean {' / '.join(base_parts)}" if base_parts else ""
+        self.bottom.set_params(
+            f"Vel:{st['vel']}  Acc:{st['acc']}  Jerk:{st['jerk']}  |  {bl_txt}  |  {next_txt}{base_detail}"
+        )
         self.bottom.set_failures(st["force_out_of_range"], st["button_did_not_retract"])
         self.force_graph.set_band(st["force_min"], st["force_max"])
         tc = max(1, st["target_cycles"])
         self.force_graph.set_progress(min(1.0, st["cycle_count"] / tc))
         t_now = time.time() - self._t0
-        while self._peak_events and t_now - self._peak_events[0][0] > 10.0:
+        while self._peak_events and t_now - self._peak_events[0].get("t", 0.0) > 10.0:
             self._peak_events.popleft()
         self.force_graph.set_peaks(list(self._peak_events))
 
@@ -2311,6 +2368,10 @@ class MainWindow(QMainWindow):
                 force_out_of_range=dict(A=0,B=0,C=0,D=0),
                 button_did_not_retract=dict(A=0,B=0,C=0,D=0),
                 cycle_count=0, baseline_ready=False, baseline_count=0,
+                baseline_mean={}, baseline_peaks={},
+                current_button="—", current_phase="idle",
+                next_button="A", next_phase="above",
+                status_detail="Ready",
             )
         self._peak_events.clear()
         self.right.reset_baseline()
