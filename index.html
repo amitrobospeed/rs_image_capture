@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RoboSpeed — Rapid Durability Testing for Product Teams</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #121933;
+      --panel-2: #0f1530;
+      --text: #eef2ff;
+      --muted: #a9b4d0;
+      --line: rgba(255,255,255,0.12);
+      --accent: #6ea8fe;
+      --accent-2: #7ef0c4;
+      --danger: #ff7b7b;
+      --shadow: 0 20px 60px rgba(0,0,0,0.35);
+      --radius: 20px;
+      --max: 1180px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: Inter, Arial, Helvetica, sans-serif;
+      background:
+        radial-gradient(circle at top right, rgba(110,168,254,0.18), transparent 28%),
+        radial-gradient(circle at top left, rgba(126,240,196,0.10), transparent 24%),
+        var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+
+    a { color: inherit; text-decoration: none; }
+    img { max-width: 100%; display: block; }
+
+    .container { width: min(var(--max), calc(100% - 32px)); margin: 0 auto; }
+
+    .nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      backdrop-filter: blur(12px);
+      background: rgba(11,16,32,0.72);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .nav-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 0;
+      gap: 20px;
+    }
+
+    .brand {
+      font-size: 1.2rem;
+      font-weight: 800;
+      letter-spacing: 0.3px;
+    }
+
+    .brand span { color: var(--accent-2); }
+
+    .nav-links {
+      display: flex;
+      gap: 22px;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .nav-cta {
+      padding: 12px 18px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #07101f;
+      font-weight: 700;
+      box-shadow: var(--shadow);
+    }
+
+    .hero {
+      padding: 84px 0 64px;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 36px;
+      align-items: center;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 14px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.04);
+      border-radius: 999px;
+      color: var(--accent-2);
+      font-weight: 700;
+      font-size: 0.84rem;
+      margin-bottom: 20px;
+    }
+
+    h1 {
+      font-size: clamp(2.4rem, 5vw, 4.8rem);
+      line-height: 1.02;
+      margin: 0 0 18px;
+      letter-spacing: -0.04em;
+    }
+
+    .hero p {
+      color: var(--muted);
+      font-size: 1.08rem;
+      max-width: 720px;
+      margin: 0 0 28px;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-bottom: 26px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 14px 20px;
+      border-radius: 14px;
+      font-weight: 700;
+      border: 1px solid transparent;
+      transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+    }
+
+    .btn:hover { transform: translateY(-2px); }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #08111f;
+      box-shadow: var(--shadow);
+    }
+
+    .btn-secondary {
+      background: rgba(255,255,255,0.04);
+      border-color: var(--line);
+      color: var(--text);
+    }
+
+    .hero-points {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 14px;
+    }
+
+    .mini-card {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+    }
+
+    .mini-card strong {
+      display: block;
+      font-size: 1.1rem;
+      margin-bottom: 5px;
+    }
+
+    .mini-card span {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .dashboard {
+      background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 22px;
+      box-shadow: var(--shadow);
+    }
+
+    .dash-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 18px;
+      gap: 14px;
+    }
+
+    .dash-pill {
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(126,240,196,0.13);
+      color: var(--accent-2);
+      font-weight: 700;
+      font-size: 0.82rem;
+    }
+
+    .dash-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+      min-height: 148px;
+    }
+
+    .panel h3 {
+      margin: 0 0 10px;
+      font-size: 1rem;
+    }
+
+    .bars {
+      display: flex;
+      align-items: end;
+      gap: 10px;
+      height: 110px;
+      margin-top: 10px;
+    }
+
+    .bar {
+      flex: 1;
+      border-radius: 12px 12px 4px 4px;
+      background: linear-gradient(180deg, var(--accent), rgba(126,240,196,0.75));
+      opacity: 0.95;
+    }
+
+    .bar-labels {
+      display: flex;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 0.82rem;
+      margin-top: 8px;
+    }
+
+    .log-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 8px;
+    }
+
+    .log-item {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 0.92rem;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.07);
+    }
+
+    .log-item em {
+      font-style: normal;
+      color: var(--danger);
+      font-weight: 700;
+    }
+
+    section {
+      padding: 32px 0 72px;
+    }
+
+    .section-head {
+      max-width: 760px;
+      margin-bottom: 30px;
+    }
+
+    .section-head h2 {
+      margin: 0 0 12px;
+      font-size: clamp(1.8rem, 3vw, 3rem);
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+    }
+
+    .section-head p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 1.04rem;
+    }
+
+    .cards-3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 18px;
+    }
+
+    .card {
+      background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.025));
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 24px;
+      box-shadow: var(--shadow);
+    }
+
+    .card .num {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      background: rgba(110,168,254,0.14);
+      color: var(--accent);
+      font-weight: 800;
+      margin-bottom: 14px;
+    }
+
+    .card h3 {
+      margin: 0 0 10px;
+      font-size: 1.18rem;
+    }
+
+    .card p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+
+    .checklist {
+      display: grid;
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    .check {
+      padding: 14px 16px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--line);
+      color: var(--text);
+    }
+
+    .check span {
+      color: var(--muted);
+      display: block;
+      margin-top: 4px;
+      font-size: 0.94rem;
+    }
+
+    .steps {
+      display: grid;
+      gap: 14px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 52px 1fr;
+      gap: 16px;
+      align-items: start;
+      padding: 18px;
+      border-radius: 18px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--line);
+    }
+
+    .step .bubble {
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
+      display: grid;
+      place-items: center;
+      background: rgba(126,240,196,0.14);
+      color: var(--accent-2);
+      font-weight: 800;
+      font-size: 1.05rem;
+    }
+
+    .step h4 {
+      margin: 0 0 6px;
+      font-size: 1.05rem;
+    }
+
+    .step p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .testimonial {
+      padding: 26px;
+      border-radius: 24px;
+      background: linear-gradient(180deg, rgba(110,168,254,0.10), rgba(126,240,196,0.06));
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+    }
+
+    .testimonial p {
+      margin: 0 0 12px;
+      font-size: 1.1rem;
+    }
+
+    .pricing-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 18px;
+    }
+
+    .price {
+      position: relative;
+      padding: 26px;
+      border-radius: 22px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.04);
+      box-shadow: var(--shadow);
+    }
+
+    .price.featured {
+      background: linear-gradient(180deg, rgba(110,168,254,0.12), rgba(126,240,196,0.08));
+      transform: translateY(-4px);
+    }
+
+    .badge {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      background: rgba(126,240,196,0.14);
+      color: var(--accent-2);
+      font-weight: 800;
+    }
+
+    .price h3 { margin: 0 0 8px; }
+    .price .amount {
+      font-size: 2.3rem;
+      font-weight: 900;
+      margin: 8px 0 6px;
+      letter-spacing: -0.04em;
+    }
+    .price .sub {
+      color: var(--muted);
+      font-size: 0.94rem;
+      margin-bottom: 18px;
+    }
+
+    .price ul {
+      list-style: none;
+      padding: 0;
+      margin: 0 0 20px;
+      display: grid;
+      gap: 10px;
+      color: var(--muted);
+    }
+
+    .cta-band {
+      margin-top: 26px;
+      padding: 30px;
+      border-radius: 24px;
+      background: linear-gradient(135deg, rgba(110,168,254,0.18), rgba(126,240,196,0.12));
+      border: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+
+    .cta-band h3 {
+      margin: 0 0 8px;
+      font-size: 1.6rem;
+    }
+
+    .cta-band p {
+      margin: 0;
+      color: var(--muted);
+      max-width: 700px;
+    }
+
+    footer {
+      padding: 36px 0 50px;
+      color: var(--muted);
+      font-size: 0.94rem;
+    }
+
+    .footer-inner {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      flex-wrap: wrap;
+      border-top: 1px solid var(--line);
+      padding-top: 22px;
+    }
+
+    @media (max-width: 980px) {
+      .hero-grid,
+      .cards-3,
+      .two-col,
+      .pricing-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .hero-points,
+      .dash-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .nav-links { display: none; }
+    }
+
+    @media (max-width: 640px) {
+      .hero { padding-top: 56px; }
+      .nav-cta { display: none; }
+      .container { width: min(var(--max), calc(100% - 20px)); }
+      .card, .price, .dashboard, .testimonial, .cta-band { padding: 20px; }
+      h1 { font-size: 2.5rem; }
+    }
+  </style>
+</head>
+<body>
+  <header class="nav">
+    <div class="container nav-inner">
+      <a href="#top" class="brand">Robo<span>Speed</span></a>
+      <nav class="nav-links">
+        <a href="#why">Why RoboSpeed</a>
+        <a href="#how">How It Works</a>
+        <a href="#pricing">Pricing</a>
+        <a href="#contact">Contact</a>
+      </nav>
+      <a class="nav-cta" href="#contact">Book a Pilot</a>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="container hero-grid">
+        <div>
+          <div class="eyebrow">Rapid durability validation for product teams</div>
+          <h1>Know which design is better <br/>before you tool, launch, or scale.</h1>
+          <p>
+            RoboSpeed helps teams compare product iterations fast with repeatable robotic durability tests,
+            visual inspection, force tracking, and clean failure reporting. This is not certification.
+            It is the rapid validation layer between design and production.
+          </p>
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="#contact">Request a Test Pilot</a>
+            <a class="btn btn-secondary" href="#why">See How It Works</a>
+          </div>
+          <div class="hero-points">
+            <div class="mini-card">
+              <strong>48-hour insight</strong>
+              <span>Faster feedback for iteration decisions</span>
+            </div>
+            <div class="mini-card">
+              <strong>Repeatable cycles</strong>
+              <span>Buttons, hinges, latches, handles, limbs, and more</span>
+            </div>
+            <div class="mini-card">
+              <strong>Clear failure evidence</strong>
+              <span>Video, force logs, cycle counts, and anomaly markers</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="dashboard">
+          <div class="dash-top">
+            <div>
+              <div style="font-weight:800; font-size:1.15rem;">Sample Test Snapshot</div>
+              <div style="color:var(--muted); font-size:0.93rem; margin-top:4px;">EP1 vs EP2 latch durability comparison</div>
+            </div>
+            <div class="dash-pill">Run Active</div>
+          </div>
+          <div class="dash-grid">
+            <div class="panel">
+              <h3>Cycle survival</h3>
+              <div class="bars">
+                <div class="bar" style="height: 38%;"></div>
+                <div class="bar" style="height: 72%;"></div>
+                <div class="bar" style="height: 94%;"></div>
+              </div>
+              <div class="bar-labels">
+                <span>EP1</span>
+                <span>EP2</span>
+                <span>FEP</span>
+              </div>
+            </div>
+            <div class="panel">
+              <h3>Detected anomalies</h3>
+              <div class="log-list">
+                <div class="log-item"><span>Cycle 1,842</span><em>Force out of range</em></div>
+                <div class="log-item"><span>Cycle 2,109</span><em>Did not retract</em></div>
+                <div class="log-item"><span>Cycle 2,115</span><em>Visual shift detected</em></div>
+              </div>
+            </div>
+            <div class="panel">
+              <h3>What you learn</h3>
+              <div style="color:var(--muted); font-size:0.95rem;">
+                EP2 shows tighter force consistency and survives 2.4× longer than EP1 under the same test setup.
+              </div>
+            </div>
+            <div class="panel">
+              <h3>Best fit use cases</h3>
+              <div style="color:var(--muted); font-size:0.95rem;">
+                Consumer products, hardware startups, design validation, vendor comparison, and pre-tooling checks.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="why">
+      <div class="container">
+        <div class="section-head">
+          <h2>Why teams use RoboSpeed</h2>
+          <p>
+            Most teams do not have recall problems. They have iteration problems. Testing takes too long,
+            results are hard to compare, and decisions get delayed. RoboSpeed is built to shorten that loop.
+          </p>
+        </div>
+
+        <div class="cards-3">
+          <div class="card">
+            <div class="num">01</div>
+            <h3>Decide faster</h3>
+            <p>
+              Compare EP1, EP2, FEP, and production-intent builds under the same repeatable setup so you can
+              choose the better design with confidence.
+            </p>
+          </div>
+          <div class="card">
+            <div class="num">02</div>
+            <h3>See how failure starts</h3>
+            <p>
+              Get cycle counts, force trends, visual changes, and anomaly flags instead of a vague note that a part failed.
+            </p>
+          </div>
+          <div class="card">
+            <div class="num">03</div>
+            <h3>Validate before certification</h3>
+            <p>
+              Use RoboSpeed before UL, SGS, or formal validation so you are not sending weak designs into expensive test queues.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="container two-col">
+        <div class="card">
+          <div class="section-head" style="margin-bottom:18px;">
+            <h2 style="font-size:2rem; margin-bottom:8px;">What we test</h2>
+            <p>Designed for repetitive durability and behavior checks across physical product interactions.</p>
+          </div>
+          <div class="checklist">
+            <div class="check">Buttons and switches<span>Cycle count, force consistency, missed actuation, retraction behavior</span></div>
+            <div class="check">Hinges, lids, and latches<span>Open-close cycles, drift, looseness, visible failure onset</span></div>
+            <div class="check">Handles, knobs, and doors<span>Repeatable user-like motion with structured reporting</span></div>
+            <div class="check">Toy and consumer product movement<span>Limbs, snap fits, repeated user interaction, durability over time</span></div>
+          </div>
+        </div>
+
+        <div class="card" id="how">
+          <div class="section-head" style="margin-bottom:18px;">
+            <h2 style="font-size:2rem; margin-bottom:8px;">How it works</h2>
+            <p>A simple workflow built for product teams that need answers quickly.</p>
+          </div>
+          <div class="steps">
+            <div class="step">
+              <div class="bubble">1</div>
+              <div>
+                <h4>Send your sample and test goal</h4>
+                <p>Tell us what matters: cycle target, motion type, iteration comparison, or specific concern.</p>
+              </div>
+            </div>
+            <div class="step">
+              <div class="bubble">2</div>
+              <div>
+                <h4>We build the repeatable setup</h4>
+                <p>Robot motion, camera view, force monitoring, and failure criteria are configured for your part.</p>
+              </div>
+            </div>
+            <div class="step">
+              <div class="bubble">3</div>
+              <div>
+                <h4>You get a clean decision package</h4>
+                <p>Video evidence, cycle logs, anomalies, summary findings, and clear comparison between versions.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="container">
+        <div class="testimonial">
+          <p>
+            “You probably already run durability tests. The problem is they are slow, inconsistent, or hard to compare across builds.
+            RoboSpeed gives your team faster answers before production.”
+          </p>
+          <div style="color:var(--muted); font-weight:700;">Positioning statement for outreach, demos, or your first pilot deck</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="pricing">
+      <div class="container">
+        <div class="section-head">
+          <h2>Starter pilot packages</h2>
+          <p>
+            Keep pricing simple early. Sell speed, clarity, and iteration confidence. Not certification.
+          </p>
+        </div>
+
+        <div class="pricing-grid">
+          <div class="price">
+            <h3>Quick Check</h3>
+            <div class="amount">$499</div>
+            <div class="sub">Single sample • up to 10,000 cycles</div>
+            <ul>
+              <li>Repeatable test setup</li>
+              <li>Basic video capture</li>
+              <li>Cycle count summary</li>
+              <li>Simple result memo</li>
+            </ul>
+            <a class="btn btn-secondary" href="#contact">Start Here</a>
+          </div>
+
+          <div class="price featured">
+            <div class="badge">Best for pilots</div>
+            <h3>Comparison Test</h3>
+            <div class="amount">$999</div>
+            <div class="sub">Two design versions • side-by-side insights</div>
+            <ul>
+              <li>EP1 vs EP2 comparison</li>
+              <li>Video evidence of failure onset</li>
+              <li>Force and anomaly logging</li>
+              <li>Decision-ready summary</li>
+            </ul>
+            <a class="btn btn-primary" href="#contact">Book a Pilot</a>
+          </div>
+
+          <div class="price">
+            <h3>Custom Validation</h3>
+            <div class="amount">Custom</div>
+            <div class="sub">Complex parts, fixtures, or multi-step test flows</div>
+            <ul>
+              <li>Custom fixture development</li>
+              <li>Multi-camera inspection</li>
+              <li>Longer duration runs</li>
+              <li>Ongoing iteration support</li>
+            </ul>
+            <a class="btn btn-secondary" href="#contact">Talk to Us</a>
+          </div>
+        </div>
+
+        <div class="cta-band" id="contact">
+          <div>
+            <h3>Bring us your next design decision.</h3>
+            <p>
+              Whether you are comparing versions, validating a supplier part, or checking durability before tooling,
+              RoboSpeed helps you get to a better answer faster.
+            </p>
+          </div>
+          <a class="btn btn-primary" href="mailto:hello@robospeed.ai">hello@robospeed.ai</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container footer-inner">
+      <div>© 2026 RoboSpeed. Rapid durability validation for physical products.</div>
+      <div>Not a certification lab. Best used before formal compliance testing.</div>
+    </div>
+  </footer>
+</body>
+</html>
