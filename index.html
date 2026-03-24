@@ -85,8 +85,8 @@
 
     .hero-grid {
       display: grid;
-      grid-template-columns: 1.15fr 0.85fr;
-      gap: 36px;
+      grid-template-columns: 0.95fr 1.05fr;
+      gap: 28px;
       align-items: center;
     }
 
@@ -180,10 +180,10 @@
       position: relative;
       border-radius: 24px;
       border: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03));
+      background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
       box-shadow: var(--shadow);
       overflow: hidden;
-      padding: 14px;
+      padding: 8px;
     }
 
     .hero-media::before {
@@ -192,8 +192,8 @@
       inset: -2px;
       pointer-events: none;
       background: linear-gradient(135deg, rgba(110,168,254,0.28), rgba(126,240,196,0.22));
-      opacity: 0.35;
-      filter: blur(18px);
+      opacity: 0.2;
+      filter: blur(12px);
       z-index: 0;
     }
 
@@ -204,7 +204,7 @@
       overflow: hidden;
       border: 1px solid rgba(255,255,255,0.2);
       background: #050914;
-      aspect-ratio: 16 / 10;
+      aspect-ratio: 16 / 9;
     }
 
     .hero-video-wrap video {
@@ -507,14 +507,14 @@
       <div class="container hero-grid">
         <div>
           <div class="eyebrow">Rapid durability validation for product teams</div>
-          <h1>Know which design is better <br/>before you tool, launch, or scale.</h1>
+          <h1>See which design survives <br/>before you commit to tooling.</h1>
           <p>
             RoboSpeed runs repeatable robotic durability tests with force tracking, time-lapse video and anomaly
             detection so your team can choose faster with confidence.
           </p>
           <div class="hero-actions">
-            <a class="btn btn-primary" href="#contact">Request a Test Pilot</a>
-            <a class="btn btn-secondary" href="#why">See How It Works</a>
+            <a class="btn btn-primary" href="#contact">Book a Pilot Review</a>
+            <a class="btn btn-secondary" href="#hero-video">Watch Test Run</a>
           </div>
           <div class="hero-points">
             <div class="mini-card">
@@ -533,16 +533,14 @@
         </div>
 
         <div class="hero-media">
-          <div class="hero-video-wrap">
+          <div class="hero-video-wrap" id="hero-video">
             <video autoplay muted loop playsinline poster="Assets/Robospeed_image.png">
               <source src="Assets/Robospeed_vid.mp4" type="video/mp4" />
               Your browser does not support the video tag.
             </video>
           </div>
           <div class="hero-media-caption">
-            <span class="caption-pill">Real robotic durability run</span>
-            <span class="caption-pill">Force tracking + anomaly detection</span>
-            <span class="caption-pill">Time-lapse failure evidence</span>
+            <span class="caption-pill">Real robotic durability test footage</span>
           </div>
         </div>
       </div>
