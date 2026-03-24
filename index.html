@@ -85,8 +85,8 @@
 
     .hero-grid {
       display: grid;
-      grid-template-columns: 1.15fr 0.85fr;
-      gap: 36px;
+      grid-template-columns: 0.95fr 1.05fr;
+      gap: 28px;
       align-items: center;
     }
 
@@ -176,94 +176,64 @@
       font-size: 0.92rem;
     }
 
-    .dashboard {
-      background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
-      border: 1px solid var(--line);
+    .hero-media {
+      position: relative;
       border-radius: 24px;
-      padding: 22px;
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
       box-shadow: var(--shadow);
+      overflow: hidden;
+      padding: 8px;
     }
 
-    .dash-top {
+    .hero-media::before {
+      content: "";
+      position: absolute;
+      inset: -2px;
+      pointer-events: none;
+      background: linear-gradient(135deg, rgba(110,168,254,0.28), rgba(126,240,196,0.22));
+      opacity: 0.2;
+      filter: blur(12px);
+      z-index: 0;
+    }
+
+    .hero-video-wrap {
+      position: relative;
+      z-index: 1;
+      border-radius: 16px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.2);
+      background: #050914;
+      aspect-ratio: 16 / 9;
+    }
+
+    .hero-video-wrap video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    .hero-media-caption {
+      position: absolute;
+      left: 24px;
+      right: 24px;
+      bottom: 22px;
+      z-index: 2;
       display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 18px;
-      gap: 14px;
+      gap: 8px;
+      flex-wrap: wrap;
     }
 
-    .dash-pill {
+    .caption-pill {
       padding: 8px 12px;
       border-radius: 999px;
-      background: rgba(126,240,196,0.13);
-      color: var(--accent-2);
+      font-size: 0.78rem;
       font-weight: 700;
-      font-size: 0.82rem;
-    }
-
-    .dash-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 14px;
-    }
-
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      padding: 16px;
-      min-height: 148px;
-    }
-
-    .panel h3 {
-      margin: 0 0 10px;
-      font-size: 1rem;
-    }
-
-    .bars {
-      display: flex;
-      align-items: end;
-      gap: 10px;
-      height: 110px;
-      margin-top: 10px;
-    }
-
-    .bar {
-      flex: 1;
-      border-radius: 12px 12px 4px 4px;
-      background: linear-gradient(180deg, var(--accent), rgba(126,240,196,0.75));
-      opacity: 0.95;
-    }
-
-    .bar-labels {
-      display: flex;
-      justify-content: space-between;
-      color: var(--muted);
-      font-size: 0.82rem;
-      margin-top: 8px;
-    }
-
-    .log-list {
-      display: grid;
-      gap: 10px;
-      margin-top: 8px;
-    }
-
-    .log-item {
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-      font-size: 0.92rem;
-      padding: 10px 12px;
-      border-radius: 12px;
-      background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.07);
-    }
-
-    .log-item em {
-      font-style: normal;
-      color: var(--danger);
-      font-weight: 700;
+      color: #e9f7ff;
+      border: 1px solid rgba(255,255,255,0.18);
+      background: rgba(11,16,32,0.72);
+      backdrop-filter: blur(8px);
     }
 
     section {
@@ -504,10 +474,7 @@
         grid-template-columns: 1fr;
       }
 
-      .hero-points,
-      .dash-grid {
-        grid-template-columns: 1fr;
-      }
+      .hero-points { grid-template-columns: 1fr; }
 
       .nav-links { display: none; }
     }
@@ -516,7 +483,7 @@
       .hero { padding-top: 56px; }
       .nav-cta { display: none; }
       .container { width: min(var(--max), calc(100% - 20px)); }
-      .card, .price, .dashboard, .testimonial, .cta-band { padding: 20px; }
+      .card, .price, .testimonial, .cta-band { padding: 20px; }
       h1 { font-size: 2.5rem; }
     }
   </style>
@@ -540,15 +507,14 @@
       <div class="container hero-grid">
         <div>
           <div class="eyebrow">Rapid durability validation for product teams</div>
-          <h1>Know which design is better <br/>before you tool, launch, or scale.</h1>
+          <h1>See which design survives <br/>before you commit to tooling.</h1>
           <p>
-            RoboSpeed helps teams compare product iterations fast with repeatable robotic durability tests,
-            visual inspection, force tracking, and clean failure reporting. This is not certification.
-            It is the rapid validation layer between design and production.
+            RoboSpeed runs repeatable robotic durability tests with force tracking, time-lapse video and anomaly
+            detection so your team can choose faster with confidence.
           </p>
           <div class="hero-actions">
-            <a class="btn btn-primary" href="#contact">Request a Test Pilot</a>
-            <a class="btn btn-secondary" href="#why">See How It Works</a>
+            <a class="btn btn-primary" href="#contact">Book a Pilot Review</a>
+            <a class="btn btn-secondary" href="#hero-video">Watch Test Run</a>
           </div>
           <div class="hero-points">
             <div class="mini-card">
@@ -566,48 +532,15 @@
           </div>
         </div>
 
-        <div class="dashboard">
-          <div class="dash-top">
-            <div>
-              <div style="font-weight:800; font-size:1.15rem;">Sample Test Snapshot</div>
-              <div style="color:var(--muted); font-size:0.93rem; margin-top:4px;">EP1 vs EP2 latch durability comparison</div>
-            </div>
-            <div class="dash-pill">Run Active</div>
+        <div class="hero-media">
+          <div class="hero-video-wrap" id="hero-video">
+            <video autoplay muted loop playsinline poster="Assets/Robospeed_image.png">
+              <source src="Assets/Robospeed_vid.mp4" type="video/mp4" />
+              Your browser does not support the video tag.
+            </video>
           </div>
-          <div class="dash-grid">
-            <div class="panel">
-              <h3>Cycle survival</h3>
-              <div class="bars">
-                <div class="bar" style="height: 38%;"></div>
-                <div class="bar" style="height: 72%;"></div>
-                <div class="bar" style="height: 94%;"></div>
-              </div>
-              <div class="bar-labels">
-                <span>EP1</span>
-                <span>EP2</span>
-                <span>FEP</span>
-              </div>
-            </div>
-            <div class="panel">
-              <h3>Detected anomalies</h3>
-              <div class="log-list">
-                <div class="log-item"><span>Cycle 1,842</span><em>Force out of range</em></div>
-                <div class="log-item"><span>Cycle 2,109</span><em>Did not retract</em></div>
-                <div class="log-item"><span>Cycle 2,115</span><em>Visual shift detected</em></div>
-              </div>
-            </div>
-            <div class="panel">
-              <h3>What you learn</h3>
-              <div style="color:var(--muted); font-size:0.95rem;">
-                EP2 shows tighter force consistency and survives 2.4× longer than EP1 under the same test setup.
-              </div>
-            </div>
-            <div class="panel">
-              <h3>Best fit use cases</h3>
-              <div style="color:var(--muted); font-size:0.95rem;">
-                Consumer products, hardware startups, design validation, vendor comparison, and pre-tooling checks.
-              </div>
-            </div>
+          <div class="hero-media-caption">
+            <span class="caption-pill">Real robotic durability test footage</span>
           </div>
         </div>
       </div>
